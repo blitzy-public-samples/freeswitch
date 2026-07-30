@@ -60,6 +60,11 @@ struct xml_binding {
 	long auth_scheme;
 	int timeout;
 	switch_size_t curl_max_bytes;
+	/* JSON: opt-in response representation for this binding. Left NULL by the wholesale
+	   memset() in do_config() whenever the response-format parameter is absent, which is
+	   exactly what preserves the legacy XML-only behaviour. Appended last so that no
+	   existing member offset moves. */
+	char *response_format;
 };
 
 static int keep_files_around = 0;
@@ -135,6 +140,265 @@ static size_t file_callback(void *ptr, size_t size, size_t nmemb, void *data)
 	return x;
 }
 
+/*
+ * JSON: everything from here down to xml_url_fetch() is new, JSON-specific logic, kept in
+ * separate file-static functions so that the original XML fetch path below reads exactly as
+ * it did before. None of it executes unless a binding opts in with response-format=json.
+ * Every function reports failure through a falsy return so that the single dispatch point in
+ * xml_url_fetch() can fall back to the untouched switch_xml_parse_file() call.
+ *
+ * The translation implements the BadgerFish convention: attributes are members prefixed with
+ * '@', text content lives under '$', child elements are nested keys, repeated children of the
+ * same name collapse into an array, and the single top-level key is the requested provisioning
+ * section name. cJSON is reached through <switch.h> alone, which already pulls in switch_json.h
+ * and therefore switch_cJSON.h.
+ */
+
+/* JSON: true when an HTTP response Content-Type names the JSON media type. Accepts
+   "application/json" bare or carrying parameters such as "; charset=utf-8"; rejects an absent
+   or empty header, text/xml, application/xml and every other media type. */
+static int xml_curl_json_is_json_content_type(const char *content_type)
+{
+	char media_type[64] = "";
+	const char *p = content_type;
+	switch_size_t len = 0;
+
+	if (zstr(p)) {
+		return 0;
+	}
+
+	/* Tolerate leading linear whitespace ahead of the media type. */
+	while (*p == ' ' || *p == '\t') {
+		p++;
+	}
+
+	/* The media type ends at the first parameter separator or whitespace. */
+	while (p[len] && p[len] != ';' && p[len] != ' ' && p[len] != '\t' && p[len] != '\r' && p[len] != '\n') {
+		len++;
+	}
+
+	if (len == 0 || len >= sizeof(media_type)) {
+		return 0;
+	}
+
+	memcpy(media_type, p, len);
+	media_type[len] = '\0';
+
+	/* Whole-token comparison: type and subtype must both match, case-insensitively. */
+	return !strcasecmp(media_type, "application/json") ? 1 : 0;
+}
+
+/* JSON: reads the already size-capped response body that file_callback() streamed to the
+   temporary file into a NUL-terminated heap buffer. The binding's response ceiling is
+   re-checked here rather than re-implemented, so the 1 MiB default and any operator override
+   are inherited for free. The caller owns the result and releases it with switch_safe_free().
+   Returns NULL on any error, which converges on the XML fallback. */
+static char *xml_curl_json_read_file(const char *filename, switch_size_t max_bytes)
+{
+	struct stat st;
+	char *buf = NULL;
+	switch_ssize_t bytes_read = 0;
+	int fd = -1;
+
+	if (zstr(filename)) {
+		return NULL;
+	}
+
+	if ((fd = open(filename, O_RDONLY, 0)) < 0) {
+		return NULL;
+	}
+
+	if (fstat(fd, &st) != 0 || st.st_size <= 0 || (switch_size_t) st.st_size > max_bytes) {
+		close(fd);
+		return NULL;
+	}
+
+	/* Plain malloc with an explicit check rather than switch_must_malloc(): an allocation
+	   failure has to degrade to the XML fallback, never abort the process. */
+	if (!(buf = malloc((size_t) st.st_size + 1))) {
+		close(fd);
+		return NULL;
+	}
+
+	bytes_read = read(fd, buf, (size_t) st.st_size);
+	close(fd);
+
+	if (bytes_read <= 0) {
+		switch_safe_free(buf);
+		return NULL;
+	}
+
+	buf[bytes_read] = '\0';
+
+	return buf;
+}
+
+/* JSON: recursive BadgerFish visitor. Populates an existing switch_xml_t node from a cJSON
+   object by dispatching on the kind of each member. Returns 1 on success and 0 on any
+   translation error; a partially built subtree stays attached to the caller's tree, which the
+   root entry point releases with a single switch_xml_free(). */
+static int xml_curl_json_to_xml_node(switch_xml_t node, cJSON *object)
+{
+	cJSON *member = NULL;
+	cJSON *element = NULL;
+	switch_xml_t child = NULL;
+
+	if (!node || !object) {
+		return 0;
+	}
+
+	cJSON_ArrayForEach(member, object) {
+		/* Every member of a JSON object carries its own key in ->string. A missing or empty
+		   key can name neither an element, nor an attribute, nor the text marker. */
+		if (zstr(member->string)) {
+			return 0;
+		}
+
+		if (member->string[0] == '@') {
+			/* BadgerFish attribute. The name must survive stripping the '@' and the value
+			   must be a string, because switch_xml_set_attr_d() duplicates both unguarded.
+			   Attributes are set in JSON member order, which the serializer preserves. */
+			if (zstr(member->string + 1) || !cJSON_IsString(member) || !member->valuestring) {
+				return 0;
+			}
+			switch_xml_set_attr_d(node, member->string + 1, member->valuestring);
+		} else if (!strcmp(member->string, "$")) {
+			/* BadgerFish text content. */
+			if (!cJSON_IsString(member) || !member->valuestring) {
+				return 0;
+			}
+			switch_xml_set_txt_d(node, member->valuestring);
+		} else if (cJSON_IsArray(member)) {
+			/* Repeated children of one name collapse into a JSON array. A constant offset of
+			   zero makes switch_xml_insert() append, so array order becomes document order. */
+			cJSON_ArrayForEach(element, member) {
+				if (!cJSON_IsObject(element)) {
+					return 0;
+				}
+				if (!(child = switch_xml_add_child_d(node, member->string, 0))) {
+					return 0;
+				}
+				if (!xml_curl_json_to_xml_node(child, element)) {
+					return 0;
+				}
+			}
+		} else if (cJSON_IsObject(member)) {
+			/* A single child element of this name. */
+			if (!(child = switch_xml_add_child_d(node, member->string, 0))) {
+				return 0;
+			}
+			if (!xml_curl_json_to_xml_node(child, member)) {
+				return 0;
+			}
+		} else {
+			/* Numbers, booleans, nulls and raw values have no guaranteed lexical round trip
+			   through the const char * builders, so they are a translation error rather than
+			   an implicit coercion. */
+			return 0;
+		}
+	}
+
+	return 1;
+}
+
+/* JSON: BadgerFish adapter and root entry point. Translates a JSON provisioning response into
+   the same kind of switch_xml_t the XML path produces, or returns NULL on any error. The single
+   top-level key names the provisioning section, and the <document type="freeswitch/xml">
+   <section name="..."> envelope that switch_xml_locate() searches for is synthesised here: a
+   tree without it could not be resolved by the core. Only the duplicating builder variants are
+   used, because the cJSON tree owning every name and value is released before the result is
+   returned. */
+static switch_xml_t xml_curl_json_to_xml(const char *json_text)
+{
+	cJSON *json = NULL;
+	cJSON *root_member = NULL;
+	switch_xml_t document = NULL;
+	switch_xml_t section = NULL;
+
+	if (zstr(json_text)) {
+		return NULL;
+	}
+
+	if (!(json = cJSON_Parse(json_text))) {
+		return NULL;
+	}
+
+	/* The payload must be an object holding exactly one member: the section name mapped to
+	   the object to translate. */
+	if (!cJSON_IsObject(json) || cJSON_GetArraySize(json) != 1) {
+		cJSON_Delete(json);
+		return NULL;
+	}
+
+	root_member = json->child;
+
+	if (!root_member || zstr(root_member->string) || !cJSON_IsObject(root_member)) {
+		cJSON_Delete(json);
+		return NULL;
+	}
+
+	if (!(document = switch_xml_new("document"))) {
+		cJSON_Delete(json);
+		return NULL;
+	}
+
+	switch_xml_set_attr_d(document, "type", "freeswitch/xml");
+
+	if (!(section = switch_xml_add_child_d(document, "section", 0))) {
+		switch_xml_free(document);
+		cJSON_Delete(json);
+		return NULL;
+	}
+
+	/* Set the section name before translating the member so that it is the first attribute,
+	   matching the attribute order of the equivalent XML document. */
+	switch_xml_set_attr_d(section, "name", root_member->string);
+
+	if (!xml_curl_json_to_xml_node(section, root_member)) {
+		switch_xml_free(document);
+		cJSON_Delete(json);
+		return NULL;
+	}
+
+	cJSON_Delete(json);
+
+	return document;
+}
+
+/* JSON: the response decode step reached from the single format dispatch point in
+   xml_url_fetch(). Validates the response Content-Type, reads the capped temporary file and
+   runs the BadgerFish translation. Every failure edge - and only a failure edge - emits one
+   SWITCH_LOG_WARNING and returns NULL, so the caller falls through to the unmodified XML
+   parse; a fallback is a degradation worth surfacing rather than a failure. cJSON_GetErrorPtr()
+   is deliberately not consulted: it is process global while this code runs concurrently on
+   many fetch threads, so it could report an unrelated thread's error. */
+static switch_xml_t xml_curl_json_decode_response(const char *filename, const char *content_type, switch_size_t max_bytes, const char *url)
+{
+	switch_xml_t xml = NULL;
+	char *json_text = NULL;
+	const char *reason = "unknown translation error";
+
+	if (zstr(filename)) {
+		reason = "no response body was captured";
+	} else if (!xml_curl_json_is_json_content_type(content_type)) {
+		reason = "response Content-Type is not application/json";
+	} else if (!(json_text = xml_curl_json_read_file(filename, max_bytes))) {
+		reason = "response body could not be read";
+	} else if (!(xml = xml_curl_json_to_xml(json_text))) {
+		reason = "response body is not a well-formed BadgerFish JSON document";
+	}
+
+	switch_safe_free(json_text);
+
+	if (!xml) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+						  "JSON decode of the response from [%s] failed (%s) [Content-Type: %s]; falling back to XML parsing\n",
+						  switch_str_nil(url), reason, zstr(content_type) ? "(absent)" : content_type);
+	}
+
+	return xml;
+}
+
 
 
 
@@ -159,6 +423,8 @@ static switch_xml_t xml_url_fetch(const char *section, const char *tag_name, con
 	char basic_data[512];
 	char *uri = NULL;
 	char *dynamic_url = NULL;
+	char content_type[256] = "";	/* JSON: copy of the response Content-Type, taken while the curl handle is alive */
+	char *curl_content_type = NULL;	/* JSON: libcurl-owned; never freed here */
 
     strncpy(hostname, switch_core_get_switchname(), sizeof(hostname) - 1);
 
@@ -220,6 +486,14 @@ static switch_xml_t xml_url_fetch(const char *section, const char *tag_name, con
 		curl_handle = switch_curl_easy_init();
 		headers = switch_curl_slist_append(headers, "Content-Type: application/x-www-form-urlencoded");
 
+		/* JSON: when the binding opted in, advertise that a BadgerFish JSON response is
+		   acceptable. Purely additive - the request Content-Type above, the form body and the
+		   rest of the XML request path are untouched, and switch_curl_slist_free_all(headers)
+		   below already releases this entry. */
+		if (binding->response_format && !strcasecmp(binding->response_format, "json")) {
+			headers = switch_curl_slist_append(headers, "Accept: application/json");
+		}
+
 		if (!strncasecmp(binding->url, "https", 5)) {
 			switch_curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYPEER, 0);
 			switch_curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYHOST, 0);
@@ -249,6 +523,15 @@ static switch_xml_t xml_url_fetch(const char *section, const char *tag_name, con
 
 		if (binding->disable100continue) {
 			slist = switch_curl_slist_append(slist, "Expect:");
+			/* JSON: this pre-existing branch REPLACES the header list assigned above rather
+			   than adding to it, which is long-standing behaviour that must not change. The
+			   Accept header therefore has to be restated on the list curl will actually use,
+			   or it would silently never reach the gateway - disable100continue defaults to
+			   1, so this is the common path. Guarded identically to the append above, so a
+			   binding without response-format still sends byte-for-byte what it sends today. */
+			if (binding->response_format && !strcasecmp(binding->response_format, "json")) {
+				slist = switch_curl_slist_append(slist, "Accept: application/json");
+			}
 			switch_curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, slist);
 		}
 
@@ -299,6 +582,14 @@ static switch_xml_t xml_url_fetch(const char *section, const char *tag_name, con
 		}
 
 		switch_curl_easy_getinfo(curl_handle, CURLINFO_RESPONSE_CODE, &httpRes);
+		/* JSON: the response Content-Type has to be read here, adjacent to the response code
+		   and before switch_curl_easy_cleanup() below, because libcurl owns that string and
+		   frees it together with the handle. Reading it at the decode site would be a
+		   use-after-free. libcurl returns NULL when the response carried no Content-Type. */
+		switch_curl_easy_getinfo(curl_handle, CURLINFO_CONTENT_TYPE, &curl_content_type);
+		if (curl_content_type) {
+			switch_copy_string(content_type, curl_content_type, sizeof(content_type));
+		}
 		switch_curl_easy_cleanup(curl_handle);
 		switch_curl_slist_free_all(headers);
 		switch_curl_slist_free_all(slist);
@@ -312,8 +603,22 @@ static switch_xml_t xml_url_fetch(const char *section, const char *tag_name, con
 		xml = NULL;
 	} else {
 		if (httpRes == 200) {
+			/* JSON: the single response-format dispatch point. When this binding opted in with
+			   response-format=json, attempt the BadgerFish decode first. The helper emits one
+			   WARNING on every failure edge and returns NULL, so a non-JSON Content-Type, an
+			   unreadable body, unparseable JSON or a wrongly shaped document all converge on
+			   the original XML parse below. */
+			if (binding->response_format && !strcasecmp(binding->response_format, "json")) {
+				xml = xml_curl_json_decode_response(filename, content_type, binding->curl_max_bytes, binding->url);
+			}
+
+			/* JSON: this guard is the only change made to the XML path. The two statements it
+			   wraps are the pre-existing parse call and its error report, kept byte for byte -
+			   including their original indentation - so the fallback is provably unchanged. */
+			if (!xml) {
 			if (!(xml = switch_xml_parse_file(filename))) {
 				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Error Parsing Result! [%s]\ndata: [%s]\n", binding->url, data);
+			}
 			}
 		} else {
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Received HTTP error %ld trying to fetch %s\ndata: [%s]\n", httpRes, binding->url,
@@ -374,6 +679,7 @@ static switch_status_t do_config(void)
 		int disable100continue = 1;
 		int use_dynamic_url = 0, timeout = 0;
 		switch_size_t curl_max_bytes = XML_CURL_MAX_BYTES;
+		char *response_format = NULL;	/* JSON: opt-in response representation; NULL means XML */
 		uint32_t enable_cacert_check = 0;
 		char *ssl_cert_file = NULL;
 		char *ssl_key_file = NULL;
@@ -469,6 +775,11 @@ static switch_status_t do_config(void)
 				} else {
 					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Can't set a negative maximum response bytes!\n");
 				}
+			} else if (!strcasecmp(var, "response-format")) {
+				/* JSON: opt-in response representation. Appended at the tail of the chain so
+				   that every pre-existing comparison keeps its current evaluation order. When
+				   this parameter is absent the module behaves exactly as it did before. */
+				response_format = val;
 			}
 		}
 
@@ -558,6 +869,13 @@ static switch_status_t do_config(void)
 		}
 
 		binding->curl_max_bytes = curl_max_bytes;
+
+		/* JSON: optional per-binding response format. Guarded exactly like its siblings above,
+		   so an absent parameter leaves the member at the NULL the memset() already wrote. The
+		   string lives in the module pool and is never freed individually. */
+		if (response_format != NULL) {
+			binding->response_format = switch_core_strdup(globals.pool, response_format);
+		}
 
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Binding [%s] XML Fetch Function [%s] [%s]\n",
 						  zstr(bname) ? "N/A" : bname, binding->url, binding->bindings ? binding->bindings : "all");
