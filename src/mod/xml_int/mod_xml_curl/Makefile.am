@@ -8,13 +8,6 @@ mod_xml_curl_la_CPPFLAGS = $(CURL_CFLAGS) $(AM_CPPFLAGS)
 mod_xml_curl_la_LIBADD   = $(switch_builddir)/libfreeswitch.la
 mod_xml_curl_la_LDFLAGS  = $(CURL_LIBS) -avoid-version -module -no-undefined -shared
 
-# FST test harness.  Everything below this line is additive: the loadable
-# module target above is untouched, and this module still stays out of a
-# default build, because build/modules.conf.in ships #xml_int/mod_xml_curl
-# commented out and src/mod/Makefile.am gates the whole per-module recipe on
-# the module appearing in the generated modules.conf.  The suite is therefore
-# built and collected only where the module itself is enabled.
-#
 # No convenience library is declared, deliberately.  Every subject under test
 # is a file-static function of mod_xml_curl.c -- xml_url_fetch(), do_config()
 # and the xml_curl_json_* translator family -- and an archive cannot export a
@@ -31,8 +24,9 @@ noinst_PROGRAMS = test/test_mod_xml_curl
 # it, so each of the three below re-states the variable it overrides.  The
 # compile flags are split the same way the module target above splits them, so
 # that the code under test is compiled exactly as it is compiled for release:
-# $(CURL_CFLAGS) belongs on _CPPFLAGS to match L7, and it is load-bearing
-# rather than decorative because <switch_curl.h> includes <curl/curl.h>.
+# $(CURL_CFLAGS) belongs on _CPPFLAGS to match the module target's own
+# _CPPFLAGS above, and it is load-bearing rather than decorative because
+# <switch_curl.h> includes <curl/curl.h>.
 # $(AM_CPPFLAGS) is where build/modmake.rulesam routes the core include paths,
 # so leaving it out would put <switch.h> beyond reach.  The two
 # test-base-directory defines are what make the suite's FST_CORE_BEGIN("conf")
@@ -43,11 +37,26 @@ test_test_mod_xml_curl_CFLAGS = $(AM_CFLAGS) -I. -DSWITCH_TEST_BASE_DIR_FOR_CONF
 test_test_mod_xml_curl_CPPFLAGS = $(CURL_CFLAGS) $(AM_CPPFLAGS)
 
 # Link flags are hand-composed rather than reused from the module target,
-# whose L9 set carries libtool's -module and -shared: library-only options
-# that are wrong for an executable.  $(CURL_LIBS) is required rather than
-# merely mirrored -- switch_curl.h maps switch_curl_easy_setopt() straight
+# whose LDFLAGS set carries libtool's -module and -shared: library-only
+# options that are wrong for an executable.  $(CURL_LIBS) is required rather
+# than merely mirrored -- switch_curl.h maps switch_curl_easy_setopt() straight
 # onto curl_easy_setopt(), so the module code linked in here calls libcurl
-# directly.
-test_test_mod_xml_curl_LDFLAGS = $(CURL_LIBS) $(AM_LDFLAGS) -avoid-version -no-undefined $(freeswitch_LDFLAGS) $(switch_builddir)/libfreeswitch.la $(CORE_LIBS) $(APR_LIBS)
+# directly.  Only variables that are actually defined in this Makefile's own
+# scope are named: $(freeswitch_LDFLAGS), $(CORE_LIBS) and $(APR_LIBS) are
+# defined by the top-level Makefile.am and expand to nothing here, so naming
+# them would suggest a link input that does not exist.  $(switch_builddir)/
+# libfreeswitch.la carries the core, and $(AM_CPPFLAGS) above already routes
+# the matching include paths.
+#
+# Naming libfreeswitch.la in _LDFLAGS alone would put it on the link line
+# without also putting it in the target's prerequisite list, because automake
+# derives that list from _LDADD/_LIBADD only.  The test target deliberately
+# has no _LDADD (see the no-convenience-library note above), so the build
+# order and the rebuild-on-change edge are declared explicitly instead: the
+# EXTRA_..._DEPENDENCIES variable is the automake-sanctioned way to add a
+# prerequisite that is not a link input of its own, and it is the same core
+# library the module target picks up through its _LIBADD.
+test_test_mod_xml_curl_LDFLAGS = $(CURL_LIBS) $(AM_LDFLAGS) -avoid-version -no-undefined $(switch_builddir)/libfreeswitch.la
+EXTRA_test_test_mod_xml_curl_DEPENDENCIES = $(switch_builddir)/libfreeswitch.la
 
 TESTS = $(noinst_PROGRAMS)

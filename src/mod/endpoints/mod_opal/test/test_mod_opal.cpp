@@ -108,20 +108,22 @@
  *             narrows the address, and the harness must not change the module,
  *             so instead the suite takes the port on loopback before any
  *             manager exists.  A loopback holder is enough to refuse a wildcard
- *             bind, so the listen fails, Initialise() returns before creating
- *             either thread, and no off-box-reachable socket is ever opened.
- *             OPAL reports the failure through PTRACE only and propagates no
- *             status, so nothing else about the module's observable behaviour
- *             changes.  Case 1 asserts all of this rather than assuming it, from
- *             inside the process and from outside it.  See the containment
- *             section further down for the measured bind semantics this relies
- *             on.
+ *             bind, so the listen fails and Initialise() returns before creating
+ *             either thread.  OPAL reports the failure through PTRACE only and
+ *             propagates no status, so nothing else about the module's observable
+ *             behaviour changes.  Case 2 asserts all of this rather than assuming
+ *             it, from inside the process and from outside it.  See the
+ *             containment section further down for the measured bind semantics
+ *             this relies on.
  *
- *   0.0.0.0:4569 UDP - what the above prevents.  This is what the suite opened
- *             before the guard existed: the IAX2 listener on the wildcard
- *             address, reachable from off-box for as long as the suite ran
- *             (CWE-668).  It must not reappear, and case 1 is what fails if it
- *             does.
+ *   0.0.0.0:4569 UDP - what the guard prevents, and what must never appear.  An
+ *             IAX2 listener on the wildcard address would be reachable from
+ *             off-box for as long as the process lived (CWE-668).  It is not
+ *             prevented by hope: no case in this suite constructs an FSManager
+ *             without first fatally requiring that the port is already
+ *             unavailable to a wildcard bind, so a run in which the guard could
+ *             not be established aborts rather than exposing the socket, and
+ *             case 2 is what fails if a wildcard owner ever does appear.
  *
  * What the listener cases assert.  FSManager::Initialise() reports a
  * StartListener() failure only through PTRACE and propagates no status
@@ -910,26 +912,23 @@ static switch_status_t test_opal_unbind_config(void)
  * in the suite that constructs a PProcess.  Either alone suffices today; both
  * means no re-ordering and no new case can reintroduce the exposure.  It is
  * idempotent, so paying twice costs nothing.
+ *
+ * NOTHING ABOUT THE PIN IS CACHED, AND THAT IS THE POINT.  putenv() can fail -
+ * it returns non-zero and sets errno on an allocation failure - so a helper that
+ * assumed success and remembered it would report containment that does not
+ * exist, and every assertion resting on that memory would pass while the process
+ * came up against an unaudited search path.  The pin is therefore re-applied and
+ * RE-VERIFIED BY READBACK on every call, and the verdict is derived from the
+ * environment as it is at that instant rather than from a flag.  Two putenv()
+ * calls and two getenv()/strcmp() pairs are far too cheap for the saving to be
+ * worth the failure mode.
  */
 #define TEST_OPAL_PLUGIN_DIR "/no/thanks"
 
-static int test_opal_plugin_path_pinned = 0;
-
-static void test_opal_pin_plugin_path(void)
-{
-	if (test_opal_plugin_path_pinned) {
-		return;
-	}
-
-	(void) putenv((char *) "PTLIBPLUGINDIR=" TEST_OPAL_PLUGIN_DIR);
-	(void) putenv((char *) "PWLIBPLUGINDIR=" TEST_OPAL_PLUGIN_DIR);
-
-	test_opal_plugin_path_pinned = 1;
-}
-
 /*
- * True when both plugin-directory variables read back as the pinned value.  Used
- * by the containment case to assert the pinning rather than assume it.
+ * True when both plugin-directory variables read back as the pinned value.  This
+ * is the only definition of "pinned" in this file: it interrogates the
+ * environment and believes nothing else.
  */
 static int test_opal_plugin_path_is_pinned(void)
 {
@@ -940,6 +939,25 @@ static int test_opal_plugin_path_is_pinned(void)
 }
 
 /*
+ * Pin both variables and return whether the pin is VERIFIED in place: 1 only
+ * when both putenv() calls reported success AND both variables read back as the
+ * pinned directory, 0 otherwise.  A caller that ignores the result gets no
+ * guarantee, and a caller that honours it fails closed.
+ */
+static int test_opal_pin_plugin_path(void)
+{
+	if (putenv((char *) "PTLIBPLUGINDIR=" TEST_OPAL_PLUGIN_DIR) != 0) {
+		return 0;
+	}
+
+	if (putenv((char *) "PWLIBPLUGINDIR=" TEST_OPAL_PLUGIN_DIR) != 0) {
+		return 0;
+	}
+
+	return test_opal_plugin_path_is_pinned();
+}
+
+/*
  * (2) THE IAX2 WILDCARD LISTENER
  *
  * FSManager's constructor allocates an IAX2EndPoint unconditionally
@@ -947,10 +965,11 @@ static int test_opal_plugin_path_is_pinned(void)
  * which does `sock = new PUDPSocket(GetDefaultSignalPort())' followed by
  * `sock->Listen(INADDR_ANY, 0, sock->GetPort())' and, ONLY if that listen
  * succeeds, constructs the IAX2Transmit and IAX2Receiver threads.  So merely
- * constructing a manager opened UDP 4569 on the WILDCARD address - reachable
- * from off-box for as long as the suite ran - and started two live threads.  No
- * configuration parameter mod_opal reads narrows it, and the harness must not
- * change the module, so the address cannot be fixed at its source.
+ * constructing a manager opens UDP 4569 on the WILDCARD address - reachable from
+ * off-box for as long as the process lives - and starts two live threads, unless
+ * the port is already unavailable when the constructor runs.  No configuration
+ * parameter mod_opal reads narrows the address, and the harness must not change
+ * the module, so it cannot be fixed at its source.
  *
  * It can, however, be made unavailable.  The suite takes the port itself, on
  * loopback only, before any manager exists.  Three measured properties of the
@@ -988,12 +1007,43 @@ static switch_memory_pool_t *test_opal_guard_pool = NULL;
 static switch_socket_t *test_opal_iax2_guard = NULL;
 
 /*
- * Set when the guard's bind was refused, which means some other holder already
- * owns the port.  That produces the same containment - a wildcard bind will be
- * refused too - so the containment case accepts it, while still refusing to
- * accept a guard that failed for any other reason.
+ * Set ONLY when the guard's bind was refused BECAUSE THE ADDRESS IS ALREADY IN
+ * USE, which is the one failure that means some other holder owns the port.
+ * That produces the same containment this suite would have produced itself - a
+ * wildcard bind will be refused too - so it is an acceptable substitute for
+ * holding the guard.
+ *
+ * NO OTHER FAILURE QUALIFIES, and the distinction is the whole point.  A bind
+ * that failed because the process ran out of descriptors, or lacked permission,
+ * or was handed an address that does not exist locally, leaves the port FREE:
+ * treating that as containment would let a manager construct and open UDP 4569
+ * on the wildcard address while the suite asserted that it could not.  Every
+ * such failure is therefore a hard containment failure, which the fatal
+ * precondition in each manager-constructing case turns into an aborted case.
+ *
+ * The verdict is recomputed from scratch on every acquire and discarded on every
+ * release, so it always describes the port as it is now rather than as it once
+ * was.
  */
 static int test_opal_iax2_port_has_foreign_owner = 0;
+
+/*
+ * True for a bind status that means "already in use".
+ *
+ * switch_socket_bind() is a thin wrapper over fspr_socket_bind()
+ * (src/switch_apr.c:744), and the Unix implementation returns the platform's own
+ * error code unchanged - `if (bind(...) == -1) return errno;'
+ * (libs/apr/network_io/unix/sockets.c:160).  fspr defines canonical predicates
+ * for a handful of codes (APR_STATUS_IS_EACCES, _EAGAIN, _EINTR) but NONE for
+ * address-in-use, so there is no portable macro to defer to and the comparison
+ * is made against the platform's EADDRINUSE directly.  <errno.h> arrives through
+ * switch.h, and the value compared is the one the kernel gave the failing bind.
+ * The cast is needed only because switch_status_t is an enum.
+ */
+static int test_opal_status_is_addr_in_use(switch_status_t status)
+{
+	return (int) status == EADDRINUSE;
+}
 
 /*
  * Take UDP DefaultUdpPort on loopback.  Idempotent: reports success when the
@@ -1004,10 +1054,17 @@ static int test_opal_iax2_port_has_foreign_owner = 0;
 static switch_status_t test_opal_iax2_guard_acquire(void)
 {
 	switch_sockaddr_t *guard_addr = NULL;
+	switch_status_t bound = SWITCH_STATUS_FALSE;
 
 	if (test_opal_iax2_guard) {
 		return SWITCH_STATUS_SUCCESS;
 	}
+
+	/* No guard is held, so nothing is yet known about the port on this attempt:
+	 * discard any earlier verdict so that what follows is the only thing that can
+	 * establish one.  This is what stops a single historical refusal from being
+	 * remembered as containment for the rest of the run. */
+	test_opal_iax2_port_has_foreign_owner = 0;
 
 	if (!test_opal_guard_pool && switch_core_new_memory_pool(&test_opal_guard_pool) != SWITCH_STATUS_SUCCESS) {
 		return SWITCH_STATUS_FALSE;
@@ -1026,10 +1083,24 @@ static switch_status_t test_opal_iax2_guard_acquire(void)
 
 	/* No SWITCH_SO_REUSEADDR here, on purpose - see the note above. */
 
-	if (switch_socket_bind(test_opal_iax2_guard, guard_addr) != SWITCH_STATUS_SUCCESS) {
+	bound = switch_socket_bind(test_opal_iax2_guard, guard_addr);
+
+	if (bound != SWITCH_STATUS_SUCCESS) {
 		switch_socket_close(test_opal_iax2_guard);
 		test_opal_iax2_guard = NULL;
-		test_opal_iax2_port_has_foreign_owner = 1;
+
+		/* ONLY an address-in-use refusal establishes that someone else owns the
+		 * port and therefore that the containment exists without this guard.  Any
+		 * other failure leaves the port free, so the verdict stays false and the
+		 * manager-constructing cases refuse to run. */
+		test_opal_iax2_port_has_foreign_owner = test_opal_status_is_addr_in_use(bound);
+
+		if (!test_opal_iax2_port_has_foreign_owner) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+							  "IAX2 containment guard could not take %s:%d and the refusal was not address-in-use (status=%d)\n",
+							  TEST_OPAL_GUARD_ADDRESS, (int) IAX2EndPoint::DefaultUdpPort, (int) bound);
+		}
+
 		return SWITCH_STATUS_FALSE;
 	}
 
@@ -1038,6 +1109,11 @@ static switch_status_t test_opal_iax2_guard_acquire(void)
 
 /*
  * Release the guard and its pool.  Idempotent.
+ *
+ * The foreign-owner verdict is discarded too.  Once the guard is gone this suite
+ * knows nothing about who holds the port, and a remembered verdict would be a
+ * claim about the past presented as a fact about the present.  The next acquire
+ * establishes it again from scratch.
  */
 static void test_opal_iax2_guard_release(void)
 {
@@ -1049,16 +1125,34 @@ static void test_opal_iax2_guard_release(void)
 	if (test_opal_guard_pool) {
 		switch_core_destroy_memory_pool(&test_opal_guard_pool);
 	}
+
+	test_opal_iax2_port_has_foreign_owner = 0;
 }
 
 /*
  * True when the IAX2 default port cannot be bound on the wildcard address by
  * anyone - either because this suite holds it on loopback or because another
  * holder already had it.
+ *
+ * A LIVE CHECK, not a reading of remembered state.  A held guard answers
+ * immediately; otherwise the guard is taken NOW, which both establishes the
+ * containment when the port is free and recomputes the foreign-owner verdict
+ * from that attempt alone.  Only then is the verdict consulted.  So a caller can
+ * never be told "contained" on the strength of a stale flag, and every
+ * manager-constructing case - each of which requires this fatally before it
+ * constructs anything - is gated on the state of the port at that instant.
  */
 static int test_opal_iax2_containment_in_effect(void)
 {
-	return (test_opal_iax2_guard != NULL) || test_opal_iax2_port_has_foreign_owner;
+	if (test_opal_iax2_guard) {
+		return 1;
+	}
+
+	if (test_opal_iax2_guard_acquire() == SWITCH_STATUS_SUCCESS) {
+		return 1;
+	}
+
+	return test_opal_iax2_port_has_foreign_owner;
 }
 
 /*
@@ -1093,17 +1187,26 @@ static switch_bool_t test_opal_udp_port_is_bindable(const char *ip, switch_port_
 }
 
 /*
- * Return the suite-local PTLib process, creating it on first use.  Every
- * FSManager needs one to exist, because OpalManager's constructor reads
+ * Return the suite-local PTLib process, creating it on first use - or NULL when
+ * the plugin-search-path containment cannot be verified.  Every FSManager needs
+ * a process to exist, because OpalManager's constructor reads
  * PProcess::Current().
  *
- * The plugin search path is pinned FIRST, on every call, because constructing a
- * PProcess is what triggers PTLib's plugin enumeration and there is no second
- * chance once it has run.
+ * FAILS CLOSED.  The pin is applied and VERIFIED first, on every call, because
+ * constructing a PProcess is what triggers PTLib's plugin enumeration and there
+ * is no second chance once it has run.  Returning NULL is what makes an
+ * unverifiable pin visible: every caller reaches this helper through
+ * fst_requires(), so the case aborts instead of proceeding against an unaudited
+ * search path.  The check also gates the already-created path, which does not
+ * enumerate anything by itself; that is deliberate, because it keeps the rule
+ * "no PProcess is handed out without verified containment" true without a caller
+ * having to know which branch it took.
  */
 static FSProcess *test_opal_acquire_process(void)
 {
-	test_opal_pin_plugin_path();
+	if (!test_opal_pin_plugin_path()) {
+		return NULL;
+	}
 
 	if (!test_opal_process) {
 		test_opal_process = new FSProcess();
@@ -1297,11 +1400,14 @@ static void test_opal_suite_state_cleanup(void)
  * FCTX runs cases in declaration order within a single process, and that order
  * is load bearing:
  *
- *   1. the containment case runs first, so the preconditions every later case
- *      relies on are established as facts before anything depends on them, and
- *      so the IAX2 listener is observed at the earliest moment it could exist;
- *   2. the configuration-absent failure follows, still before any successful
- *      parse or load can leave module state behind;
+ *   1. the configuration-absent failure runs first, so its verdict cannot be an
+ *      artefact of a successful parse or load having left module state behind.
+ *      It stands alone in the ordering: the containment it needs is installed by
+ *      the setup hook, which runs ahead of every case body, and it asserts both
+ *      containment properties itself as fatal preconditions;
+ *   2. the containment case follows and examines those same properties in
+ *      detail, still before any case that does more than construct objects, so
+ *      the IAX2 listener is observed at the earliest moment it could matter;
  *   3. the three cases that only build objects come next, so they observe a
  *      pristine OPAL media-format registry - FSManager::Initialise() mutates
  *      the process-global registry;
@@ -1319,11 +1425,18 @@ FST_CORE_BEGIN("conf_opal")
 			 * Contain the toolkit's two unwanted side effects before any case
 			 * body can trigger them.  FCTX runs this hook once per declared
 			 * case, ahead of the body, which makes it the earliest point no
-			 * case ordering can bypass.  Both calls are idempotent.  Neither
-			 * asserts here: a fixture cannot fail a case, so the containment
-			 * case below asserts both outcomes instead.
+			 * case ordering can bypass.  Both calls are idempotent.
+			 *
+			 * Neither result is asserted HERE, and only here: a fixture runs
+			 * outside any test body, so a failed check would have nothing to
+			 * attribute itself to.  These calls are the early installation, not
+			 * the guarantee.  The guarantee is enforced where it matters - every
+			 * case that constructs an FSManager fatally requires
+			 * test_opal_iax2_containment_in_effect(), which re-establishes the
+			 * containment live, and test_opal_acquire_process() returns NULL
+			 * unless the pin verifies at that instant.
 			 */
-			test_opal_pin_plugin_path();
+			(void) test_opal_pin_plugin_path();
 			(void) test_opal_iax2_guard_acquire();
 		}
 		FST_SETUP_END()
@@ -1361,11 +1474,60 @@ FST_CORE_BEGIN("conf_opal")
 		FST_TEARDOWN_END()
 
 		/*
-		 * Case 1 - the toolkit's side effects are contained.
+		 * Case 1 - configuration absent.  DECLARED FIRST.
 		 *
-		 * Declared first because it asserts the preconditions every later case
-		 * depends on, and because the thing it is asserting about - the IAX2
-		 * listener - appears the instant the first FSManager is constructed.
+		 * ReadConfig() is asserted directly rather than through
+		 * mod_opal_load(), because FSManager::Initialise() discards
+		 * ReadConfig()'s status: a load would still report success and the
+		 * error branch would go unobserved.  No binding is registered, so the
+		 * fixture root's deliberate omission of the module's configuration
+		 * section is what makes the miss deterministic.
+		 *
+		 * DECLARED FIRST so its verdict cannot be an artefact of anything that
+		 * ran before it: no configuration has been injected, no successful parse
+		 * has happened and no module has been loaded.  It is self-sufficient in
+		 * the ordering as well - both containment properties are established by
+		 * the setup hook, which FCTX runs ahead of every case body, and both are
+		 * asserted here as fatal preconditions rather than inherited from the
+		 * case that examines them in detail.
+		 */
+		FST_TEST_BEGIN(config_absent_read_config_fails)
+		{
+			switch_status_t status = SWITCH_STATUS_SUCCESS;
+
+			/* Fatal preconditions, both asserted BEFORE any FSManager exists.
+			 *
+			 * The plugin search path must be verifiably pinned, because acquiring
+			 * the process below is what brings PTLib up and enumerates that
+			 * directory; and the IAX2 wildcard listener must be unable to bind,
+			 * because constructing a manager is what attempts it.  Asserted per
+			 * case, not just once, so no re-ordering can leave a manager built
+			 * without either. */
+			fst_requires(test_opal_plugin_path_is_pinned());
+			fst_requires(test_opal_iax2_containment_in_effect());
+			fst_requires(test_opal_acquire_process() != NULL);
+
+			{
+				FSManager manager;
+
+				status = manager.ReadConfig(false);
+			}
+
+			fst_check(status == SWITCH_STATUS_FALSE);
+		}
+		FST_TEST_END()
+
+		/*
+		 * Case 2 - the toolkit's side effects are contained.
+		 *
+		 * Declared immediately after the configuration-absent branch, and before
+		 * every other case, because it examines in detail the preconditions those
+		 * cases depend on, and because the thing it is asserting about - the IAX2
+		 * listener - appears the instant an FSManager is constructed.  The
+		 * containment itself is installed by the setup hook rather than by this
+		 * case, so being second costs nothing: case 1 asserts the same two
+		 * properties as bare preconditions, and this case is where they are
+		 * proved rather than merely required.
 		 *
 		 * Three independent observations, in increasing strength:
 		 *
@@ -1436,36 +1598,6 @@ FST_CORE_BEGIN("conf_opal")
 		FST_TEST_END()
 
 		/*
-		 * Case 2 - configuration absent.
-		 *
-		 * ReadConfig() is asserted directly rather than through
-		 * mod_opal_load(), because FSManager::Initialise() discards
-		 * ReadConfig()'s status: a load would still report success and the
-		 * error branch would go unobserved.  No binding is registered, so the
-		 * fixture root's deliberate omission of the module's configuration
-		 * section is what makes the miss deterministic.
-		 */
-		FST_TEST_BEGIN(config_absent_read_config_fails)
-		{
-			switch_status_t status = SWITCH_STATUS_SUCCESS;
-
-			fst_requires(test_opal_acquire_process() != NULL);
-			/* Fatal precondition: the IAX2 wildcard listener must be unable to
-			 * bind before a manager is constructed.  Asserted per case, not just
-			 * once, so no re-ordering can leave a manager built without it. */
-			fst_requires(test_opal_iax2_containment_in_effect());
-
-			{
-				FSManager manager;
-
-				status = manager.ReadConfig(false);
-			}
-
-			fst_check(status == SWITCH_STATUS_FALSE);
-		}
-		FST_TEST_END()
-
-		/*
 		 * Case 3 - dual endpoint construction.
 		 *
 		 * FSManager's constructor allocates an H.323, an IAX2 and a FreeSWITCH
@@ -1475,7 +1607,7 @@ FST_CORE_BEGIN("conf_opal")
 		 * valid across any refactoring of those members.
 		 *
 		 * Constructing a manager does attempt one bind - IAX2EndPoint's
-		 * constructor tries to listen on the wildcard address - and case 1
+		 * constructor tries to listen on the wildcard address - and case 2
 		 * establishes that the attempt is refused before this case runs.  What
 		 * is asserted here is only which endpoints the constructor allocated;
 		 * an endpoint exists whether or not its listener started.
