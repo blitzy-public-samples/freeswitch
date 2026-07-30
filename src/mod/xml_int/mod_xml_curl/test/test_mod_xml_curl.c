@@ -92,16 +92,58 @@
  * files, so the shipped fixture set stays exactly what it documents: the
  * canonical, well-formed contract.
  *
+ * DRIVING THE PRODUCTION DISPATCH WITHOUT A NETWORK PEER
+ * ------------------------------------------------------
+ * Asserting that a JSON failure "falls back" is only meaningful if the assertion
+ * runs the code that actually performs the fallback.  That code is the HTTP-200
+ * block inside xml_url_fetch(): the format dispatch, and then the untouched
+ * switch_xml_parse_file() call that every JSON failure edge converges on.  A
+ * test that only observes the decode helper returning NULL would stay green if
+ * that parse call were deleted, which is precisely the property a fallback test
+ * has to rule out.
+ *
+ * Reaching it needs an HTTP 200, and this suite is required to be hermetic: no
+ * listening port, no peer, no wall-clock dependence.  Those two requirements are
+ * reconciled by replacing the transport rather than the peer.  For the remainder
+ * of this translation unit the four libcurl entry points the module uses --
+ * easy_init, easy_perform, easy_getinfo and easy_cleanup -- plus slist_free_all
+ * and switch_uuid_format are interposed, exactly as switch_xml_bind_search_function
+ * is interposed above and for the same reason: it is the only way to observe and
+ * steer a file-static code path without editing the module.  The handle stays a
+ * REAL libcurl handle, so every option the module sets is set for real; only the
+ * request itself is replaced by a canned response written into the module's own
+ * temporary file.  Everything downstream of the transport -- the temporary file,
+ * the content-type probe, the dispatch, the BadgerFish decode, the production XML
+ * parse, the error and warning reporting and the unlink -- is the production code
+ * path, unmodified.
+ *
  * DETERMINISM
  * -----------
- * No case performs network I/O, opens a listening port, or depends on the
- * wall clock.  The two cases that need a response body on disk write it into
- * the core temp directory and remove it again.  The one case that needs a
- * configuration document injects it through switch_xml_bind_search_function_ret()
- * -- the same public binding API mod_xml_curl itself registers with -- and
- * removes it again with switch_xml_unbind_search_function_ptr() before the
- * case ends.  FCTX runs every case in one process in declaration order, so a
- * binding left behind would be visible to every later case.
+ * No case performs network I/O, opens a listening port, starts a thread, or
+ * depends on the wall clock.
+ *
+ * Files.  Every case that needs a document on disk writes it into one private
+ * directory created per test case under an unpredictable name, with owner-only
+ * permissions, and removed again unconditionally.  A fixed name under the shared
+ * temp directory would be both a collision between concurrent runs and a symlink
+ * target an unprivileged local user could pre-create.
+ *
+ * Configuration.  The one case that needs a configuration document injects it
+ * through switch_xml_bind_search_function_ret() -- the same public binding API
+ * mod_xml_curl itself registers with -- and removes it again with
+ * switch_xml_unbind_search_function_ptr() before the case ends.  FCTX runs every
+ * case in one process in declaration order, so a binding left behind would be
+ * visible to every later case.  The teardown block repeats every removal as a
+ * safety net, because a failed assertion leaves a case early.
+ *
+ * Log lines.  switch_log_printf() enqueues onto a single FIFO queue that one
+ * dispatcher thread drains, so a line is not visible to a bound logger the moment
+ * it is written.  The cases that count log lines therefore use a queue barrier: a
+ * unique sentinel line is emitted and waited for before the counters are armed,
+ * and a second sentinel is emitted and waited for before they are read.  Because
+ * the queue is FIFO and one thread drains it, observing a sentinel proves every
+ * line enqueued before it has already been dispatched.  Every wait is bounded and
+ * reports a failure rather than blocking.
  */
 
 #include <switch.h>
@@ -148,6 +190,50 @@ static void fst_xc_observe_binding(void *user_data)
 #define switch_xml_bind_search_function(_f, _s, _u) \
 	(fst_xc_observe_binding((void *) (_u)), switch_xml_bind_search_function_ret(_f, _s, _u, NULL))
 
+/*
+ * -------------------------------------------------------------------------
+ * INTERPOSING THE HTTP TRANSPORT
+ * -------------------------------------------------------------------------
+ * The names below are redirected for the remainder of this translation unit so
+ * that xml_url_fetch() can be driven end to end -- through the real HTTP-200
+ * gate, the real format dispatch and the real switch_xml_parse_file() fallback --
+ * with no peer, no port and no dependence on anything outside this process.
+ *
+ * Two different mechanisms are at work, and the difference matters:
+ *
+ *   switch_uuid_format() is declared by <switch.h>, which has already been
+ *   processed, so this macro rewrites only the module's CALL.  The shim has to be
+ *   declared explicitly, below, because nothing else declares it.  It exists so
+ *   the response body can be written into the very temporary file the production
+ *   fetch decodes: the file name is composed from a uuid the module generates
+ *   itself, and recording the formatted value is the least invasive way to learn
+ *   it.  The uuid bytes still come from the un-interposed switch_uuid_get(), so
+ *   the production file name stays as unpredictable as it is in production.
+ *
+ *   The five curl names are declared by <switch_curl.h>, which the module source
+ *   includes below -- AFTER these macros.  Their declarations are therefore
+ *   rewritten into declarations of the shims, which is why the shims are defined
+ *   with SWITCH_DECLARE and external linkage rather than as statics: they have to
+ *   match the prototypes the header now emits.  switch_curl_easy_setopt is
+ *   deliberately NOT interposed; it is itself a macro in that header, and
+ *   redefining it would be a macro redefinition the build refuses.  Nothing is
+ *   lost by leaving it alone, because switch_curl_easy_init() returns a genuine
+ *   libcurl handle and every option the module sets is really set on it.
+ *
+ * slist_free_all is interposed to record the header list at the moment it is
+ * released, which is the last point at which it is exactly what was handed to
+ * CURLOPT_HTTPHEADER -- so the Accept negotiation is asserted from what the
+ * request carried rather than from what the code appeared to append.
+ */
+static void fst_xc_uuid_format(char *buffer, const switch_uuid_t *uuid);
+
+#define switch_uuid_format fst_xc_uuid_format
+#define switch_curl_easy_init fst_xc_curl_easy_init
+#define switch_curl_easy_perform fst_xc_curl_easy_perform
+#define switch_curl_easy_getinfo fst_xc_curl_easy_getinfo
+#define switch_curl_easy_cleanup fst_xc_curl_easy_cleanup
+#define switch_curl_slist_free_all fst_xc_curl_slist_free_all
+
 #include "../mod_xml_curl.c"
 
 /*
@@ -157,15 +243,345 @@ static void fst_xc_observe_binding(void *user_data)
  */
 #define FST_XC_FIXTURE_DIR SWITCH_TEST_BASE_DIR_OVERRIDE SWITCH_PATH_SEPARATOR "fixtures" SWITCH_PATH_SEPARATOR
 
+/*
+ * Base names of the documents cases write to disk.  Each one is resolved inside
+ * the private per-case directory below, never directly under the shared core
+ * temporary directory.
+ */
+
 /* Response body written to disk by the case that drives the body reader. */
-#define FST_XC_TEMP_BODY "test_mod_xml_curl_body.json"
+#define FST_XC_TEMP_BODY "body.json"
 
 /* Document written to disk by the case that drives the file: URL shortcut. */
-#define FST_XC_TEMP_XML "test_mod_xml_curl_shortcut.xml"
+#define FST_XC_TEMP_XML "shortcut.xml"
 
 /* Documents written to disk by the configuration-parsing case, one per binding. */
-#define FST_XC_TEMP_DIRECTORY_XML "test_mod_xml_curl_directory.xml"
-#define FST_XC_TEMP_DIALPLAN_XML "test_mod_xml_curl_dialplan.xml"
+#define FST_XC_TEMP_DIRECTORY_XML "directory.xml"
+#define FST_XC_TEMP_DIALPLAN_XML "dialplan.xml"
+
+/* Response bodies written to disk by the case that drives the HTTP dispatch. */
+#define FST_XC_TEMP_RESPONSE_XML "response.xml"
+
+/* Target the case that proves a planted symlink is not written through uses. */
+#define FST_XC_TEMP_CANARY "canary"
+
+/*
+ * -------------------------------------------------------------------------
+ * PRIVATE PER-CASE TEMPORARY DIRECTORY
+ * -------------------------------------------------------------------------
+ * Everything this suite writes goes inside one directory created per test case,
+ * and none of it goes directly into SWITCH_GLOBAL_dirs.temp_dir.  That directory
+ * is shared and, when the core has no configured override, is the system-wide
+ * world-writable one, so a fixed file name there is two distinct problems: two
+ * concurrent runs of this binary would truncate each other's documents, and an
+ * unprivileged local user could pre-create the name as a symlink and have the
+ * suite truncate whatever it pointed at.
+ *
+ * The name carries a uuid, so it is not guessable.  switch_dir_make() is used
+ * rather than a recursive variant precisely because it fails when the name
+ * already exists -- including when it exists as a symlink -- so the creation is
+ * the exclusivity check and there is no window between testing and creating.  The
+ * permissions are owner-only, and the files inside are created with O_EXCL and
+ * O_NOFOLLOW so neither a leftover entry nor a symlink planted mid-run can be
+ * written through.
+ */
+static char fst_xc_temp_dir[1024] = "";
+
+/* Compose the absolute path of `name` inside the private directory. */
+static const char *fst_xc_temp_path(const char *name, char *buf, switch_size_t buflen)
+{
+	switch_snprintf(buf, buflen, "%s%s%s", fst_xc_temp_dir, SWITCH_PATH_SEPARATOR, name);
+
+	return buf;
+}
+
+/* Create the private directory.  Returns 1 on success, and is idempotent. */
+static int fst_xc_temp_dir_create(void)
+{
+	switch_uuid_t uuid;
+	char uuid_str[SWITCH_UUID_FORMATTED_LENGTH + 1] = "";
+
+	if (*fst_xc_temp_dir) {
+		return 1;
+	}
+
+	switch_uuid_get(&uuid);
+	switch_uuid_format(uuid_str, &uuid);
+
+	switch_snprintf(fst_xc_temp_dir, sizeof(fst_xc_temp_dir), "%s%stest_mod_xml_curl.%s", SWITCH_GLOBAL_dirs.temp_dir, SWITCH_PATH_SEPARATOR,
+					uuid_str);
+
+	if (switch_dir_make(fst_xc_temp_dir, SWITCH_FPROT_UREAD | SWITCH_FPROT_UWRITE | SWITCH_FPROT_UEXECUTE, NULL) != SWITCH_STATUS_SUCCESS) {
+		*fst_xc_temp_dir = '\0';
+		return 0;
+	}
+
+	return 1;
+}
+
+/*
+ * Remove the private directory and everything this suite put in it.  Called from
+ * the teardown block, so it runs whether a case finished or left early, and it is
+ * safe to call when nothing was created.  rmdir() only succeeds once the
+ * directory is empty, so a residue left behind by a failed case is reported by
+ * the directory surviving rather than passing silently.
+ */
+static void fst_xc_temp_dir_destroy(void)
+{
+	static const char *names[] = {
+		FST_XC_TEMP_BODY, FST_XC_TEMP_XML, FST_XC_TEMP_DIRECTORY_XML, FST_XC_TEMP_DIALPLAN_XML, FST_XC_TEMP_RESPONSE_XML,
+		FST_XC_TEMP_CANARY, NULL
+	};
+	char path[1024] = "";
+	int i = 0;
+
+	if (!*fst_xc_temp_dir) {
+		return;
+	}
+
+	for (i = 0; names[i]; i++) {
+		unlink(fst_xc_temp_path(names[i], path, sizeof(path)));
+	}
+
+	rmdir(fst_xc_temp_dir);
+	*fst_xc_temp_dir = '\0';
+}
+
+/*
+ * -------------------------------------------------------------------------
+ * THE INTERPOSED TRANSPORT
+ * -------------------------------------------------------------------------
+ * `canned` is what the next fetch will be answered with; the rest is what the
+ * fetch was observed to do.  A case fills in the first group, calls
+ * xml_url_fetch(), and then reads the second.
+ */
+#define FST_XC_MAX_SENT_HEADERS 16
+
+/*
+ * The fetch builds up to two header lists and releases them in a fixed order --
+ * the Content-Type list first, then the list the Expect: suppression uses -- so
+ * recording them into separate buckets in that order says which list each entry
+ * actually landed on.  That distinction is the whole point of one of the
+ * assertions below: when a binding both suppresses the 100-continue and asks for
+ * JSON, the production code hands curl the second list and only the second list,
+ * so an Accept entry appended to the first would be silently dropped from the
+ * request.  Asserting "both entries, same bucket" is what rules that out.
+ */
+#define FST_XC_HEADER_LISTS 2
+#define FST_XC_HEADER_LIST_CONTENT_TYPE 0
+#define FST_XC_HEADER_LIST_EXPECT 1
+
+typedef struct {
+	/* canned response */
+	const char *body;
+	switch_size_t body_len;
+	const char *content_type;
+	int content_type_present;
+	long response_code;
+	switch_CURLcode perform_result;
+	/* observed */
+	int perform_count;
+	int body_write_failures;
+	char sent_headers[FST_XC_HEADER_LISTS][FST_XC_MAX_SENT_HEADERS][192];
+	int sent_header_count[FST_XC_HEADER_LISTS];
+	int released_list_count;
+	/* the temporary file name the fetch composed, learned from switch_uuid_format() */
+	char last_uuid[SWITCH_UUID_FORMATTED_LENGTH + 1];
+	char last_body_path[1024];
+} fst_xc_transport_t;
+
+static fst_xc_transport_t fst_xc_transport;
+
+/* Arm the transport for one fetch and clear everything observed from the last. */
+static void fst_xc_transport_arm(const char *body, const char *content_type, long response_code)
+{
+	memset(&fst_xc_transport, 0, sizeof(fst_xc_transport));
+
+	fst_xc_transport.body = body;
+	fst_xc_transport.body_len = body ? strlen(body) : 0;
+	fst_xc_transport.content_type = content_type;
+	fst_xc_transport.content_type_present = content_type ? 1 : 0;
+	fst_xc_transport.response_code = response_code;
+	fst_xc_transport.perform_result = CURLE_OK;
+}
+
+/* 1 when the request built `header` onto the numbered list; see the note above. */
+static int fst_xc_transport_header_in_list(int list, const char *header)
+{
+	int i = 0;
+
+	if (list < 0 || list >= FST_XC_HEADER_LISTS) {
+		return 0;
+	}
+
+	for (i = 0; i < fst_xc_transport.sent_header_count[list] && i < FST_XC_MAX_SENT_HEADERS; i++) {
+		if (!strcmp(fst_xc_transport.sent_headers[list][i], header)) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+/* 1 when the request carried `header` on either list. */
+static int fst_xc_transport_sent_header(const char *header)
+{
+	int list = 0;
+
+	for (list = 0; list < FST_XC_HEADER_LISTS; list++) {
+		if (fst_xc_transport_header_in_list(list, header)) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * Reimplements the canonical uuid formatting so the value can be recorded on the
+ * way past.  The bytes are still whatever switch_uuid_get() produced.
+ */
+static void fst_xc_uuid_format(char *buffer, const switch_uuid_t *uuid)
+{
+	static const char hex[] = "0123456789abcdef";
+	const unsigned char *bytes = NULL;
+	int i = 0;
+	int o = 0;
+
+	if (!buffer) {
+		return;
+	}
+
+	if (!uuid) {
+		*buffer = '\0';
+		return;
+	}
+
+	bytes = (const unsigned char *) uuid->data;
+
+	for (i = 0; i < 16; i++) {
+		if (i == 4 || i == 6 || i == 8 || i == 10) {
+			buffer[o++] = '-';
+		}
+		buffer[o++] = hex[(bytes[i] >> 4) & 0x0f];
+		buffer[o++] = hex[bytes[i] & 0x0f];
+	}
+
+	buffer[o] = '\0';
+
+	switch_copy_string(fst_xc_transport.last_uuid, buffer, sizeof(fst_xc_transport.last_uuid));
+}
+
+/* A real handle, so every option the module sets is really set. */
+SWITCH_DECLARE(switch_CURL *) fst_xc_curl_easy_init(void)
+{
+	return (switch_CURL *) curl_easy_init();
+}
+
+SWITCH_DECLARE(void) fst_xc_curl_easy_cleanup(switch_CURL *handle)
+{
+	if (handle) {
+		curl_easy_cleanup((CURL *) handle);
+	}
+}
+
+/*
+ * The request itself.  Writes the canned body into the temporary file the fetch
+ * already opened, using the name the fetch composed -- so the production reader,
+ * the production parser and the production unlink all act on exactly the file
+ * they would act on in production.  A second descriptor is used rather than the
+ * module's: nothing has been written through the module's descriptor at this
+ * point, and closing it later neither truncates nor rewrites the file.
+ */
+SWITCH_DECLARE(switch_CURLcode) fst_xc_curl_easy_perform(switch_CURL *handle)
+{
+	int fd = -1;
+	switch_ssize_t wrote = 0;
+
+	(void) handle;
+
+	fst_xc_transport.perform_count++;
+
+	if (!fst_xc_transport.body) {
+		return fst_xc_transport.perform_result;
+	}
+
+	switch_snprintf(fst_xc_transport.last_body_path, sizeof(fst_xc_transport.last_body_path), "%s%s%s.tmp.xml", SWITCH_GLOBAL_dirs.temp_dir,
+					SWITCH_PATH_SEPARATOR, fst_xc_transport.last_uuid);
+
+	if ((fd = open(fst_xc_transport.last_body_path, O_WRONLY | O_TRUNC | O_NOFOLLOW, S_IRUSR | S_IWUSR)) < 0) {
+		fst_xc_transport.body_write_failures++;
+		return fst_xc_transport.perform_result;
+	}
+
+	wrote = write(fd, fst_xc_transport.body, fst_xc_transport.body_len);
+	close(fd);
+
+	if (wrote != (switch_ssize_t) fst_xc_transport.body_len) {
+		fst_xc_transport.body_write_failures++;
+	}
+
+	return fst_xc_transport.perform_result;
+}
+
+/*
+ * Serves the two pieces of response metadata the module reads.  Both are read
+ * adjacent to each other in production and before the handle is destroyed, which
+ * is what this shim's argument order preserves: CURLINFO_CONTENT_TYPE hands back
+ * a pointer the caller must copy, exactly as libcurl does, and NULL when the
+ * response carried no such header.
+ */
+SWITCH_DECLARE(switch_CURLcode) fst_xc_curl_easy_getinfo(switch_CURL *curl, switch_CURLINFO info, ...)
+{
+	va_list ap;
+	void *out = NULL;
+
+	(void) curl;
+
+	va_start(ap, info);
+	out = va_arg(ap, void *);
+	va_end(ap);
+
+	if (!out) {
+		return CURLE_OK;
+	}
+
+	if (info == CURLINFO_RESPONSE_CODE) {
+		*((long *) out) = fst_xc_transport.response_code;
+	} else if (info == CURLINFO_CONTENT_TYPE) {
+		*((char **) out) = fst_xc_transport.content_type_present ? (char *) fst_xc_transport.content_type : NULL;
+	}
+
+	return CURLE_OK;
+}
+
+/*
+ * Records a header list as it is released.  That is the last moment at which the
+ * list is exactly what was handed to CURLOPT_HTTPHEADER, so the Accept
+ * negotiation can be asserted from what the request carried.
+ */
+SWITCH_DECLARE(void) fst_xc_curl_slist_free_all(switch_curl_slist_t *list)
+{
+	struct curl_slist *node = NULL;
+	int bucket = fst_xc_transport.released_list_count;
+
+	fst_xc_transport.released_list_count++;
+
+	if (bucket < 0 || bucket >= FST_XC_HEADER_LISTS) {
+		curl_slist_free_all(list);
+		return;
+	}
+
+	for (node = list; node; node = node->next) {
+		if (node->data && fst_xc_transport.sent_header_count[bucket] < FST_XC_MAX_SENT_HEADERS) {
+			switch_copy_string(fst_xc_transport.sent_headers[bucket][fst_xc_transport.sent_header_count[bucket]], node->data,
+							   sizeof(fst_xc_transport.sent_headers[bucket][0]));
+			fst_xc_transport.sent_header_count[bucket]++;
+		}
+	}
+
+	curl_slist_free_all(list);
+}
 
 /*
  * Serialise one fixture pair.
@@ -291,13 +707,23 @@ static char *fst_xc_render(const char *text, const char *section)
  * success.  Both xml_curl_json_read_file() and xml_url_fetch() take a file name
  * rather than a buffer, because the production fetch streams the HTTP response
  * into a temporary file before anything decodes it.
+ *
+ * `path` always names an entry inside the private per-case directory.  Any
+ * previous copy is removed and the file is then created exclusively, so the
+ * descriptor can only ever be a regular file this call created: O_EXCL rules out
+ * writing through an entry that already existed, and O_NOFOLLOW refuses a symlink
+ * outright rather than following it.  Because the enclosing directory is
+ * owner-only and unpredictably named, no other user can win the gap between the
+ * removal and the creation.
  */
 static int fst_xc_write_file(const char *path, const char *text, switch_size_t len)
 {
 	switch_ssize_t wrote;
-	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+	int fd = -1;
 
-	if (fd < 0) {
+	unlink(path);
+
+	if ((fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, S_IRUSR | S_IWUSR)) < 0) {
 		return 0;
 	}
 
@@ -305,6 +731,214 @@ static int fst_xc_write_file(const char *path, const char *text, switch_size_t l
 	close(fd);
 
 	return (wrote == (switch_ssize_t) len) ? 1 : 0;
+}
+
+/*
+ * -------------------------------------------------------------------------
+ * COUNTING PRODUCTION LOG LINES DETERMINISTICALLY
+ * -------------------------------------------------------------------------
+ * "Falls back with a warning" is only an assertion if the warning is counted, and
+ * counting it needs care: switch_log_printf() does not call bound loggers, it
+ * enqueues onto one FIFO queue that a single dispatcher thread drains while
+ * holding the bind lock across every callback.  A line is therefore visible to a
+ * logger some time after it was written, and a naive "did anything arrive
+ * recently" test can be satisfied by a line an earlier case produced.
+ *
+ * The queue's own properties give an exact barrier instead.  Emitting a line that
+ * cannot be confused with anything else and waiting until this logger has seen it
+ * proves that every line enqueued before it has already been dispatched, because
+ * the queue is FIFO and one thread drains it.  Two barriers -- one before the
+ * counters are armed and one before they are read -- make the counts exact rather
+ * than probable.  The wait is bounded and reports a failure instead of blocking;
+ * that timeout is the only use of the clock, and it can only turn a hang into a
+ * diagnosable failure.
+ */
+#define FST_XC_LOG_PATTERNS 2
+#define FST_XC_LOG_TIMEOUT_US 10000000
+
+/* The one JSON fallback warning, emitted by xml_curl_json_decode_response(). */
+#define FST_XC_LOG_FALLBACK "falling back to XML parsing"
+#define FST_XC_LOG_IDX_FALLBACK 0
+
+/* The pre-existing error the production XML parse reports when it cannot parse. */
+#define FST_XC_LOG_PARSE_ERROR "Error Parsing Result!"
+#define FST_XC_LOG_IDX_PARSE_ERROR 1
+
+static switch_memory_pool_t *fst_xc_log_pool = NULL;
+static switch_mutex_t *fst_xc_log_mutex = NULL;
+static switch_thread_cond_t *fst_xc_log_cond = NULL;
+static const char *fst_xc_log_patterns[FST_XC_LOG_PATTERNS];
+static int fst_xc_log_counts[FST_XC_LOG_PATTERNS];
+static int fst_xc_log_armed = 0;
+static int fst_xc_log_bound = 0;
+static int fst_xc_log_barrier_seq = 0;
+static int fst_xc_log_sentinel_seen = 0;
+static char fst_xc_log_sentinel[64] = "";
+
+static switch_status_t fst_xc_logger(const switch_log_node_t *node, switch_log_level_t level)
+{
+	(void) level;
+
+	if (!fst_xc_log_mutex || !node || !node->content) {
+		return SWITCH_STATUS_SUCCESS;
+	}
+
+	switch_mutex_lock(fst_xc_log_mutex);
+
+	if (*fst_xc_log_sentinel && strstr(node->content, fst_xc_log_sentinel)) {
+		/* the barrier line itself, which is deliberately never counted */
+		fst_xc_log_sentinel_seen = 1;
+		switch_thread_cond_broadcast(fst_xc_log_cond);
+	} else if (fst_xc_log_armed) {
+		int i;
+
+		for (i = 0; i < FST_XC_LOG_PATTERNS; i++) {
+			if (fst_xc_log_patterns[i] && strstr(node->content, fst_xc_log_patterns[i])) {
+				fst_xc_log_counts[i]++;
+			}
+		}
+	}
+
+	switch_mutex_unlock(fst_xc_log_mutex);
+
+	return SWITCH_STATUS_SUCCESS;
+}
+
+/*
+ * Bind the counting logger.  The mutex and condition are allocated from a pool
+ * this capture owns rather than from fst_pool, because FST destroys the per-test
+ * pool BEFORE the teardown body runs -- a logger still bound at that moment would
+ * be waiting on freed memory.
+ */
+static int fst_xc_log_capture_start(void)
+{
+	memset(fst_xc_log_counts, 0, sizeof(fst_xc_log_counts));
+	memset(fst_xc_log_patterns, 0, sizeof(fst_xc_log_patterns));
+	fst_xc_log_armed = 0;
+	fst_xc_log_sentinel_seen = 0;
+	*fst_xc_log_sentinel = '\0';
+
+	if (fst_xc_log_bound) {
+		return 1;
+	}
+
+	if (switch_core_new_memory_pool(&fst_xc_log_pool) != SWITCH_STATUS_SUCCESS) {
+		return 0;
+	}
+
+	if (switch_mutex_init(&fst_xc_log_mutex, SWITCH_MUTEX_UNNESTED, fst_xc_log_pool) != SWITCH_STATUS_SUCCESS ||
+		switch_thread_cond_create(&fst_xc_log_cond, fst_xc_log_pool) != SWITCH_STATUS_SUCCESS) {
+		fst_xc_log_mutex = NULL;
+		fst_xc_log_cond = NULL;
+		switch_core_destroy_memory_pool(&fst_xc_log_pool);
+		return 0;
+	}
+
+	if (switch_log_bind_logger(fst_xc_logger, SWITCH_LOG_DEBUG, SWITCH_FALSE) != SWITCH_STATUS_SUCCESS) {
+		fst_xc_log_mutex = NULL;
+		fst_xc_log_cond = NULL;
+		switch_core_destroy_memory_pool(&fst_xc_log_pool);
+		return 0;
+	}
+
+	fst_xc_log_bound = 1;
+
+	return 1;
+}
+
+/*
+ * Unbind and release, in that order and idempotently.  switch_log_unbind_logger()
+ * takes the same lock the dispatcher holds across every callback, so once it has
+ * returned no dispatch can still be inside fst_xc_logger() and the pool backing
+ * the mutex and condition is safe to destroy.
+ */
+static void fst_xc_log_capture_stop(void)
+{
+	if (!fst_xc_log_bound) {
+		return;
+	}
+
+	switch_log_unbind_logger(fst_xc_logger);
+	fst_xc_log_bound = 0;
+	fst_xc_log_armed = 0;
+	fst_xc_log_mutex = NULL;
+	fst_xc_log_cond = NULL;
+
+	if (fst_xc_log_pool) {
+		switch_core_destroy_memory_pool(&fst_xc_log_pool);
+	}
+}
+
+/* Emit a barrier line and wait until this logger has seen it.  Returns 1 when the
+   queue has demonstrably drained past it. */
+static int fst_xc_log_barrier(void)
+{
+	switch_time_t deadline = 0;
+	int seen = 0;
+
+	if (!fst_xc_log_bound || !fst_xc_log_mutex) {
+		return 0;
+	}
+
+	switch_mutex_lock(fst_xc_log_mutex);
+	switch_snprintf(fst_xc_log_sentinel, sizeof(fst_xc_log_sentinel), "fst-xc-log-barrier-%d", ++fst_xc_log_barrier_seq);
+	fst_xc_log_sentinel_seen = 0;
+	switch_mutex_unlock(fst_xc_log_mutex);
+
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "%s\n", fst_xc_log_sentinel);
+
+	deadline = switch_micro_time_now() + FST_XC_LOG_TIMEOUT_US;
+
+	switch_mutex_lock(fst_xc_log_mutex);
+	while (!fst_xc_log_sentinel_seen && switch_micro_time_now() < deadline) {
+		switch_thread_cond_timedwait(fst_xc_log_cond, fst_xc_log_mutex, 50000);
+	}
+	seen = fst_xc_log_sentinel_seen;
+	*fst_xc_log_sentinel = '\0';
+	switch_mutex_unlock(fst_xc_log_mutex);
+
+	return seen;
+}
+
+/* Start counting the two production messages from zero. */
+static void fst_xc_log_arm(void)
+{
+	if (!fst_xc_log_mutex) {
+		return;
+	}
+
+	switch_mutex_lock(fst_xc_log_mutex);
+	memset(fst_xc_log_counts, 0, sizeof(fst_xc_log_counts));
+	fst_xc_log_patterns[FST_XC_LOG_IDX_FALLBACK] = FST_XC_LOG_FALLBACK;
+	fst_xc_log_patterns[FST_XC_LOG_IDX_PARSE_ERROR] = FST_XC_LOG_PARSE_ERROR;
+	fst_xc_log_armed = 1;
+	switch_mutex_unlock(fst_xc_log_mutex);
+}
+
+static void fst_xc_log_disarm(void)
+{
+	if (!fst_xc_log_mutex) {
+		return;
+	}
+
+	switch_mutex_lock(fst_xc_log_mutex);
+	fst_xc_log_armed = 0;
+	switch_mutex_unlock(fst_xc_log_mutex);
+}
+
+static int fst_xc_log_count(int index)
+{
+	int count = 0;
+
+	if (!fst_xc_log_mutex || index < 0 || index >= FST_XC_LOG_PATTERNS) {
+		return -1;
+	}
+
+	switch_mutex_lock(fst_xc_log_mutex);
+	count = fst_xc_log_counts[index];
+	switch_mutex_unlock(fst_xc_log_mutex);
+
+	return count;
 }
 
 /*
@@ -412,6 +1046,148 @@ static switch_xml_t fst_xc_conf_search(const char *section, const char *tag_name
 	return switch_xml_parse_str_dynamic((char *) document, SWITCH_TRUE);
 }
 
+/*
+ * -------------------------------------------------------------------------
+ * MODULE-WIDE STATE, AND THE ONE PLACE IT IS GIVEN BACK
+ * -------------------------------------------------------------------------
+ * do_config() allocates every binding and duplicates every string member into
+ * globals.pool, so the one case that drives it has to lend the module a pool.  It
+ * deliberately does NOT lend it fst_pool.  FST destroys the per-test pool at the
+ * TOP of the teardown macro, before the teardown body runs, and a failed
+ * assertion inside a test body goes straight to teardown -- so a case that had
+ * already registered bindings out of fst_pool would reach the teardown body with
+ * every binding pointing into freed memory, and the unbinding itself would be
+ * reading it.
+ *
+ * A pool this suite owns removes the ordering problem entirely: it is created
+ * when the module is lent state and destroyed only after the bindings that live
+ * in it have been removed from the core.  Everything the case mutates is released
+ * through this one function, it is idempotent, and it is called both at the end
+ * of the case and from the teardown block, so no assertion outcome can leave
+ * module state behind.
+ */
+static switch_memory_pool_t *fst_xc_module_pool = NULL;
+static char *fst_xc_module_conf = NULL;
+
+static int fst_xc_module_pool_create(void)
+{
+	if (fst_xc_module_pool) {
+		return 1;
+	}
+
+	if (switch_core_new_memory_pool(&fst_xc_module_pool) != SWITCH_STATUS_SUCCESS) {
+		return 0;
+	}
+
+	globals.pool = fst_xc_module_pool;
+
+	return 1;
+}
+
+static void fst_xc_module_state_cleanup(void)
+{
+	/* the injected configuration provider, if this case got as far as registering it */
+	switch_xml_unbind_search_function_ptr(fst_xc_conf_search);
+
+	/*
+	 * The module's own shutdown releases the enable-post-var hashes the parsed
+	 * configuration created and removes the fetch bindings do_config() registered.
+	 * It is safe unconditionally: with nothing configured the hash list is empty
+	 * and the unbind reports SWITCH_STATUS_FALSE harmlessly.
+	 */
+	mod_xml_curl_shutdown();
+
+	globals.pool = NULL;
+
+	/* only now, with no binding left pointing into it */
+	if (fst_xc_module_pool) {
+		switch_core_destroy_memory_pool(&fst_xc_module_pool);
+	}
+
+	switch_safe_free(fst_xc_module_conf);
+}
+
+/*
+ * -------------------------------------------------------------------------
+ * DRIVING ONE COMPLETE FETCH
+ * -------------------------------------------------------------------------
+ * Every HTTP sub-case follows the same protocol, and the order inside it is
+ * load-bearing, so it lives in exactly one place:
+ *
+ *   1. drain the log queue, so nothing an earlier sub-case emitted can be
+ *      counted against this one;
+ *   2. arm the pattern counters;
+ *   3. arm the canned response and run the real xml_url_fetch();
+ *   4. drain the log queue again, so everything THIS fetch emitted has certainly
+ *      been dispatched before the counters are read;
+ *   5. disarm, so nothing emitted afterwards is counted either.
+ *
+ * The drain is a barrier, not a sleep.  The core has one log queue drained by one
+ * thread, so a sentinel line observed by the bound logger proves every line
+ * enqueued before it has already been delivered to every bound logger.  The only
+ * clock reading anywhere in the protocol is the bounded timeout that turns a
+ * wedged log thread into a reported failure instead of a hung test.
+ */
+static int fst_xc_fetch_barrier_ok = 0;
+
+static switch_xml_t fst_xc_drive_fetch(xml_binding_t *binding, const char *section, const char *body, const char *content_type, long response_code)
+{
+	switch_xml_t xml = NULL;
+
+	fst_xc_fetch_barrier_ok = fst_xc_log_barrier();
+	fst_xc_log_arm();
+	fst_xc_transport_arm(body, content_type, response_code);
+
+	xml = xml_url_fetch(section, "user", "id", "1000", NULL, binding);
+
+	if (!fst_xc_log_barrier()) {
+		fst_xc_fetch_barrier_ok = 0;
+	}
+
+	fst_xc_log_disarm();
+
+	return xml;
+}
+
+/*
+ * The id attribute of the single <user> a fetched provisioning document carries,
+ * or the empty string when the document is not shaped that way.  The two response
+ * bodies the HTTP case uses name different ids, so this is what distinguishes the
+ * tree the BadgerFish translator built from the tree switch_xml_parse_file()
+ * built -- which is the only way to prove which decoder actually ran.
+ */
+static const char *fst_xc_fetched_user_id(switch_xml_t xml)
+{
+	switch_xml_t section_tag = NULL;
+	switch_xml_t user_tag = NULL;
+
+	if (!xml || !(section_tag = switch_xml_child(xml, "section")) || !(user_tag = switch_xml_child(section_tag, "user"))) {
+		return "";
+	}
+
+	return switch_xml_attr_soft(user_tag, "id");
+}
+
+/*
+ * Remove the preprocessed copy switch_xml_parse_file() leaves in the log
+ * directory.  When the parse succeeds the returned tree owns that path and
+ * switch_xml_free() unlinks it; when it fails the production code frees the name
+ * without unlinking the file, so the sub-case that drives a failing parse tidies
+ * up after it rather than leaving residue behind.  The name is derived from the
+ * temporary file the fetch composed, which is why the uuid is recorded.
+ */
+static void fst_xc_unlink_preprocessed(void)
+{
+	char path[1024] = "";
+
+	if (!*fst_xc_transport.last_uuid) {
+		return;
+	}
+
+	switch_snprintf(path, sizeof(path), "%s%s%s.tmp.xml.fsxml", SWITCH_GLOBAL_dirs.log_dir, SWITCH_PATH_SEPARATOR, fst_xc_transport.last_uuid);
+	unlink(path);
+}
+
 FST_CORE_BEGIN("conf")
 {
 	FST_SUITE_BEGIN(mod_xml_curl)
@@ -419,24 +1195,31 @@ FST_CORE_BEGIN("conf")
 		FST_SETUP_BEGIN()
 		{
 			/*
-			 * Nothing to arrange: every case builds its own inputs.  The block is
-			 * mandatory all the same -- FST_CORE_BEGIN selects the full core, and
-			 * FST_TEST_BEGIN then requires both the per-test memory pool and the
-			 * soft timer that only this macro creates.
+			 * One private directory per case for everything written to disk.  The
+			 * block is mandatory in any event -- FST_CORE_BEGIN selects the full
+			 * core, and FST_TEST_BEGIN then requires both the per-test memory pool
+			 * and the soft timer that only this macro creates.
 			 */
+			fst_requires(fst_xc_temp_dir_create());
 		}
 		FST_SETUP_END()
 
 		FST_TEARDOWN_BEGIN()
 		{
 			/*
-			 * Safety net.  fst_requires() jumps straight to teardown on failure, so a
-			 * case that registers an XML binding could otherwise leave it behind for
-			 * every later case in this single process.  Both calls return
-			 * SWITCH_STATUS_FALSE, harmlessly, when the function is not bound.
+			 * Safety net, and the only cleanup this suite relies on.  fst_requires()
+			 * jumps straight to teardown on failure, so anything a case registers has
+			 * to be removable from here as well as from the case itself.  Every call
+			 * below is idempotent and harmless when the case never got that far.
+			 *
+			 * Order matters: module state is released before the private directory is
+			 * removed, because releasing it unbinds fetch functions whose documents
+			 * live in that directory.
 			 */
-			switch_xml_unbind_search_function_ptr(fst_xc_conf_search);
+			fst_xc_log_capture_stop();
+			fst_xc_module_state_cleanup();
 			switch_xml_unbind_search_function_ptr(xml_url_fetch);
+			fst_xc_temp_dir_destroy();
 		}
 		FST_TEARDOWN_END()
 
@@ -772,6 +1555,66 @@ FST_CORE_BEGIN("conf")
 		}
 		FST_TEST_END()
 
+		/*
+		 * Declared before the first case that writes a document, because it establishes
+		 * the guarantee every one of those cases depends on.
+		 *
+		 * SWITCH_GLOBAL_dirs.temp_dir is shared, and when the core has no configured
+		 * override it is the system-wide world-writable directory.  A fixed file name
+		 * there would be two distinct defects: two concurrent runs of this binary would
+		 * truncate each other's documents, and any local user could pre-create the name
+		 * as a symlink and have the suite write through it.  Every document this suite
+		 * writes therefore lives inside a per-case directory whose name carries a uuid,
+		 * created owner-only, with each file created rather than opened.
+		 */
+		FST_TEST_BEGIN(temp_documents_are_isolated_and_created)
+		{
+			char path[1024] = "";
+			char canary[1024] = "";
+			char buf[64] = "";
+			struct stat st;
+			switch_ssize_t got = 0;
+			int fd = -1;
+
+			/* a real directory, owner-only, and not the shared one */
+			fst_requires(*fst_xc_temp_dir != '\0');
+			fst_xcheck(strcmp(fst_xc_temp_dir, SWITCH_GLOBAL_dirs.temp_dir) != 0,
+					   "the suite must not write straight into the shared temporary directory");
+			fst_requires(lstat(fst_xc_temp_dir, &st) == 0);
+			fst_xcheck(S_ISDIR(st.st_mode), "the private path must be a directory, not a symlink to one");
+			fst_check_int_equals((int) (st.st_mode & 0777), (int) (S_IRUSR | S_IWUSR | S_IXUSR));
+
+			/* and it starts empty, so no case can be affected by another case's documents */
+			fst_check(lstat(fst_xc_temp_path(FST_XC_TEMP_BODY, path, sizeof(path)), &st) != 0);
+			fst_check(lstat(fst_xc_temp_path(FST_XC_TEMP_XML, path, sizeof(path)), &st) != 0);
+			fst_check(lstat(fst_xc_temp_path(FST_XC_TEMP_DIRECTORY_XML, path, sizeof(path)), &st) != 0);
+			fst_check(lstat(fst_xc_temp_path(FST_XC_TEMP_DIALPLAN_XML, path, sizeof(path)), &st) != 0);
+
+			/*
+			 * A symlink planted at one of the names is not written through.  The entry is
+			 * removed and a regular file is created in its place, so the target keeps its
+			 * contents; O_NOFOLLOW refuses the descriptor outright if the removal were
+			 * lost to a race, and O_EXCL refuses an entry that reappeared in the gap.
+			 */
+			fst_xc_temp_path(FST_XC_TEMP_CANARY, canary, sizeof(canary));
+			fst_requires(fst_xc_write_file(canary, "untouched", 9));
+
+			fst_xc_temp_path(FST_XC_TEMP_XML, path, sizeof(path));
+			fst_requires(symlink(canary, path) == 0);
+			fst_xcheck(fst_xc_write_file(path, "X", 1) == 1, "the document must still be written");
+
+			fst_requires(lstat(path, &st) == 0);
+			fst_xcheck(S_ISREG(st.st_mode), "the document must be a regular file, not the symlink that was planted");
+			fst_check_int_equals((int) st.st_size, 1);
+
+			fst_requires((fd = open(canary, O_RDONLY, 0)) > -1);
+			got = read(fd, buf, sizeof(buf) - 1);
+			close(fd);
+			fst_check_int_equals((int) got, 9);
+			fst_xcheck(!strcmp(buf, "untouched"), "the symlink target must be untouched");
+		}
+		FST_TEST_END()
+
 		FST_TEST_BEGIN(response_body_read_is_exact)
 		{
 			/*
@@ -783,7 +1626,7 @@ FST_CORE_BEGIN("conf")
 			char path[1024] = "";
 			char *got = NULL;
 
-			switch_snprintf(path, sizeof(path), "%s%s%s", SWITCH_GLOBAL_dirs.temp_dir, SWITCH_PATH_SEPARATOR, FST_XC_TEMP_BODY);
+			fst_xc_temp_path(FST_XC_TEMP_BODY, path, sizeof(path));
 
 			/* the recorded length covers bytes past the NUL, so a NUL-terminated read
 			   would hand the decoder a document hiding arbitrary trailing content */
@@ -858,6 +1701,57 @@ FST_CORE_BEGIN("conf")
 		}
 		FST_TEST_END()
 
+		FST_TEST_BEGIN(envelope_ownership_reserved)
+		{
+			char *rendered = NULL;
+
+			/*
+			 * Matching the top-level key against the requested section is necessary but not
+			 * sufficient, because the root member is translated INTO the <section> element
+			 * the adapter just created.  switch_xml_set_attr() replaces an existing
+			 * attribute IN PLACE rather than appending a second one, so a root-level
+			 * BadgerFish "@name" would rewrite the section name the adapter had already set
+			 * -- after the top-level key had been checked, and with no diagnostic.
+			 *
+			 * The consequence is not cosmetic.  switch_xml_locate() treats a
+			 * <section name="result"> carrying a <result status="not found"> as a deliberate
+			 * miss and goes on to satisfy the lookup from static local configuration.  A
+			 * response could therefore substitute a silent "not found" for a directory
+			 * lookup while the decode reported success: no fallback warning, no XML parse,
+			 * and a caller that believes it asked the gateway and was told nothing exists.
+			 *
+			 * The envelope is core-owned, so every root-level attribute member is refused.
+			 */
+			fst_xcheck(fst_xc_rejects("{\"directory\":{\"@name\":\"result\",\"user\":{\"@id\":\"1000\"}}}", "directory"),
+					   "a root @name may not rename the section");
+			fst_xcheck(fst_xc_rejects("{\"directory\":{\"user\":{\"@id\":\"1000\"},\"@name\":\"result\"}}", "directory"),
+					   "the position of the root @name in the object must not matter");
+			fst_xcheck(fst_xc_rejects("{\"directory\":{\"@name\":\"directory\",\"user\":{}}}", "directory"),
+					   "a root @name is refused even when it agrees with the requested section");
+			fst_xcheck(fst_xc_rejects("{\"directory\":{\"@type\":\"freeswitch/xml\",\"user\":{}}}", "directory"),
+					   "no root-level attribute member is contractual");
+			fst_xcheck(fst_xc_rejects("{\"directory\":{\"$\":\"text\",\"@name\":\"result\"}}", "directory"),
+					   "a root @name is refused alongside root text as well");
+
+			/*
+			 * The refusal is exactly one level deep: "@name" is the ordinary way a
+			 * configuration document names itself, and every shipped fixture relies on it
+			 * one level below the envelope.
+			 */
+			fst_xcheck(fst_xc_accepts("{\"configuration\":{\"configuration\":{\"@name\":\"acl.conf\"}}}", "configuration"),
+					   "a child @name must still be accepted");
+			fst_xcheck(fst_xc_accepts("{\"directory\":{\"user\":{\"@name\":\"result\"}}}", "directory"),
+					   "even the sentinel spelling is legitimate below the envelope");
+
+			/* and the envelope a caller receives names the section that was requested */
+			rendered = fst_xc_render("{\"directory\":{\"user\":{\"@id\":\"1000\"}}}", "directory");
+			fst_requires(rendered != NULL);
+			fst_check_string_has(rendered, "<section name=\"directory\">");
+			fst_check_string_does_not_have(rendered, "name=\"result\"");
+			switch_safe_free(rendered);
+		}
+		FST_TEST_END()
+
 		FST_TEST_BEGIN(xml_name_injection_rejected)
 		{
 			/*
@@ -892,6 +1786,63 @@ FST_CORE_BEGIN("conf")
 					   "even a section name that matches must still be a valid XML name");
 			fst_xcheck(fst_xc_accepts("{\"directory\":{\"ns:user\":{\"@x:id\":\"1\"}}}", "directory"),
 					   "namespaced names must still be accepted");
+		}
+		FST_TEST_END()
+
+		FST_TEST_BEGIN(serializer_immune_sequence_rejected)
+		{
+			char *rendered = NULL;
+
+			/*
+			 * A name is drawn from a whitelist, but a VALUE only has to be legal XML
+			 * character data -- and legal character data is not the same thing as data the
+			 * serializer will escape.  switch_xml_ampencode() escapes '<' as &lt; in the
+			 * ordinary case, but a '<' whose next byte is '!' is emitted RAW and puts the
+			 * encoder into an immune mode that copies every remaining byte verbatim.  A
+			 * single value of "<!" is therefore enough to leave the escaping regime for the
+			 * rest of the string, so a response could forge attribute and element syntax
+			 * with nothing but a quote and a bracket after it.
+			 *
+			 * The sequence is refused in the one common value validator, which is what
+			 * makes the rule hold at every builder call site: an attribute value, text
+			 * content, and any value a future arm might add.
+			 */
+			fst_xcheck(xml_curl_json_is_valid_text("<!") == 0, "the bare immune-mode trigger must be refused");
+			fst_xcheck(xml_curl_json_is_valid_text("<![CDATA[x]]>") == 0, "a CDATA section must be refused");
+			fst_xcheck(xml_curl_json_is_valid_text("<!-- x --><y z=\"1\"/>") == 0, "a comment opener must be refused");
+			fst_xcheck(xml_curl_json_is_valid_text("1000<!DOCTYPE") == 0, "the sequence must be refused anywhere in the value");
+
+			/* and a '<' that is NOT the trigger stays perfectly legal, because it is
+			   escaped -- the check is exactly two characters wide and no wider */
+			fst_xcheck(xml_curl_json_is_valid_text("a<b") == 1, "a lone < must still be accepted");
+			fst_xcheck(xml_curl_json_is_valid_text("<") == 1, "a value that ends on < must not be over-read");
+			fst_xcheck(xml_curl_json_is_valid_text("!<") == 1, "the reversed pair is not the trigger");
+			fst_xcheck(xml_curl_json_is_valid_text("a<") == 1, "a trailing < must still be accepted");
+
+			/* the same rule through the whole decoder, at both builder call sites */
+			fst_xcheck(fst_xc_rejects("{\"directory\":{\"user\":{\"@id\":\"<![CDATA[1000]]>\"}}}", "directory"),
+					   "an attribute value may not carry the immune-mode trigger");
+			fst_xcheck(fst_xc_rejects("{\"directory\":{\"user\":{\"$\":\"<!-- \\\" injected=\\\"yes\"}}}", "directory"),
+					   "text content may not carry the immune-mode trigger");
+
+			/*
+			 * And in its escaped spelling.  The lexical gate accepts \u003c, because U+003C
+			 * is legal XML character data -- so this case only passes if the rule is applied
+			 * to the DECODED value rather than to the payload bytes.
+			 */
+			fst_xcheck(fst_xc_rejects("{\"directory\":{\"user\":{\"@id\":\"\\u003c!DOCTYPE\"}}}", "directory"),
+					   "the escaped spelling of the trigger must be refused too");
+			fst_xcheck(fst_xc_rejects("{\"directory\":{\"user\":{\"$\":\"a\\u003c\\u0021b\"}}}", "directory"),
+					   "both halves of the trigger may be escaped");
+
+			/* a legitimate lone '<' survives and comes back escaped, in an attribute and in
+			   text alike, so no raw markup opener can reach the serialised document */
+			rendered = fst_xc_render("{\"directory\":{\"user\":{\"@id\":\"a<b\",\"note\":{\"$\":\"1 < 2\"}}}}", "directory");
+			fst_requires(rendered != NULL);
+			fst_check_string_has(rendered, "id=\"a&lt;b\"");
+			fst_check_string_has(rendered, "1 &lt; 2");
+			fst_check_string_does_not_have(rendered, "<!");
+			switch_safe_free(rendered);
 		}
 		FST_TEST_END()
 
@@ -1227,6 +2178,7 @@ FST_CORE_BEGIN("conf")
 		FST_TEST_BEGIN(accept_header_append_is_non_destructive)
 		{
 			switch_curl_slist_t *list = NULL;
+			switch_curl_slist_t *head = NULL;
 
 			/*
 			 * switch_curl_slist_append() returns NULL when it cannot allocate and leaves
@@ -1252,6 +2204,36 @@ FST_CORE_BEGIN("conf")
 			fst_check_string_equals(list->data, "Content-Type: application/x-www-form-urlencoded");
 			fst_check_string_equals(list->next->data, "Accept: application/json");
 			fst_check(list->next->next == NULL);
+
+			/*
+			 * The 100-continue suppression appends to the SAME list when a binding both
+			 * disables 100-continue and asks for JSON, because that configuration routes the
+			 * Accept entry into the list the suppression then extends.  It therefore has to
+			 * go through this helper as well: assigning the append result straight back would
+			 * replace a list already carrying Accept with NULL on an allocation failure, leak
+			 * it, and hand curl an empty header set while the fetch still believed it had
+			 * negotiated JSON.  Composed through the helper, the two entries coexist in
+			 * request order and a later refusal cannot disturb either of them.
+			 */
+			fst_xcheck(xml_curl_json_append_header(&list, "Expect:") == 1, "the Expect suppression must append after them");
+			fst_check_string_equals(list->next->next->data, "Expect:");
+			fst_check(list->next->next->next == NULL);
+
+			/*
+			 * The failure path of that third append is the one the finding named: the
+			 * caller's own pointer must still be the head of the same three-entry list
+			 * afterwards, because that pointer is what reaches CURLOPT_HTTPHEADER.  An
+			 * append that assigned its result back would have replaced it with NULL and
+			 * leaked all three entries while the fetch still believed it had negotiated
+			 * JSON.
+			 */
+			head = list;
+			fst_xcheck(xml_curl_json_append_header(&list, NULL) == 0, "a refusal after the third entry must still report failure");
+			fst_xcheck(list == head, "a refused append must leave the caller's list pointer exactly as it was");
+			fst_check_string_equals(list->data, "Content-Type: application/x-www-form-urlencoded");
+			fst_check_string_equals(list->next->data, "Accept: application/json");
+			fst_check_string_equals(list->next->next->data, "Expect:");
+			fst_check(list->next->next->next == NULL);
 
 			switch_curl_slist_free_all(list);
 		}
@@ -1323,7 +2305,7 @@ FST_CORE_BEGIN("conf")
 			formats[1] = "json";
 			formats[2] = "JSON";
 
-			switch_snprintf(path, sizeof(path), "%s%s%s", SWITCH_GLOBAL_dirs.temp_dir, SWITCH_PATH_SEPARATOR, FST_XC_TEMP_XML);
+			fst_xc_temp_path(FST_XC_TEMP_XML, path, sizeof(path));
 			switch_snprintf(url, sizeof(url), "file:%s", path);
 			fst_requires(fst_xc_write_file(path, document, strlen(document)));
 
@@ -1357,8 +2339,178 @@ FST_CORE_BEGIN("conf")
 
 			/* a fetch with no binding at all is refused before anything else happens */
 			fst_check(xml_url_fetch("directory", "user", "id", "1000", NULL, NULL) == NULL);
+		}
+		FST_TEST_END()
 
-			unlink(path);
+		/*
+		 * The complete HTTP fetch, with no peer.
+		 *
+		 * Every other case in this suite observes one piece of the fetch.  This one
+		 * runs xml_url_fetch() itself: the real request-header composition, the real
+		 * temporary file, the real HTTP-200 gate, the real response-format dispatch,
+		 * the real switch_xml_parse_file() fallback and the real unlink.  Only the
+		 * transport underneath is replaced.
+		 *
+		 * That distinction is the point.  A test that drove only
+		 * xml_curl_json_decode_response() would still pass if the fallback parse were
+		 * deleted from the production dispatch, because that helper's contract is to
+		 * return NULL and let the caller fall back -- so the sub-cases below are
+		 * written to fail in exactly that situation: each one asserts which decoder
+		 * produced the tree, from a user id that only one of the two response bodies
+		 * contains.
+		 */
+		FST_TEST_BEGIN(http_dispatch_end_to_end)
+		{
+			/* the JSON body names user 1000; its XML counterpart names user 2000, so the
+			   id in the returned tree says which decoder ran */
+			static const char json_body[] = "{\"directory\":{\"user\":{\"@id\":\"1000\"}}}";
+			static const char xml_body[] = "<document type=\"freeswitch/xml\"><section name=\"directory\">"
+				"<user id=\"2000\"></user></section></document>";
+			xml_binding_t binding;
+			switch_xml_t xml = NULL;
+
+			fst_requires(fst_xc_log_capture_start());
+
+			/*
+			 * 1. The binding asked for JSON and the gateway answered JSON.  The
+			 *    translator decodes it, nothing falls back, and the request carried the
+			 *    Accept header on the list curl was handed.
+			 */
+			memset(&binding, 0, sizeof(binding));
+			binding.url = (char *) "http://127.0.0.1:1/provision";
+			binding.curl_max_bytes = XML_CURL_MAX_BYTES;
+			binding.response_format = (char *) "json";
+
+			xml = fst_xc_drive_fetch(&binding, "directory", json_body, "application/json; charset=utf-8", 200);
+			fst_xcheck(fst_xc_fetch_barrier_ok, "the log queue must drain before the warning counters are read");
+			fst_check_int_equals(fst_xc_transport.perform_count, 1);
+			fst_check_int_equals(fst_xc_transport.body_write_failures, 0);
+			/* both header lists are released, so neither is leaked whichever branch ran */
+			fst_check_int_equals(fst_xc_transport.released_list_count, 2);
+			fst_xcheck(fst_xc_transport_header_in_list(FST_XC_HEADER_LIST_CONTENT_TYPE, "Content-Type: application/x-www-form-urlencoded"),
+					   "the pre-existing request content type must still be sent");
+			fst_xcheck(fst_xc_transport_header_in_list(FST_XC_HEADER_LIST_CONTENT_TYPE, "Accept: application/json"),
+					   "a JSON binding must advertise Accept: application/json on the list curl receives");
+			/* the 100-continue list is not built at all for this binding */
+			fst_check_int_equals(fst_xc_transport.sent_header_count[FST_XC_HEADER_LIST_EXPECT], 0);
+			fst_xcheck(xml != NULL, "a JSON response to a JSON binding must decode");
+			fst_check_string_equals(fst_xc_fetched_user_id(xml), "1000");
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_FALLBACK), 0);
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_PARSE_ERROR), 0);
+			switch_xml_free(xml);
+			xml = NULL;
+
+			/*
+			 * 2. The binding asked for JSON and the gateway answered XML, announcing it
+			 *    as XML.  This is the content-type mismatch: exactly one warning, and the
+			 *    document still resolves -- through the untouched XML parse.  The id
+			 *    proves it: 2000 exists only in the XML body, so this assertion fails if
+			 *    the fallback parse is removed.
+			 */
+			xml = fst_xc_drive_fetch(&binding, "directory", xml_body, "text/xml; charset=utf-8", 200);
+			fst_xcheck(fst_xc_fetch_barrier_ok, "the log queue must drain before the warning counters are read");
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_FALLBACK), 1);
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_PARSE_ERROR), 0);
+			fst_xcheck(xml != NULL, "a mismatched content type must fall back to the XML parse, not fail the fetch");
+			fst_check_string_equals(fst_xc_fetched_user_id(xml), "2000");
+			switch_xml_free(xml);
+			xml = NULL;
+
+			/*
+			 * 3. The binding asked for JSON, the gateway announced JSON, and the body is
+			 *    not JSON at all.  Same single warning, same fallback, same resolved
+			 *    document -- the announcement is not trusted over the bytes.
+			 */
+			xml = fst_xc_drive_fetch(&binding, "directory", xml_body, "application/json", 200);
+			fst_xcheck(fst_xc_fetch_barrier_ok, "the log queue must drain before the warning counters are read");
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_FALLBACK), 1);
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_PARSE_ERROR), 0);
+			fst_xcheck(xml != NULL, "a body that is not JSON must fall back to the XML parse");
+			fst_check_string_equals(fst_xc_fetched_user_id(xml), "2000");
+			switch_xml_free(xml);
+			xml = NULL;
+
+			/*
+			 * 4. Nothing can decode an empty body, so both decoders report and the fetch
+			 *    resolves to nothing.  This is the one path that emits the module's
+			 *    pre-existing parse error as well as the new fallback warning, and the
+			 *    two are deliberately distinct messages: the warning explains why JSON
+			 *    was abandoned, the error reports that XML failed too.
+			 */
+			xml = fst_xc_drive_fetch(&binding, "directory", "", "application/json", 200);
+			fst_xcheck(fst_xc_fetch_barrier_ok, "the log queue must drain before the warning counters are read");
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_FALLBACK), 1);
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_PARSE_ERROR), 1);
+			fst_xcheck(xml == NULL, "an empty body must resolve to nothing");
+			fst_xc_unlink_preprocessed();
+
+			/*
+			 * 5. No response-format at all.  The gateway answers JSON, and the module
+			 *    treats it exactly as it did before this parameter existed: no Accept
+			 *    header is negotiated, no JSON decode is attempted, no fallback warning
+			 *    is emitted, and switch_xml_parse_file() is handed the body and returns
+			 *    the diagnostic-carrying tree it has always returned for a non-XML
+			 *    document.  That last detail is what makes this a behaviour assertion
+			 *    rather than a smoke test.
+			 */
+			memset(&binding, 0, sizeof(binding));
+			binding.url = (char *) "http://127.0.0.1:1/provision";
+			binding.curl_max_bytes = XML_CURL_MAX_BYTES;
+
+			xml = fst_xc_drive_fetch(&binding, "directory", json_body, "application/json", 200);
+			fst_xcheck(fst_xc_fetch_barrier_ok, "the log queue must drain before the warning counters are read");
+			fst_xcheck(!fst_xc_transport_sent_header("Accept: application/json"),
+					   "a binding that did not ask for JSON must not advertise it");
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_FALLBACK), 0);
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_PARSE_ERROR), 0);
+			fst_xcheck(xml != NULL, "the XML-only path must return the parser's tree unchanged");
+			if (xml) {
+				fst_xcheck(*switch_xml_error(xml) != '\0', "the parser must report a JSON body as the malformed XML it is");
+			}
+			switch_xml_free(xml);
+			xml = NULL;
+
+			/*
+			 * 6. A non-200 response.  The success gate is untouched, so no decoder runs
+			 *    at all: no fallback warning, no parse error, and no document.
+			 */
+			binding.response_format = (char *) "json";
+			xml = fst_xc_drive_fetch(&binding, "directory", json_body, "application/json", 500);
+			fst_xcheck(fst_xc_fetch_barrier_ok, "the log queue must drain before the warning counters are read");
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_FALLBACK), 0);
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_PARSE_ERROR), 0);
+			fst_xcheck(xml == NULL, "a non-200 response must resolve to nothing whatever the format is");
+
+			/*
+			 * 7. The composition that the non-destructive append exists for: a binding
+			 *    that both suppresses the 100-continue and asks for JSON.  That
+			 *    configuration routes the Accept entry onto the same list the Expect
+			 *    suppression builds, and the production code hands curl that list and
+			 *    only that list -- so both entries have to be on it, and neither may
+			 *    have landed on the list curl never receives.
+			 */
+			memset(&binding, 0, sizeof(binding));
+			binding.url = (char *) "http://127.0.0.1:1/provision";
+			binding.curl_max_bytes = XML_CURL_MAX_BYTES;
+			binding.response_format = (char *) "json";
+			binding.disable100continue = 1;
+
+			xml = fst_xc_drive_fetch(&binding, "directory", json_body, "application/json", 200);
+			fst_xcheck(fst_xc_fetch_barrier_ok, "the log queue must drain before the warning counters are read");
+			fst_check_int_equals(fst_xc_transport.released_list_count, 2);
+			fst_xcheck(fst_xc_transport_header_in_list(FST_XC_HEADER_LIST_EXPECT, "Accept: application/json"),
+					   "Accept must be on the list a 100-continue-suppressing binding hands curl");
+			fst_xcheck(fst_xc_transport_header_in_list(FST_XC_HEADER_LIST_EXPECT, "Expect:"),
+					   "the 100-continue suppression must be on that same list");
+			fst_xcheck(!fst_xc_transport_header_in_list(FST_XC_HEADER_LIST_CONTENT_TYPE, "Accept: application/json"),
+					   "Accept must not be appended to the list this binding makes curl discard");
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_FALLBACK), 0);
+			fst_xcheck(xml != NULL, "suppressing the 100-continue must not disturb the JSON decode");
+			fst_check_string_equals(fst_xc_fetched_user_id(xml), "1000");
+			switch_xml_free(xml);
+			xml = NULL;
+
+			fst_xc_log_capture_stop();
 		}
 		FST_TEST_END()
 
@@ -1370,30 +2522,34 @@ FST_CORE_BEGIN("conf")
 		{
 			char dir_path[1024] = "";
 			char dial_path[1024] = "";
-			char *conf = NULL;
 			xml_binding_t *json_binding = NULL;
 			xml_binding_t *xml_binding = NULL;
 			switch_xml_t located = NULL;
 			switch_xml_t located_node = NULL;
 			switch_xml_t extension_tag = NULL;
 
-			switch_snprintf(dir_path, sizeof(dir_path), "%s%s%s", SWITCH_GLOBAL_dirs.temp_dir, SWITCH_PATH_SEPARATOR,
-							FST_XC_TEMP_DIRECTORY_XML);
-			switch_snprintf(dial_path, sizeof(dial_path), "%s%s%s", SWITCH_GLOBAL_dirs.temp_dir, SWITCH_PATH_SEPARATOR,
-							FST_XC_TEMP_DIALPLAN_XML);
+			fst_xc_temp_path(FST_XC_TEMP_DIRECTORY_XML, dir_path, sizeof(dir_path));
+			fst_xc_temp_path(FST_XC_TEMP_DIALPLAN_XML, dial_path, sizeof(dial_path));
 			fst_requires(fst_xc_write_file(dir_path, fst_xc_directory_document, strlen(fst_xc_directory_document)));
 			fst_requires(fst_xc_write_file(dial_path, fst_xc_dialplan_document, strlen(fst_xc_dialplan_document)));
 
-			conf = switch_mprintf(fst_xc_conf_template, dir_path, dial_path);
-			fst_requires(conf != NULL);
+			/*
+			 * The configuration string outlives the do_config() call that reads it,
+			 * because the registered provider re-parses it on every lookup.  Handing it
+			 * to the suite-owned pointer means the teardown block frees it even if an
+			 * assertion below never lets this case reach its own tail.
+			 */
+			fst_xc_module_conf = switch_mprintf(fst_xc_conf_template, dir_path, dial_path);
+			fst_requires(fst_xc_module_conf != NULL);
 
 			/*
 			 * do_config() allocates every binding and duplicates every string member into
-			 * the module pool, so it has to be given one.  The per-test pool is exactly
-			 * right: it is destroyed at teardown, and every binding it backs is removed
-			 * from the core before this case ends.
+			 * the module pool, so it has to be given one -- and it must not be fst_pool.
+			 * See the note above fst_xc_module_pool_create(): FST destroys the per-test
+			 * pool before the teardown body runs, so a binding allocated out of it would
+			 * be unbound through freed memory on any failing assertion.
 			 */
-			globals.pool = fst_pool;
+			fst_requires(fst_xc_module_pool_create());
 
 			/*
 			 * The fixture configuration root deliberately carries no xml_curl.conf
@@ -1406,7 +2562,7 @@ FST_CORE_BEGIN("conf")
 			/* now present the configuration through the same public binding API
 			   mod_xml_curl itself registers its fetch function with */
 			fst_xcheck(switch_xml_bind_search_function_ret(fst_xc_conf_search, switch_xml_parse_section_string("configuration"),
-														   (void *) conf, NULL) == SWITCH_STATUS_SUCCESS,
+														   (void *) fst_xc_module_conf, NULL) == SWITCH_STATUS_SUCCESS,
 					   "the configuration provider must register");
 
 			/*
@@ -1427,51 +2583,70 @@ FST_CORE_BEGIN("conf")
 			 * pool-duplicated string.
 			 */
 			json_binding = (xml_binding_t *) fst_xc_observed_bindings[0];
-			fst_requires(json_binding != NULL);
-			fst_requires(json_binding->response_format != NULL);
-			fst_check_string_equals(json_binding->response_format, "json");
+			xml_binding = (xml_binding_t *) fst_xc_observed_bindings[1];
+
+			/*
+			 * Every assertion from here on is non-fatal.  This case has already lent the
+			 * module a pool, registered a configuration provider and registered two fetch
+			 * bindings with the core, and fst_requires() abandons the case body on the
+			 * spot -- so a fatal assertion here would hand the rest of the run a core
+			 * still carrying this case's bindings.  The teardown block does clean up
+			 * unconditionally, but the case reads its own state below, so it guards
+			 * instead of trusting.
+			 */
+			if (json_binding) {
+				fst_xcheck(json_binding->response_format != NULL, "the opted-in binding must carry response-format");
+				if (json_binding->response_format) {
+					fst_check_string_equals(json_binding->response_format, "json");
+				}
+
+				/*
+				 * And the eighteen parameters that were already there are unchanged by
+				 * the nineteenth: a sample spanning a string, an integer, a long, a
+				 * boolean-gated flag, a size and the post-variable hash is read back off
+				 * the same binding.
+				 */
+				fst_check_string_equals(json_binding->method, "POST");
+				fst_check_string_equals(json_binding->cred, "provisioner:secret");
+				fst_check_string_equals(json_binding->bindings, "directory");
+				fst_check_string_equals(json_binding->cookie_file, "/tmp/test_mod_xml_curl_cookies");
+				fst_check_int_equals(json_binding->timeout, 7);
+				fst_check_int_equals((int) json_binding->curl_max_bytes, 65536);
+				fst_check_int_equals(json_binding->use_dynamic_url, 1);
+				fst_check_int_equals((int) json_binding->enable_cacert_check, 1);
+				fst_check_int_equals((int) json_binding->enable_ssl_verifyhost, 1);
+				/* the 100-continue parameter is a suppression: a false value clears the
+				   default rather than setting a flag, and that inversion is easy to break */
+				fst_check_int_equals(json_binding->disable100continue, 0);
+				/* "digest" is OR-ed into the basic default rather than replacing it */
+				fst_check_int_equals((int) json_binding->auth_scheme, (int) (CURLAUTH_BASIC | CURLAUTH_DIGEST));
+				/* an explicit POST method is still a POST, not a GET-style request */
+				fst_check_int_equals(json_binding->use_get_style, 0);
+				fst_check(json_binding->vars_map != NULL);
+			} else {
+				fst_fail("do_config() did not build the binding that carries response-format");
+			}
 
 			/*
 			 * The binding that omitted it is left at the NULL the wholesale memset()
 			 * wrote, which is the whole mechanism by which a binding that does not ask
 			 * for JSON stays XML-only.
 			 */
-			xml_binding = (xml_binding_t *) fst_xc_observed_bindings[1];
-			fst_requires(xml_binding != NULL);
-			fst_check(xml_binding->response_format == NULL);
+			if (xml_binding) {
+				fst_check(xml_binding->response_format == NULL);
 
-			/*
-			 * And the eighteen parameters that were already there are unchanged by the
-			 * nineteenth: a sample spanning a string, an integer, a long, a boolean-gated
-			 * flag, a size and the post-variable hash is read back off the same binding.
-			 */
-			fst_check_string_equals(json_binding->method, "POST");
-			fst_check_string_equals(json_binding->cred, "provisioner:secret");
-			fst_check_string_equals(json_binding->bindings, "directory");
-			fst_check_string_equals(json_binding->cookie_file, "/tmp/test_mod_xml_curl_cookies");
-			fst_check_int_equals(json_binding->timeout, 7);
-			fst_check_int_equals((int) json_binding->curl_max_bytes, 65536);
-			fst_check_int_equals(json_binding->use_dynamic_url, 1);
-			fst_check_int_equals((int) json_binding->enable_cacert_check, 1);
-			fst_check_int_equals((int) json_binding->enable_ssl_verifyhost, 1);
-			/* the 100-continue parameter is a suppression: a false value clears the
-			   default rather than setting a flag, and that inversion is easy to break */
-			fst_check_int_equals(json_binding->disable100continue, 0);
-			/* "digest" is OR-ed into the basic default rather than replacing it */
-			fst_check_int_equals((int) json_binding->auth_scheme, (int) (CURLAUTH_BASIC | CURLAUTH_DIGEST));
-			/* an explicit POST method is still a POST, not a GET-style request */
-			fst_check_int_equals(json_binding->use_get_style, 0);
-			fst_check(json_binding->vars_map != NULL);
-
-			/* the binding that configured none of them keeps the module's own defaults */
-			fst_check_string_equals(xml_binding->bindings, "dialplan");
-			fst_check(xml_binding->method == NULL);
-			fst_check(xml_binding->cred == NULL);
-			fst_check_int_equals(xml_binding->timeout, 0);
-			fst_check_int_equals(xml_binding->disable100continue, 1);
-			fst_check_int_equals((int) xml_binding->auth_scheme, (int) CURLAUTH_BASIC);
-			fst_check_int_equals((int) xml_binding->curl_max_bytes, (int) XML_CURL_MAX_BYTES);
-			fst_check(xml_binding->vars_map == NULL);
+				/* and it keeps the module's own defaults for everything else */
+				fst_check_string_equals(xml_binding->bindings, "dialplan");
+				fst_check(xml_binding->method == NULL);
+				fst_check(xml_binding->cred == NULL);
+				fst_check_int_equals(xml_binding->timeout, 0);
+				fst_check_int_equals(xml_binding->disable100continue, 1);
+				fst_check_int_equals((int) xml_binding->auth_scheme, (int) CURLAUTH_BASIC);
+				fst_check_int_equals((int) xml_binding->curl_max_bytes, (int) XML_CURL_MAX_BYTES);
+				fst_check(xml_binding->vars_map == NULL);
+			} else {
+				fst_fail("do_config() did not build the binding that omits response-format");
+			}
 
 			/*
 			 * Close the loop.  The binding do_config() built FROM the response-format
@@ -1503,20 +2678,18 @@ FST_CORE_BEGIN("conf")
 			}
 			switch_xml_free(located);
 
-			fst_check(switch_xml_unbind_search_function_ptr(fst_xc_conf_search) == SWITCH_STATUS_SUCCESS);
-
 			/*
 			 * Shutdown is asserted rather than left implicit.  It releases the
 			 * enable-post-var hash this configuration created and removes the fetch
-			 * bindings do_config() registered, so the pool this case borrowed can be torn
-			 * down cleanly at teardown.
+			 * bindings do_config() registered, which is what makes the borrowed pool safe
+			 * to destroy.  The whole sequence -- unbind the provider, shut the module
+			 * down, drop globals.pool, destroy the pool, free the configuration string --
+			 * lives in one idempotent helper that the teardown block also calls, so the
+			 * only thing left to assert here is that the module reported success.
 			 */
+			fst_check(switch_xml_unbind_search_function_ptr(fst_xc_conf_search) == SWITCH_STATUS_SUCCESS);
 			fst_check(mod_xml_curl_shutdown() == SWITCH_STATUS_SUCCESS);
-			globals.pool = NULL;
-
-			switch_safe_free(conf);
-			unlink(dir_path);
-			unlink(dial_path);
+			fst_xc_module_state_cleanup();
 		}
 		FST_TEST_END()
 	}

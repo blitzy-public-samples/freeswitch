@@ -136,6 +136,22 @@ SWITCH_END_EXTERN_C
 #define TEST_OPAL_LISTEN_PORT "21720"
 
 /*
+ * A second listener name, used by the settings case alone.
+ *
+ * Every listener ReadConfig() stores is announced on the log (mod_opal.cpp:431),
+ * and that line is the only publicly observable evidence of the listener-name
+ * default that the case below it asserts.  If two cases announced the SAME name,
+ * a line left over from the earlier one could satisfy the later one's
+ * observation without the later parse having produced anything at all - the
+ * assertion would then be reporting the wrong case's work.  Giving the settings
+ * case a name that no other case ever produces removes that possibility by
+ * construction: any line carrying this name is, by definition, not the line the
+ * listener-name case is waiting for, and the capture's expected-name filter
+ * rejects it and records it as foreign.
+ */
+#define TEST_OPAL_SETTINGS_LISTEN_NAME "opal-settings-listener"
+
+/*
  * Settings values chosen so the assertions cannot pass by accident.  FSManager
  * member-initialises m_context to "default" and m_dialplan to "XML" in its
  * constructor, so the injected configuration must differ from both for the
@@ -183,7 +199,42 @@ static const char TEST_OPAL_CONFIG_XML[] =
 	"</document>";
 
 /*
- * A second configuration document whose single <listener> element carries NO
+ * The document served to the settings case, identical to the one above except
+ * that its listener carries TEST_OPAL_SETTINGS_LISTEN_NAME.
+ *
+ * The distinct name is not decoration.  The settings case parses a configuration
+ * that declares a listener, so it necessarily announces one on the log, and the
+ * case that follows it observes exactly that kind of announcement.  Naming the
+ * two listeners differently is what makes the later observation unambiguous: see
+ * the note beside TEST_OPAL_SETTINGS_LISTEN_NAME.  The listener stanza itself
+ * cannot simply be dropped from this document - a configuration without one
+ * drives FSManager::Initialise() into its StartListener("") wildcard bind
+ * (mod_opal.cpp:284-285), and every injected document in this suite therefore
+ * carries an explicit loopback listener on a fixed high port.
+ */
+static const char TEST_OPAL_CONFIG_XML_SETTINGS[] =
+	"<document type=\"freeswitch/xml\">"
+		"<section name=\"configuration\">"
+			"<configuration name=\"" TEST_OPAL_CONFIG_FILE "\" description=\"Opal Endpoints\">"
+				"<settings>"
+					"<param name=\"context\" value=\"" TEST_OPAL_CONTEXT "\"/>"
+					"<param name=\"dialplan\" value=\"" TEST_OPAL_DIALPLAN "\"/>"
+					"<param name=\"codec-prefs\" value=\"" TEST_OPAL_CODEC_PREFS "\"/>"
+					"<param name=\"disable-transcoding\" value=\"true\"/>"
+					"<param name=\"jitter-size\" value=\"40,100\"/>"
+				"</settings>"
+				"<listeners>"
+					"<listener name=\"" TEST_OPAL_SETTINGS_LISTEN_NAME "\">"
+						"<param name=\"h323-ip\" value=\"" TEST_OPAL_LISTEN_ADDRESS "\"/>"
+						"<param name=\"h323-port\" value=\"" TEST_OPAL_LISTEN_PORT "\"/>"
+					"</listener>"
+				"</listeners>"
+			"</configuration>"
+		"</section>"
+	"</document>";
+
+/*
+ * A third configuration document whose single <listener> element carries NO
  * name attribute.  This is the input that drives FSManager::ReadConfig() down
  * its listener-name default branch (mod_opal.cpp:418-419): switch_xml_attr_soft()
  * yields "" for an absent attribute, PString::IsEmpty() is therefore true, and
@@ -242,13 +293,42 @@ static const char TEST_OPAL_CONFIG_XML_UNNAMED_LISTENER[] =
  * and waits for a matching line under a mutex and condition variable, which is
  * the shape reproduced below.
  *
- * DELIVERY IS ASYNCHRONOUS, so a bounded wait is mandatory rather than
- * decorative.  switch_log_printf() only enqueues the node
+ * DELIVERY IS ASYNCHRONOUS, and the consequence is a cross-case hazard rather
+ * than a mere need to wait.  switch_log_printf() only enqueues the node
  * (switch_queue_trypush(LOG_QUEUE, node), src/switch_log.c:732); bound loggers
  * are invoked later, from log_thread(), which pops the queue and calls each
- * binding whose level admits the node (src/switch_log.c:511-518).  A test that
- * read the captured value straight after ReadConfig() returned would be racing
- * that thread.
+ * binding whose level admits the node (src/switch_log.c:501-518).  So a test
+ * that read the captured value straight after ReadConfig() returned would be
+ * racing that thread - and, worse, a listener line produced by an EARLIER case
+ * can still be sitting in LOG_QUEUE when this case binds its logger, and would
+ * then be handed to this logger as though this case had produced it.
+ *
+ * TWO INDEPENDENT MECHANISMS make the observation exact, and neither consults
+ * the clock:
+ *
+ *   1. A QUEUE BARRIER.  Arming binds the logger and then emits a sentinel line
+ *      of its own, carrying a token unique to that arming, and refuses to accept
+ *      any listener line until the logger has SEEN that sentinel come back.
+ *      LOG_QUEUE is one FIFO (src/switch_log.c:61, created at :755) drained by
+ *      exactly one consumer (log_thread's blocking switch_queue_pop at :501), so
+ *      once the sentinel has been dispatched every node enqueued before it has
+ *      necessarily been dispatched already.  Anything left pending from an
+ *      earlier case therefore arrives strictly BEFORE the barrier opens and is
+ *      discarded, and everything this case goes on to produce is enqueued
+ *      strictly AFTER the sentinel and is admitted.  That is a proof about queue
+ *      order, not an estimate: it replaces the timestamp look-back an earlier
+ *      revision used, which could only ever guess how much wall time separates
+ *      two cases and gave no protection at all against a node that was still
+ *      queued when the logger bound.
+ *
+ *   2. AN EXPECTED-NAME FILTER.  Arming also states the listener name the case
+ *      is about to provoke, and only that name satisfies the wait.  A
+ *      post-barrier line naming anything else is recorded separately as foreign,
+ *      so the case can assert that no other listener line appeared inside its
+ *      window rather than silently accepting the first marker it sees.  Together
+ *      with the deliberately distinct name the settings case announces
+ *      (TEST_OPAL_SETTINGS_LISTEN_NAME), a leaked line can therefore neither be
+ *      mistaken for this case's line nor vacuously satisfy it.
  *
  * The binding level is SWITCH_LOG_DEBUG because the dispatch test is
  * "binding->level >= node->level" and DEBUG is the highest-numbered real level,
@@ -264,48 +344,85 @@ static const char TEST_OPAL_CONFIG_XML_UNNAMED_LISTENER[] =
 #define TEST_OPAL_LOG_TIMEOUT_MS 5000
 
 /*
- * Slack applied to the arming stamp described below.  The soft timer refreshes
- * the cached clock in coarse steps, so a node emitted immediately after arming
- * can legitimately carry a stamp a few milliseconds older than the arming
- * instant.  100 ms absorbs that comfortably while still leaving most of the
- * roughly one second that separates consecutive cases as margin against a stale
- * node from the previous case.
+ * Barrier tuning.  The overall bound is generous because it is only ever spent
+ * on the failure path, and the slice is the interval after which the sentinel is
+ * re-emitted: switch_queue_trypush() DROPS a node when the queue is full
+ * (src/switch_log.c:732-734), and a barrier that hung forever on one dropped
+ * sentinel would be a worse failure mode than one that simply says it again.
  */
-#define TEST_OPAL_LOG_ARM_SLACK_US 100000
-
-static switch_mutex_t *test_opal_log_mutex = NULL;
-static switch_thread_cond_t *test_opal_log_cond = NULL;
-static char test_opal_log_listener_name[128];
-static int test_opal_log_captured = 0;
-static switch_time_t test_opal_log_armed_at = 0;
+#define TEST_OPAL_LOG_BARRIER_TIMEOUT_MS 5000
+#define TEST_OPAL_LOG_BARRIER_SLICE_MS 250
 
 /*
- * Bound logger.  Extracts the listener name from between the quotes of the first
- * matching line and signals the waiter.
+ * Sentinel text.  The trailing epoch makes each arming's token unique, so a
+ * sentinel still queued from a previous arming cannot open this one's barrier
+ * early.  It shares no substring with the listener marker above, so neither
+ * search can ever match the other's line.
+ */
+#define TEST_OPAL_LOG_BARRIER_PREFIX "mod-opal-test-log-barrier-"
+
+/* Bound on every listener name this suite records, expected or foreign. */
+#define TEST_OPAL_LOG_NAME_MAX 128
+
+/*
+ * Capture state.
  *
- * Two filters make the capture unambiguous.  Only the FIRST match is kept, so a
- * later line cannot overwrite an observation the waiter has not read yet.  And a
- * node is only considered when its timestamp is at or after the moment capture
- * was armed, which closes the one race the queue makes possible: switch_log_printf()
- * enqueues nodes and log_thread() dispatches them later, so a line emitted by an
- * earlier case could in principle still be sitting in LOG_QUEUE when this logger
- * binds.  Such a node carries an older timestamp and is discarded here, so an
- * earlier case's listener name can never be mistaken for this one's.
+ * The mutex and the condition variable live in a pool this capture owns, NOT in
+ * fst_pool.  fst_pool is destroyed by FST_TEARDOWN_BEGIN before the teardown
+ * body runs and lasts exactly one case, whereas a bound logger is reachable from
+ * log_thread until switch_log_unbind_logger() returns.  Holding the two on
+ * fst_pool would mean that any exit which skipped the disarm - and the suite's
+ * safety sweep runs in a LATER case, by which time that pool is long gone - left
+ * a live binding pointing at freed memory.  A capture-owned pool makes the disarm
+ * safe from anywhere, which is precisely what lets the sweep call it.
  *
- * The stamp comparison must use ONE clock, and it has to be the log subsystem's
- * own.  src/switch_log.c:565 stamps a node with switch_micro_time_now(), which
- * returns the soft timer's cached clock while the core is running
- * (src/switch_time.c:311-314) and therefore LAGS the real clock that
- * switch_time_now() reads straight from CLOCK_REALTIME (src/switch_apr.c:327-336).
- * Arming from the real clock and comparing against a lagging node stamp discards
- * the very line being waited for, so test_opal_log_capture_start() arms with
- * switch_micro_time_now() as well.
+ * The name buffers are deliberately static rather than pool-backed, so a name a
+ * case has already observed stays readable after the capture is torn down.
+ */
+static switch_memory_pool_t *test_opal_log_pool = NULL;
+static switch_mutex_t *test_opal_log_mutex = NULL;
+static switch_thread_cond_t *test_opal_log_cond = NULL;
+static int test_opal_log_bound = 0;
+static unsigned int test_opal_log_epoch = 0;
+static char test_opal_log_sentinel[64];
+static int test_opal_log_barrier_seen = 0;
+static char test_opal_log_expected_name[TEST_OPAL_LOG_NAME_MAX];
+static char test_opal_log_listener_name[TEST_OPAL_LOG_NAME_MAX];
+static int test_opal_log_captured = 0;
+static char test_opal_log_foreign_name[TEST_OPAL_LOG_NAME_MAX];
+static int test_opal_log_foreign = 0;
+
+/*
+ * Bound logger.  Opens the barrier when this arming's sentinel comes back, and
+ * thereafter classifies every listener line it is handed.
  *
- * The mutex guard is dropped defensively when capture is not armed, so a stray
- * invocation can never touch pool memory the teardown has already freed.
+ * Nothing is accepted before the barrier opens.  A node dispatched at that point
+ * was enqueued no later than the sentinel, so it belongs to whatever ran before
+ * this arming and is not this case's evidence - see the barrier note above for
+ * why single-consumer FIFO order makes that a certainty rather than a guess.
+ *
+ * After the barrier, a line whose name matches the armed expectation exactly
+ * satisfies the wait; only the FIRST such line is kept, so a later one cannot
+ * overwrite an observation the waiter has not read yet.  A line naming anything
+ * else is recorded once as foreign and deliberately does NOT satisfy the wait:
+ * the case reports it instead, which is what turns a stray announcement from
+ * something that could quietly become the answer into something that fails
+ * loudly and names itself.
+ *
+ * The name comparison is exact: strncmp over the announced length, plus the
+ * requirement that the expected name ends there, so no name can match a prefix
+ * of another.  test_opal_log_capture_start() refuses an empty expectation, which
+ * would otherwise match every name through that same zero-length comparison.
+ *
+ * The mutex pointer is checked before it is used, so a stray invocation arriving
+ * when nothing is armed returns without touching capture state at all.
  */
 static switch_status_t test_opal_listener_logger(const switch_log_node_t *node, switch_log_level_t level)
 {
+	const char *marker = NULL;
+	const char *start = NULL;
+	const char *end = NULL;
+
 	(void) level;
 
 	if (!test_opal_log_mutex || !node || !node->content) {
@@ -314,18 +431,41 @@ static switch_status_t test_opal_listener_logger(const switch_log_node_t *node, 
 
 	switch_mutex_lock(test_opal_log_mutex);
 
-	if (!test_opal_log_captured && node->timestamp >= test_opal_log_armed_at) {
-		const char *marker = strstr(node->content, TEST_OPAL_LISTENER_LOG_MARKER);
+	/* The barrier.  Until this arming's own sentinel has been observed, every
+	 * node handed over predates the arming and is ignored. */
+	if (!test_opal_log_barrier_seen) {
+		if (strstr(node->content, test_opal_log_sentinel)) {
+			test_opal_log_barrier_seen = 1;
+			switch_thread_cond_broadcast(test_opal_log_cond);
+		}
 
-		if (marker) {
-			const char *start = marker + (sizeof(TEST_OPAL_LISTENER_LOG_MARKER) - 1);
-			const char *end = strchr(start, '\'');
+		switch_mutex_unlock(test_opal_log_mutex);
 
-			if (end && (switch_size_t) (end - start) < sizeof(test_opal_log_listener_name)) {
-				memcpy(test_opal_log_listener_name, start, (switch_size_t) (end - start));
-				test_opal_log_listener_name[end - start] = '\0';
-				test_opal_log_captured = 1;
-				switch_thread_cond_signal(test_opal_log_cond);
+		return SWITCH_STATUS_SUCCESS;
+	}
+
+	marker = strstr(node->content, TEST_OPAL_LISTENER_LOG_MARKER);
+
+	if (marker) {
+		start = marker + (sizeof(TEST_OPAL_LISTENER_LOG_MARKER) - 1);
+		end = strchr(start, '\'');
+
+		if (end) {
+			switch_size_t length = (switch_size_t) (end - start);
+
+			if (length < TEST_OPAL_LOG_NAME_MAX) {
+				if (!strncmp(start, test_opal_log_expected_name, length) && !test_opal_log_expected_name[length]) {
+					if (!test_opal_log_captured) {
+						memcpy(test_opal_log_listener_name, start, length);
+						test_opal_log_listener_name[length] = '\0';
+						test_opal_log_captured = 1;
+						switch_thread_cond_broadcast(test_opal_log_cond);
+					}
+				} else if (!test_opal_log_foreign) {
+					memcpy(test_opal_log_foreign_name, start, length);
+					test_opal_log_foreign_name[length] = '\0';
+					test_opal_log_foreign = 1;
+				}
 			}
 		}
 	}
@@ -336,70 +476,200 @@ static switch_status_t test_opal_listener_logger(const switch_log_node_t *node, 
 }
 
 /*
- * Arm capture: reset the state, stamp the arming instant, build the mutex and
- * condition variable from the caller's pool, and bind the logger.  Safe to call
- * more than once per case; each call starts from a cleared buffer and a fresh
- * arming stamp, so a second observation can inherit neither the first one's
- * value nor a line the first one produced.
+ * Enqueue this arming's sentinel line.
  *
- * The state is reset before the bind rather than after, so there is no window in
- * which a bound logger could see stale values, and no lock is needed for the
- * reset because no binding exists yet.
+ * DEBUG is deliberate: the sentinel has to clear exactly the same two gates the
+ * listener line clears, or the barrier would be measuring a different queue from
+ * the one that carries the evidence.  Those gates are the core's runtime level,
+ * which FST_TEST_BEGIN raises to SWITCH_LOG_DEBUG for the duration of every case
+ * (switch_test.h:448-449, against src/switch_log.c:600-601), and the MAX_LEVEL
+ * gate that binding this logger at DEBUG raises (src/switch_log.c:461-462, read
+ * at :706).
  *
- * The arming stamp deliberately comes from switch_micro_time_now(), the same
- * function the log subsystem stamps nodes with, less a small slack; see the
- * logger above for why any other clock silently discards the wanted line.
+ * Calling this more than once is not merely tolerated, it is intended.  A node is
+ * dropped outright when the queue is full (src/switch_log.c:732-734), and opening
+ * the barrier on a later sentinel drains strictly more of the queue than opening
+ * it on an earlier one, so a repeat can only strengthen the guarantee.
  */
-static switch_status_t test_opal_log_capture_start(switch_memory_pool_t *pool)
+static void test_opal_log_emit_sentinel(void)
 {
-	test_opal_log_listener_name[0] = '\0';
-	test_opal_log_captured = 0;
-	test_opal_log_armed_at = switch_micro_time_now() - TEST_OPAL_LOG_ARM_SLACK_US;
-
-	if (switch_mutex_init(&test_opal_log_mutex, SWITCH_MUTEX_NESTED, pool) != SWITCH_STATUS_SUCCESS) {
-		return SWITCH_STATUS_FALSE;
-	}
-
-	if (switch_thread_cond_create(&test_opal_log_cond, pool) != SWITCH_STATUS_SUCCESS) {
-		return SWITCH_STATUS_FALSE;
-	}
-
-	return switch_log_bind_logger(test_opal_listener_logger, SWITCH_LOG_DEBUG, SWITCH_FALSE);
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "%s\n", test_opal_log_sentinel);
 }
 
 /*
- * Disarm capture.  The logger is unbound FIRST, and switch_log_unbind_logger()
- * takes the same BINDLOCK that log_thread() holds across every dispatch
- * (src/switch_log.c:511-518), so once it returns no invocation can still be in
- * flight; only then are the pool-backed pointers dropped.  Order matters,
- * because the mutex and condition variable live in the per-case pool that the
- * teardown destroys.
+ * Emit the sentinel and wait for the logger to report it back, which is the
+ * moment the queue is known to be drained past this arming.
  *
- * The unbind status is returned rather than swallowed: an orphaned binding would
- * survive into every later case in the same process and would eventually be
- * invoked with a dangling mutex.
+ * The wait is split into slices so the sentinel can be repeated if it never
+ * arrives, and the deadline is re-read from the clock on every iteration so a
+ * spurious wakeup cannot extend it.  The clock is used ONLY to bound the wait -
+ * it is never compared against a log node's own stamp, which is the comparison
+ * this design exists to eliminate.
+ */
+static switch_status_t test_opal_log_barrier(void)
+{
+	switch_time_t expiration = switch_time_now() + (TEST_OPAL_LOG_BARRIER_TIMEOUT_MS * 1000);
+	switch_time_t now = 0;
+	int seen = 0;
+
+	if (!test_opal_log_mutex || !test_opal_log_cond) {
+		return SWITCH_STATUS_FALSE;
+	}
+
+	while (!seen && (now = switch_time_now()) < expiration) {
+		switch_time_t slice = now + (TEST_OPAL_LOG_BARRIER_SLICE_MS * 1000);
+
+		if (slice > expiration) {
+			slice = expiration;
+		}
+
+		test_opal_log_emit_sentinel();
+
+		switch_mutex_lock(test_opal_log_mutex);
+
+		while (!test_opal_log_barrier_seen && (now = switch_time_now()) < slice) {
+			switch_thread_cond_timedwait(test_opal_log_cond, test_opal_log_mutex, slice - now);
+		}
+
+		seen = test_opal_log_barrier_seen;
+
+		switch_mutex_unlock(test_opal_log_mutex);
+	}
+
+	return seen ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
+}
+
+/*
+ * Drop the capture's synchronisation objects and the pool they live in.  Only
+ * ever called when no binding is live, because the pointers are cleared before
+ * the pool goes: the mutex and condition variable are pool-backed, and APR
+ * reclaims both through the pool's own cleanup, so destroying the pool is the
+ * complete release.
+ */
+static void test_opal_log_capture_release(void)
+{
+	test_opal_log_mutex = NULL;
+	test_opal_log_cond = NULL;
+
+	if (test_opal_log_pool) {
+		switch_core_destroy_memory_pool(&test_opal_log_pool);
+	}
+}
+
+/*
+ * Disarm capture.  Idempotent by design, because the suite's safety sweep calls
+ * it without knowing whether anything is armed.
+ *
+ * The logger is unbound FIRST.  switch_log_unbind_logger() takes the same
+ * BINDLOCK that log_thread() holds across every dispatch
+ * (src/switch_log.c:511-518), so once it returns no invocation of this logger can
+ * still be in flight and the memory behind the mutex and condition variable can
+ * be released; doing it the other way round would be a use-after-free with a
+ * window exactly one dispatch wide.
+ *
+ * The unbind status is returned rather than swallowed - an orphaned binding would
+ * survive into every later case in the same process - but a call made when
+ * nothing is armed reports success, since there is nothing to fail at.
  */
 static switch_status_t test_opal_log_capture_stop(void)
 {
-	switch_status_t status = switch_log_unbind_logger(test_opal_listener_logger);
+	switch_status_t status = SWITCH_STATUS_SUCCESS;
 
-	test_opal_log_mutex = NULL;
-	test_opal_log_cond = NULL;
+	if (test_opal_log_bound) {
+		status = switch_log_unbind_logger(test_opal_listener_logger);
+		test_opal_log_bound = 0;
+	}
+
+	test_opal_log_capture_release();
 
 	return status;
 }
 
 /*
- * Wait up to timeout_ms for the listener line, then return the captured name, or
- * NULL if none arrived.  Re-reads the clock on every iteration so a spurious
- * wakeup cannot extend the deadline, which is the shape tests/unit/switch_log.c
- * uses.
+ * Arm capture for one expected listener name: take a private pool, build the
+ * mutex and condition variable in it, clear every observation, mint a fresh
+ * sentinel token, bind the logger, and then hold until the barrier opens.
  *
- * switch_time_now() is correct HERE, unlike in the arming stamp, because this
- * clock is only ever used to measure an elapsed interval for a relative
- * switch_thread_cond_timedwait() timeout - it is never compared against a log
- * node's own stamp, so the two clocks cannot disagree about anything that
- * matters.
+ * Arming therefore reports success only once the queue is provably drained past
+ * this point, so a caller that gets SUCCESS knows that every line it goes on to
+ * see was produced after it asked.
+ *
+ * Safe to call twice in a row: any previous arming is wound down first, so a
+ * second observation can inherit neither the first one's value nor a line the
+ * first one produced.  The state is reset before the bind rather than after, so
+ * no dispatch can ever observe a half-armed capture, and no lock is needed for
+ * the reset because no binding exists yet.
+ *
+ * Every early return releases exactly what it had acquired, and a barrier that
+ * fails to open disarms completely rather than leaving a live binding behind.
+ */
+static switch_status_t test_opal_log_capture_start(const char *expected_name)
+{
+	switch_status_t status = SWITCH_STATUS_FALSE;
+
+	(void) test_opal_log_capture_stop();
+
+	if (zstr(expected_name)) {
+		return SWITCH_STATUS_FALSE;
+	}
+
+	if (switch_core_new_memory_pool(&test_opal_log_pool) != SWITCH_STATUS_SUCCESS || !test_opal_log_pool) {
+		return SWITCH_STATUS_FALSE;
+	}
+
+	if (switch_mutex_init(&test_opal_log_mutex, SWITCH_MUTEX_NESTED, test_opal_log_pool) != SWITCH_STATUS_SUCCESS) {
+		test_opal_log_capture_release();
+
+		return SWITCH_STATUS_FALSE;
+	}
+
+	if (switch_thread_cond_create(&test_opal_log_cond, test_opal_log_pool) != SWITCH_STATUS_SUCCESS) {
+		test_opal_log_capture_release();
+
+		return SWITCH_STATUS_FALSE;
+	}
+
+	test_opal_log_listener_name[0] = '\0';
+	test_opal_log_foreign_name[0] = '\0';
+	test_opal_log_captured = 0;
+	test_opal_log_foreign = 0;
+	test_opal_log_barrier_seen = 0;
+	switch_copy_string(test_opal_log_expected_name, expected_name, sizeof(test_opal_log_expected_name));
+	switch_snprintf(test_opal_log_sentinel, sizeof(test_opal_log_sentinel), "%s%u",
+					TEST_OPAL_LOG_BARRIER_PREFIX, ++test_opal_log_epoch);
+
+	status = switch_log_bind_logger(test_opal_listener_logger, SWITCH_LOG_DEBUG, SWITCH_FALSE);
+
+	if (status != SWITCH_STATUS_SUCCESS) {
+		test_opal_log_capture_release();
+
+		return status;
+	}
+
+	test_opal_log_bound = 1;
+
+	status = test_opal_log_barrier();
+
+	if (status != SWITCH_STATUS_SUCCESS) {
+		(void) test_opal_log_capture_stop();
+	}
+
+	return status;
+}
+
+/*
+ * Wait up to timeout_ms for the awaited listener line, then return the captured
+ * name, or NULL if it never arrived.  Re-reads the clock on every iteration so a
+ * spurious wakeup cannot extend the deadline, which is the shape
+ * tests/unit/switch_log.c uses.
+ *
+ * The clock is only ever used to measure an elapsed interval for a relative
+ * switch_thread_cond_timedwait() timeout; nothing here is compared against a log
+ * node's own stamp, so no two clocks can disagree about anything that matters.
+ *
+ * A NULL return is the real verdict this suite reads: the barrier and the
+ * expected-name filter between them mean the wait can only be satisfied by a line
+ * this arming provoked, carrying exactly the name it asked for.
  */
 static const char *test_opal_log_wait(switch_interval_time_t timeout_ms)
 {
@@ -424,6 +694,38 @@ static const char *test_opal_log_wait(switch_interval_time_t timeout_ms)
 	switch_mutex_unlock(test_opal_log_mutex);
 
 	return captured;
+}
+
+/*
+ * The first listener line that appeared inside the capture window carrying a name
+ * the arming did not ask for, or NULL if none did.
+ *
+ * This is the assertion surface for the hazard the barrier exists to close.  The
+ * barrier already discards anything enqueued before arming, so a non-NULL answer
+ * here means a listener was announced DURING the window that the case did not
+ * account for - a second listener in the document, a leaked provider still
+ * serving an earlier case's configuration, or a name the parser substituted
+ * unexpectedly.  Reporting it by name is what makes the difference between a test
+ * that quietly accepts the wrong evidence and one that says which evidence it
+ * rejected.
+ */
+static const char *test_opal_log_foreign_listener_name(void)
+{
+	const char *foreign = NULL;
+
+	if (!test_opal_log_mutex) {
+		return NULL;
+	}
+
+	switch_mutex_lock(test_opal_log_mutex);
+
+	if (test_opal_log_foreign) {
+		foreign = test_opal_log_foreign_name;
+	}
+
+	switch_mutex_unlock(test_opal_log_mutex);
+
+	return foreign;
 }
 
 /*
@@ -649,6 +951,62 @@ static FSManager *test_opal_module_manager(void)
 }
 
 /*
+ * Reclaim everything this suite can retain beyond a single case, in one call.
+ *
+ * WHY EVERY STEP IS IDEMPOTENT, so this is safe whether the state exists or not:
+ *   - switch_xml_unbind_search_function_ptr() searches the binding list under the
+ *     write lock and reports SWITCH_STATUS_FALSE without changing anything when
+ *     the pointer is not registered, so calling it on an empty list is a no-op;
+ *   - test_opal_log_capture_stop() unbinds only when a binding is actually live
+ *     and reports success otherwise;
+ *   - mod_opal_shutdown() is `delete opal_process; opal_process = NULL' and
+ *     always returns success (mod_opal.cpp:136-138), and deleting a null pointer
+ *     is a well-defined no-op, so it is safe with or without a prior load and
+ *     safe to repeat.  It is also the ONLY way to reclaim a process the module
+ *     created, including after a load that failed halfway;
+ *   - test_opal_release_process() and test_opal_module_pool_destroy() both test
+ *     their pointer first and null it afterwards.
+ *
+ * ORDER IS LOAD-BEARING:
+ *   1. unbind the provider first, so nothing that follows can still resolve a
+ *      configuration lookup through this suite's document;
+ *   2. stop the capture next, so no bound logger can observe the teardown that
+ *      follows;
+ *   3. shut the module down, which is the last thing that touches module state
+ *      allocated from the module-lifetime pool;
+ *   4. release the suite's own PTLib process, so at most one PProcess-derived
+ *      object has existed at any instant and none outlives the suite;
+ *   5. forget the module interface, which is memory owned by the pool destroyed
+ *      on the next line, and only then destroy that pool.
+ *
+ * WHY THIS IS NOT INVOKED FROM FST_TEARDOWN.  FST_TEARDOWN runs after EVERY case,
+ * and this suite deliberately hands live state from the load case to the shutdown
+ * case so that shutting it down can be asserted rather than assumed.  A teardown
+ * that swept unconditionally would destroy precisely the state the last case
+ * exists to observe.  The sweep is therefore anchored where it cannot do that: in
+ * the failure branch of the case that retains state, and unconditionally in the
+ * LAST declared case.  That placement is sufficient because a fatal check only
+ * breaks out of the case body it appears in (switch_fct.h:3668-3669) and the
+ * framework re-enters the fixture suite once per declared case
+ * (switch_fct.h:3507-3516), so no failure anywhere can prevent the last case from
+ * running its own sweep.
+ */
+static void test_opal_suite_state_cleanup(void)
+{
+	(void) test_opal_unbind_config();
+
+	(void) test_opal_log_capture_stop();
+
+	(void) mod_opal_shutdown();
+
+	test_opal_release_process();
+
+	test_opal_module_interface = NULL;
+
+	test_opal_module_pool_destroy();
+}
+
+/*
  * ---------------------------------------------------------------------------
  * The suite
  * ---------------------------------------------------------------------------
@@ -686,6 +1044,33 @@ FST_CORE_BEGIN("conf_opal")
 		}
 		FST_SETUP_END()
 
+		/*
+		 * Both fixtures are mandatory even though neither has a body: the setup
+		 * hook is the only thing that creates fst_pool and starts the soft timer,
+		 * and every case fatally requires both, while the teardown hook is the
+		 * only thing that destroys that pool.
+		 *
+		 * The teardown body stays EMPTY on purpose, and the invariant that makes
+		 * that safe is structural rather than accidental: no case in this suite
+		 * makes a fatal check after acquiring a resource that nothing else
+		 * reclaims.  Registrations and pool creations are performed as plain
+		 * statements and checked non-fatally, each acquiring case ends with a
+		 * single unconditional tail that releases what it took, and anything
+		 * deliberately handed to a later case is swept by
+		 * test_opal_suite_state_cleanup() in the last declared case.
+		 *
+		 * Two things a fatal check CAN still strand, and why neither matters.  The
+		 * shared PTLib process, which every socket-free case acquires before its
+		 * first assertion: it has two independent reclamation paths, the load
+		 * case's own handover and the last case's sweep.  And anything allocated
+		 * from fst_pool, which FST_TEARDOWN_BEGIN destroys on the way in before
+		 * this body would ever run.
+		 *
+		 * A sweep here would also be actively wrong, not merely redundant: the
+		 * load case hands a loaded module, its process and its pool to the
+		 * shutdown case on purpose, and a teardown running after every case would
+		 * demolish exactly the state the shutdown case exists to observe.
+		 */
 		FST_TEARDOWN_BEGIN()
 		{
 		}
@@ -792,13 +1177,20 @@ FST_CORE_BEGIN("conf_opal")
 		 * The accessor assertions are gated on a successful parse.  Without
 		 * one, the transcoding flag would still hold the indeterminate value
 		 * FSManager's constructor left behind.
+		 *
+		 * The document served here is the settings variant, whose listener is
+		 * named distinctly from every other listener this suite declares.  This
+		 * case must declare a listener - no injected document may omit the stanza -
+		 * and it therefore announces one on the log, which is the same channel the
+		 * case after it observes.  A distinct name is what stops this
+		 * announcement from ever being mistaken for that case's evidence.
 		 */
 		FST_TEST_BEGIN(settings_from_injected_configuration)
 		{
 			switch_status_t status = SWITCH_STATUS_FALSE;
 
 			fst_requires(test_opal_acquire_process() != NULL);
-			fst_requires(test_opal_bind_config() == SWITCH_STATUS_SUCCESS);
+			fst_requires(test_opal_bind_config_document(TEST_OPAL_CONFIG_XML_SETTINGS) == SWITCH_STATUS_SUCCESS);
 
 			{
 				FSManager manager;
@@ -837,32 +1229,53 @@ FST_CORE_BEGIN("conf_opal")
 		 * were the capture broken, the wait would time out and both halves would
 		 * report a NULL name rather than one of them silently agreeing.
 		 *
+		 * WHAT EACH HALF PROVES, now that arming states the name it expects.  The
+		 * verdict is that the awaited line ARRIVED: the wait can only be satisfied
+		 * by a post-barrier line naming exactly what was asked for, so a NULL
+		 * return means the parser did not announce that name inside this case's
+		 * own window.  The equality check that follows restates the verdict in the
+		 * form a reader expects, and would catch a filter that ever loosened into
+		 * a prefix test.  The foreign-name check is the third assertion and the
+		 * one that closes the hazard: it fails if ANY other listener was announced
+		 * during the window, naming the intruder instead of quietly adopting it.
+		 *
 		 * Each half is fully wound down before the next begins: the manager
 		 * leaves scope, the logger is unbound and the provider is unregistered,
 		 * so the loopback listener is closed again before the same port is
 		 * reused.
 		 *
-		 * Only the two binds are fatal, and each sits at a point where nothing
-		 * is yet registered - the first before any setup, the second after the
-		 * first half has already been wound down - so a fatal exit there leaves
-		 * nothing behind.  Every assertion that follows a bind is non-fatal, so
-		 * the matching unbinds are always reached.
+		 * This case acquires TWO things that nothing else would reclaim - a
+		 * registered provider and a bound logger holding its own pool - so
+		 * neither acquisition is made inside a fatal assertion.  Each is performed
+		 * as a plain statement, checked non-fatally, and released by an
+		 * unconditional tail that runs whatever the observation did; the
+		 * observation itself is skipped, with one explicit failure, if either
+		 * acquisition did not succeed.  The only fatal check is the process
+		 * precondition, which precedes both acquisitions: without a live PProcess
+		 * the FSManager constructor would terminate the whole binary rather than
+		 * fail a case.
 		 */
 		FST_TEST_BEGIN(listener_name_defaults_to_unnamed)
 		{
 			const char *observed_name = NULL;
-			switch_status_t status = SWITCH_STATUS_FALSE;
+			switch_status_t bound = SWITCH_STATUS_FALSE;
+			switch_status_t armed = SWITCH_STATUS_FALSE;
 
 			fst_requires(test_opal_acquire_process() != NULL);
 
 			/* Half one: a <listener> with no name attribute takes the default. */
-			fst_requires(test_opal_bind_config_document(TEST_OPAL_CONFIG_XML_UNNAMED_LISTENER) == SWITCH_STATUS_SUCCESS);
-			fst_check(test_opal_log_capture_start(fst_pool) == SWITCH_STATUS_SUCCESS);
+			bound = test_opal_bind_config_document(TEST_OPAL_CONFIG_XML_UNNAMED_LISTENER);
+			fst_xcheck(bound == SWITCH_STATUS_SUCCESS,
+					   "the opal.conf provider must be registered before the unnamed-listener document is parsed");
 
-			{
+			armed = test_opal_log_capture_start("unnamed");
+			fst_xcheck(armed == SWITCH_STATUS_SUCCESS,
+					   "the listener capture must be armed, and its queue barrier open, before the document is parsed");
+
+			if (bound == SWITCH_STATUS_SUCCESS && armed == SWITCH_STATUS_SUCCESS) {
 				FSManager manager;
+				switch_status_t status = manager.ReadConfig(false);
 
-				status = manager.ReadConfig(false);
 				fst_check(status == SWITCH_STATUS_SUCCESS);
 
 				if (status == SWITCH_STATUS_SUCCESS) {
@@ -872,28 +1285,55 @@ FST_CORE_BEGIN("conf_opal")
 					if (observed_name) {
 						fst_check_string_equals(observed_name, "unnamed");
 					}
+
+					fst_xcheck(test_opal_log_foreign_listener_name() == NULL,
+							   "no listener other than the awaited one may be announced inside the capture window");
 				}
+			} else {
+				fst_fail("the unnamed-listener observation was not attempted because a precondition failed");
 			}
 
-			fst_check(test_opal_log_capture_stop() == SWITCH_STATUS_SUCCESS);
-			fst_check(test_opal_unbind_config() == SWITCH_STATUS_SUCCESS);
+			/*
+			 * Single unconditional tail.  Each resource is released only if it was
+			 * actually acquired, so a precondition failure cannot turn into a
+			 * second, misleading failure report about releasing something that was
+			 * never taken.
+			 */
+			if (armed == SWITCH_STATUS_SUCCESS) {
+				fst_check(test_opal_log_capture_stop() == SWITCH_STATUS_SUCCESS);
+			}
+
+			if (bound == SWITCH_STATUS_SUCCESS) {
+				fst_check(test_opal_unbind_config() == SWITCH_STATUS_SUCCESS);
+			}
 
 			/*
 			 * Half two: the contrast.  An identical document that does carry a
 			 * name attribute must yield that name verbatim, which is what proves
 			 * "unnamed" above came from the default branch and not from a
-			 * capture that reports the same string whatever it is given.
+			 * capture that reports the same string whatever it is given.  Nothing
+			 * else in the suite announces this name, so the line satisfying this
+			 * half can only be the one this half provoked.
 			 */
-			observed_name = NULL;
-			status = SWITCH_STATUS_FALSE;
+			/*
+			 * No half-one value is carried in: bound and armed are both
+			 * reassigned below before anything reads them, observed_name is only
+			 * read inside the branch that reassigns it first, and the parse
+			 * status is block-local to each half - so resetting anything here
+			 * would be a dead store rather than a safeguard.
+			 */
+			bound = test_opal_bind_config();
+			fst_xcheck(bound == SWITCH_STATUS_SUCCESS,
+					   "the opal.conf provider must be registered before the named-listener document is parsed");
 
-			fst_requires(test_opal_bind_config() == SWITCH_STATUS_SUCCESS);
-			fst_check(test_opal_log_capture_start(fst_pool) == SWITCH_STATUS_SUCCESS);
+			armed = test_opal_log_capture_start(TEST_OPAL_LISTEN_NAME);
+			fst_xcheck(armed == SWITCH_STATUS_SUCCESS,
+					   "the listener capture must be re-armed, and its queue barrier open, before the document is parsed");
 
-			{
+			if (bound == SWITCH_STATUS_SUCCESS && armed == SWITCH_STATUS_SUCCESS) {
 				FSManager manager;
+				switch_status_t status = manager.ReadConfig(false);
 
-				status = manager.ReadConfig(false);
 				fst_check(status == SWITCH_STATUS_SUCCESS);
 
 				if (status == SWITCH_STATUS_SUCCESS) {
@@ -903,11 +1343,22 @@ FST_CORE_BEGIN("conf_opal")
 					if (observed_name) {
 						fst_check_string_equals(observed_name, TEST_OPAL_LISTEN_NAME);
 					}
+
+					fst_xcheck(test_opal_log_foreign_listener_name() == NULL,
+							   "no listener other than the awaited one may be announced inside the capture window");
 				}
+			} else {
+				fst_fail("the named-listener contrast was not attempted because a precondition failed");
 			}
 
-			fst_check(test_opal_log_capture_stop() == SWITCH_STATUS_SUCCESS);
-			fst_check(test_opal_unbind_config() == SWITCH_STATUS_SUCCESS);
+			/* Single unconditional tail, as above. */
+			if (armed == SWITCH_STATUS_SUCCESS) {
+				fst_check(test_opal_log_capture_stop() == SWITCH_STATUS_SUCCESS);
+			}
+
+			if (bound == SWITCH_STATUS_SUCCESS) {
+				fst_check(test_opal_unbind_config() == SWITCH_STATUS_SUCCESS);
+			}
 		}
 		FST_TEST_END()
 
@@ -928,8 +1379,22 @@ FST_CORE_BEGIN("conf_opal")
 		 *       switch_status_t asserted, with the registered endpoint
 		 *       interface read back from the module interface it populated.
 		 *
-		 * Everything after the bind uses non-fatal checks so the provider is
-		 * always unregistered before the case returns.
+		 * NOTHING THAT THIS CASE ACQUIRES IS ACQUIRED INSIDE A FATAL ASSERTION.
+		 * The case registers a provider and creates the pool the loaded module
+		 * lives in, and it is the only case that deliberately leaves state behind
+		 * for a later one, so an exit that skipped its tail would orphan a binding
+		 * into every subsequent case and leak a pool for the rest of the process.
+		 * Both acquisitions are therefore plain statements whose status is checked
+		 * non-fatally, the work that depends on them is gated on both having
+		 * succeeded, and the case ends with a single unconditional tail.  The only
+		 * fatal check is the process precondition, which precedes everything:
+		 * without a live PProcess the FSManager constructor terminates the binary.
+		 *
+		 * The load is gated on the provider specifically, not merely for tidiness:
+		 * FSManager::Initialise() discards ReadConfig()'s status, so loading with
+		 * no provider registered would still report success while quietly falling
+		 * through to StartListener("") - a wildcard bind on the default H.323 port
+		 * that this suite exists never to perform.
 		 */
 		FST_TEST_BEGIN(module_load_and_endpoint_interface)
 		{
@@ -937,14 +1402,19 @@ FST_CORE_BEGIN("conf_opal")
 			switch_loadable_module_interface_t *loaded_interface = NULL;
 			switch_endpoint_interface_t *endpoint = NULL;
 			switch_status_t status = SWITCH_STATUS_FALSE;
+			switch_status_t bound = SWITCH_STATUS_FALSE;
+			switch_status_t pooled = SWITCH_STATUS_FALSE;
 
 			fst_requires(test_opal_acquire_process() != NULL);
-			fst_requires(test_opal_bind_config() == SWITCH_STATUS_SUCCESS);
+
+			bound = test_opal_bind_config();
+			fst_xcheck(bound == SWITCH_STATUS_SUCCESS,
+					   "the opal.conf provider must be registered before the module reads its configuration");
 
 			observed_interface = switch_loadable_module_create_module_interface(fst_pool, MODNAME);
 			fst_check(observed_interface != NULL);
 
-			if (observed_interface) {
+			if (bound == SWITCH_STATUS_SUCCESS && observed_interface) {
 				FSManager manager;
 
 				fst_check(manager.Initialise(observed_interface));
@@ -955,6 +1425,8 @@ FST_CORE_BEGIN("conf_opal")
 				if (endpoint) {
 					fst_check_string_equals(endpoint->interface_name, TEST_OPAL_INTERFACE_NAME);
 				}
+			} else {
+				fst_fail("the in-suite manager was not initialised because a precondition failed");
 			}
 
 			/* Hand the PTLib process singleton over to the module. */
@@ -964,11 +1436,18 @@ FST_CORE_BEGIN("conf_opal")
 			 * fst_pool: this case leaves the module loaded on purpose so that the
 			 * shutdown case can assert its status, and fst_pool does not survive
 			 * this case's teardown.  See test_opal_module_pool above. */
-			fst_requires(test_opal_module_pool_create() == SWITCH_STATUS_SUCCESS);
-			fst_requires(test_opal_module_pool != NULL);
+			pooled = test_opal_module_pool_create();
+			fst_xcheck(pooled == SWITCH_STATUS_SUCCESS,
+					   "the module-lifetime pool must be available before the module is loaded");
+			fst_check(test_opal_module_pool != NULL);
 			fst_check(test_opal_module_pool != fst_pool);
 
-			status = mod_opal_load(&loaded_interface, test_opal_module_pool);
+			if (bound == SWITCH_STATUS_SUCCESS && test_opal_module_pool != NULL) {
+				status = mod_opal_load(&loaded_interface, test_opal_module_pool);
+			} else {
+				fst_fail("the module load was not attempted because a precondition failed");
+			}
+
 			fst_check(status == SWITCH_STATUS_SUCCESS);
 			fst_check(loaded_interface != NULL);
 
@@ -994,7 +1473,28 @@ FST_CORE_BEGIN("conf_opal")
 			 * left alive for the shutdown case to observe */
 			test_opal_module_interface = loaded_interface;
 
-			fst_check(test_opal_unbind_config() == SWITCH_STATUS_SUCCESS);
+			/*
+			 * SINGLE UNCONDITIONAL CLEANUP TAIL.
+			 *
+			 * The provider is unregistered on every path that registered it, so
+			 * nothing this case bound can answer a lookup in any later case - an
+			 * invariant the next case re-checks on entry rather than assuming.
+			 *
+			 * The retained state is handed on ONLY when the load actually took
+			 * ownership of it.  When the load did not happen, or happened and
+			 * failed, there is no shutdown case's worth of state to observe and
+			 * keeping it would leak: mod_opal_load() deletes its own process on the
+			 * Initialise failure path (mod_opal.cpp:128-129) but nothing else
+			 * reclaims the pool, the suite's process or a half-built interface, so
+			 * the sweep does it here and now.
+			 */
+			if (bound == SWITCH_STATUS_SUCCESS) {
+				fst_check(test_opal_unbind_config() == SWITCH_STATUS_SUCCESS);
+			}
+
+			if (status != SWITCH_STATUS_SUCCESS) {
+				test_opal_suite_state_cleanup();
+			}
 		}
 		FST_TEST_END()
 
@@ -1007,23 +1507,55 @@ FST_CORE_BEGIN("conf_opal")
 		 * is declared last so it observes a fully initialised module, and
 		 * because the suite is built on FST_SUITE_BEGIN there is no implicit
 		 * unload at suite end to make the result unobservable.
+		 *
+		 * BEING DECLARED LAST GIVES THIS CASE TWO EXTRA DUTIES.
+		 *
+		 * It opens by proving that the case before it left no configuration
+		 * provider registered.  The framework re-enters the fixture suite once per
+		 * declared case and a fatal check only breaks the body it appears in, so
+		 * this case always runs even when an earlier one exited early - which makes
+		 * it the right place to state that invariant, and the only place a
+		 * regression that orphaned a binding would be caught by name rather than
+		 * silently answering some later lookup.
+		 *
+		 * And it closes with the suite's sweep, unconditionally.  Every
+		 * precondition here is therefore non-fatal with a guarded dereference: the
+		 * point of the sweep is that state gets reclaimed even when the state was
+		 * not what this case hoped to find, and a fatal precondition would skip the
+		 * very cleanup it was checking for.
 		 */
 		FST_TEST_BEGIN(module_shutdown_succeeds)
 		{
 			switch_status_t status = SWITCH_STATUS_FALSE;
 
 			/*
+			 * Permanent regression guard.  SWITCH_STATUS_FALSE is the expected
+			 * answer, and it is a positive statement rather than an absence of one:
+			 * the unbind searches the binding list under the write lock and reports
+			 * FALSE precisely when the pointer is not registered, changing nothing.
+			 * A SUCCESS here would mean the previous case left its provider behind.
+			 */
+			fst_xcheck(test_opal_unbind_config() == SWITCH_STATUS_FALSE,
+					   "the preceding case must leave no opal.conf provider registered");
+
+			/*
 			 * Observe the loaded module BEFORE the call, so the assertions after it
 			 * measure a transition rather than restating a fact.  A shutdown that
 			 * did nothing would leave every one of these unchanged and fail below.
 			 */
-			fst_requires(test_opal_module_pool != NULL);
+			fst_check(test_opal_module_pool != NULL);
 			fst_check(test_opal_module_pool != fst_pool);
 
-			fst_requires(test_opal_module_interface != NULL);
-			fst_requires(test_opal_module_interface->endpoint_interface != NULL);
-			fst_check_string_equals(test_opal_module_interface->endpoint_interface->interface_name,
-									TEST_OPAL_INTERFACE_NAME);
+			fst_check(test_opal_module_interface != NULL);
+
+			if (test_opal_module_interface) {
+				fst_check(test_opal_module_interface->endpoint_interface != NULL);
+
+				if (test_opal_module_interface->endpoint_interface) {
+					fst_check_string_equals(test_opal_module_interface->endpoint_interface->interface_name,
+											TEST_OPAL_INTERFACE_NAME);
+				}
+			}
 
 			fst_check(PProcess::IsInitialised());
 			fst_check(test_opal_module_manager() != NULL);
@@ -1032,8 +1564,8 @@ FST_CORE_BEGIN("conf_opal")
 			fst_check(status == SWITCH_STATUS_SUCCESS);
 
 			/*
-			 * mod_opal.cpp:130-133 deletes the process object, and ~FSProcess
-			 * deletes the manager with it (mod_opal.cpp:244).  Deleting the one live
+			 * mod_opal.cpp:136-137 deletes the process object, and ~FSProcess
+			 * deletes the manager with it (mod_opal.cpp:246).  Deleting the one live
 			 * PProcess-derived object is what makes PProcess::IsInitialised() false
 			 * again, so these two public observations prove both the process and the
 			 * manager it owned are gone.
@@ -1042,30 +1574,38 @@ FST_CORE_BEGIN("conf_opal")
 			fst_check(test_opal_module_manager() == NULL);
 
 			/* the module interface itself is pool-backed, not process-backed, so it
-			 * is still readable after shutdown - the pool below is what releases it */
-			fst_check_string_equals(test_opal_module_interface->endpoint_interface->interface_name,
-									TEST_OPAL_INTERFACE_NAME);
+			 * is still readable after shutdown - the sweep below is what releases it */
+			if (test_opal_module_interface && test_opal_module_interface->endpoint_interface) {
+				fst_check_string_equals(test_opal_module_interface->endpoint_interface->interface_name,
+										TEST_OPAL_INTERFACE_NAME);
+			}
 
 			/* shutdown is idempotent: deleting a null pointer is a no-op */
 			status = mod_opal_shutdown();
 			fst_check(status == SWITCH_STATUS_SUCCESS);
 			fst_check(!PProcess::IsInitialised());
 
-			/* Nothing PTLib-derived may outlive the suite. */
-			test_opal_release_process();
-			fst_check(test_opal_process == NULL);
-
 			/*
-			 * Only now may the module-lifetime pool go.  Shutdown was the last thing
-			 * to touch pool-backed module state, so this is the earliest safe point -
-			 * and doing it here, inside the case, keeps it clear of the per-case
-			 * teardown that owns fst_pool.  switch_core_destroy_memory_pool() nulls
-			 * the caller's pointer, which is asserted so a silent failure to release
-			 * cannot pass unnoticed.
+			 * THE SUITE'S UNCONDITIONAL SWEEP.
+			 *
+			 * Nothing above it is fatal, so this runs on every path through the
+			 * case, and because it is the last declared case it runs even when an
+			 * earlier case exited early.  It reclaims everything that can outlive a
+			 * single case - the provider, the log capture, the module's process, the
+			 * suite's own process and the module-lifetime pool - in the one order
+			 * that is safe, and each step is idempotent, so repeating work the case
+			 * has already done above costs nothing.  Shutdown was the last thing to
+			 * touch pool-backed module state, which is why the pool goes last.
+			 *
+			 * The three checks that follow are the positive statement that the suite
+			 * exits owning nothing: no PTLib process, no module pool, and - already
+			 * established on entry - no registered provider.
 			 */
-			test_opal_module_interface = NULL;
-			test_opal_module_pool_destroy();
+			test_opal_suite_state_cleanup();
+
+			fst_check(test_opal_process == NULL);
 			fst_check(test_opal_module_pool == NULL);
+			fst_check(!PProcess::IsInitialised());
 		}
 		FST_TEST_END()
 	}

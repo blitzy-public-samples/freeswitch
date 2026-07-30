@@ -295,11 +295,23 @@ static int xml_curl_json_is_xml_char(unsigned long cp)
 	return 1;
 }
 
-/* JSON: validates a decoded string that is about to be handed to a duplicating builder. The
-   builders measure with strlen(), so a string carrying an embedded NUL would be silently
-   truncated - "alice\u0000admin" becoming the identifier "alice" - which is why length is taken
-   from the caller and the buffer is walked byte by byte rather than trusted. Returns 1 when the
-   string is bounded, well-formed UTF-8 and legal XML character data throughout. */
+/*
+ * JSON: validates a decoded string that is about to be handed to a duplicating builder. The
+ * builders measure with strlen(), so a string carrying an embedded NUL would be silently
+ * truncated - "alice\u0000admin" becoming the identifier "alice" - which is why length is taken
+ * from the caller and the buffer is walked byte by byte rather than trusted. Returns 1 when the
+ * string is bounded, well-formed UTF-8 and legal XML character data throughout.
+ *
+ * The two-character sequence "<!" is refused outright, and that rule is the reason this one
+ * validator guards every builder call site rather than each one guarding itself. The serializer
+ * escapes '<' as &lt; in the ordinary case, but switch_xml_ampencode() special-cases a '<' whose
+ * next byte is '!': it emits the '<' raw and switches into an immune mode that copies every
+ * remaining byte of the string verbatim. A value of <![CDATA[..]]> - or of "<!-- " followed by a
+ * quote - would therefore leave the escaping regime altogether and let a response forge attribute
+ * and element syntax in the serialised document. Refusing the sequence before it reaches a
+ * builder is what keeps the serialisation faithful. A lone '<' is still accepted and still
+ * escaped, because it never reaches the immune branch.
+ */
 static int xml_curl_json_is_valid_text(const char *text)
 {
 	const unsigned char *p = (const unsigned char *) text;
@@ -335,6 +347,11 @@ static int xml_curl_json_is_valid_text(const char *text)
 		}
 
 		if (!xml_curl_json_is_xml_char(cp)) {
+			return 0;
+		}
+
+		/* the serializer's immune-mode trigger; see the note above this function */
+		if (cp == '<' && i + 1 < len && p[i + 1] == '!') {
 			return 0;
 		}
 
@@ -936,6 +953,7 @@ static switch_xml_t xml_curl_json_to_xml(const char *json_text, const char *requ
 {
 	cJSON *json = NULL;
 	cJSON *root_member = NULL;
+	cJSON *envelope_member = NULL;
 	const char *parse_end = NULL;
 	switch_xml_t document = NULL;
 	switch_xml_t section = NULL;
@@ -989,6 +1007,27 @@ static switch_xml_t xml_curl_json_to_xml(const char *json_text, const char *requ
 		return NULL;
 	}
 
+	/*
+	 * JSON: the <document>/<section> envelope belongs to this adapter, not to the response, so
+	 * the payload may not carry attributes for it. The root member is translated INTO the
+	 * <section> element, and switch_xml_set_attr() replaces an existing attribute in place
+	 * rather than appending a second one - so a root-level "@name" would silently rewrite the
+	 * section name that was set from requested_section a few lines below. A response could
+	 * otherwise answer a directory lookup with section name="result", which switch_xml_locate()
+	 * reads as a deliberate "not found" and satisfies from static local configuration instead:
+	 * the decode would report success, no fallback warning would be emitted, and the XML parse
+	 * would be skipped. Refusing every root-level attribute member removes that whole class of
+	 * substitution, costs nothing the canonical contract uses - the envelope's only attribute is
+	 * the section name, and no provisioning document places attributes at this level - and
+	 * converges on the ordinary fallback like every other translation error.
+	 */
+	cJSON_ArrayForEach(envelope_member, root_member) {
+		if (envelope_member->string && envelope_member->string[0] == '@') {
+			cJSON_Delete(json);
+			return NULL;
+		}
+	}
+
 	if (!(document = switch_xml_new("document"))) {
 		cJSON_Delete(json);
 		return NULL;
@@ -1014,6 +1053,17 @@ static switch_xml_t xml_curl_json_to_xml(const char *json_text, const char *requ
 		cJSON_Delete(json);
 		return NULL;
 	}
+
+	/*
+	 * JSON: re-assert the envelope's own attribute once the translation has finished. The loop
+	 * above already refuses the only input that could have disturbed it, so this is an invariant
+	 * guard rather than a repair: the section a caller receives is the section that was
+	 * requested, unconditionally and however the translator evolves. Re-setting is leak free -
+	 * switch_xml_set_attr() releases the previous duplicate when it replaces a value it had
+	 * duplicated itself - and it does not reorder the attribute, so the serialisation is
+	 * unchanged.
+	 */
+	switch_xml_set_attr_d(section, "name", requested_section);
 
 	cJSON_Delete(json);
 
@@ -1321,7 +1371,19 @@ static switch_xml_t xml_url_fetch(const char *section, const char *tag_name, con
 		}
 
 		if (binding->disable100continue) {
-			slist = switch_curl_slist_append(slist, "Expect:");
+			/* JSON: this append goes through the same non-destructive helper the Accept entry
+			   above uses. It has to, because when this binding suppresses the 100-continue the
+			   Accept entry was appended to THIS list: assigning the append result straight back
+			   would, on an allocation failure, replace a list already carrying Accept with NULL,
+			   leak it, and then hand curl an empty header set while the fetch still believed it
+			   had negotiated JSON. Keeping the list means the worst case is that the suppression
+			   is not applied - the request is still made, and it is still made as the JSON
+			   request it announced. */
+			if (!xml_curl_json_append_header(&slist, "Expect:")) {
+				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+								  "Could not add the Expect: request header for [%s]; 100-continue suppression is not applied\n",
+								  xml_curl_json_redact_url(binding->url, safe_url, sizeof(safe_url)));
+			}
 			switch_curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, slist);
 		}
 

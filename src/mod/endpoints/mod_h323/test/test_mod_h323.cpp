@@ -808,6 +808,65 @@ static void fst_h323_module_pool_destroy(void)
 	}
 }
 
+/*
+ * Total, idempotent reclamation of everything this suite can retain BETWEEN
+ * cases: the registered h323.conf provider, the loaded module's own state, the
+ * shared PProcess, and the module-lifetime pool.
+ *
+ * WHY EVERY STEP IS IDEMPOTENT
+ * ---------------------------
+ * switch_xml_unbind_search_function_ptr() reports SWITCH_STATUS_FALSE when no
+ * binding carries the pointer and changes nothing (src/switch_xml.c:315-338).
+ * mod_h323_shutdown() frees its four globals through switch_safe_free(), which
+ * NULLs each pointer after freeing it (src/include/switch_utils.h:881), then
+ * deletes the process and NULLs that too (mod_h323.cpp:188-199) - so it is
+ * safe whether the module was loaded, never loaded, or already shut down.  The
+ * process release and the pool destroy are both guarded on their own handles.
+ * The sweep can therefore be called at any point, any number of times.
+ *
+ * WHY IT IS NOT INVOKED FROM FST_TEARDOWN
+ * --------------------------------------
+ * FST_TEARDOWN runs after EVERY case, and this suite deliberately hands state
+ * from one case to the next: case 6 leaves the module loaded, its PProcess
+ * alive and its pool alive ON PURPOSE, because case 7 exists to assert that
+ * shutting that module down works.  An unconditional per-case teardown would
+ * demolish exactly the state case 7 must observe.  Reclamation is anchored
+ * instead where it is both unconditional and correct: a single cleanup tail in
+ * every case that retains anything, plus this total sweep in the last declared
+ * case.
+ *
+ * Two framework facts make that placement sound.  A fatal check merely breaks
+ * out of the enclosing test body - fct_req expands to `if (!ok) { break; }`
+ * (switch_fct.h:3668-3669) - and FCTX re-enters the whole fixture-suite body
+ * once per declared case, running only the case whose number matches
+ * (switch_fct.h:3507-3516).  So a fatal check in one case can skip that case's
+ * own tail but never a later case, which is why the last case is a dependable
+ * safety net; and why no case below may make a fatal check after mutating state
+ * that outlives it.
+ *
+ * ORDER IS LOAD-BEARING
+ * ---------------------
+ *   1. unbind the provider first, so nothing that follows can trigger a
+ *      configuration lookup that re-enters it;
+ *   2. shut the module down next - that is the last thing which reads the
+ *      module state carved out of the pool;
+ *   3. release any shared PProcess the direct-object cases may still hold,
+ *      after shutdown, so the one-live-PProcess invariant is never breached;
+ *   4. destroy the pool last, once nothing points into it.
+ */
+static void fst_h323_suite_state_cleanup(void)
+{
+	/* FALSE simply means nothing was registered, which is the healthy state
+	 * here, so the status is deliberately not treated as an error. */
+	(void) fst_h323_unbind_config();
+
+	(void) mod_h323_shutdown();
+
+	fst_h323_process_release();
+
+	fst_h323_module_pool_destroy();
+}
+
 
 /*
  * ---------------------------------------------------------------------------
@@ -863,10 +922,30 @@ FST_CORE_BEGIN("conf_h323")
 		FST_SETUP_END()
 
 		/*
-		 * Deliberately empty.  The harness never dlopens or dlcloses
-		 * mod_h323, so there is nothing here to unload - and every per-case
-		 * resource (binding, endpoint, PProcess, module interface) is
-		 * released inside the case that created it.
+		 * Deliberately empty, and safely so.
+		 *
+		 * There is nothing here to unload: the harness never dlopens or
+		 * dlcloses mod_h323, it calls the module's own entry points by name.
+		 * And nothing may be reclaimed here either, because this hook runs
+		 * after EVERY case while the suite deliberately hands state from case 6
+		 * to case 7 - see fst_h323_suite_state_cleanup() for that argument in
+		 * full.  Note also that FST_TEARDOWN_BEGIN destroys fst_pool before
+		 * this body is entered (switch_test.h:425-432), so nothing backed by
+		 * fst_pool could be released here in any case.
+		 *
+		 * What makes that safe is a structural rule the cases below keep, stated
+		 * exactly.  NO case makes a fatal check after registering the
+		 * configuration provider or after creating the module-lifetime pool -
+		 * those are the two resources nothing else would reclaim, so every check
+		 * that follows either of them is non-fatal and control always reaches
+		 * that case's single cleanup tail instead of breaking out to this hook.
+		 *
+		 * Two things a fatal check can still strand, and why neither matters.
+		 * The shared PProcess: cases 1-5 acquire it before checking that PTLib
+		 * came up, so a break there retains it - but case 6 releases any stray
+		 * instance defensively before letting the module create its own, and the
+		 * last case's sweep releases it again.  And anything allocated from
+		 * fst_pool, which FST_TEARDOWN_BEGIN destroys on the way in.
 		 */
 		FST_TEARDOWN_BEGIN()
 		{
@@ -1321,6 +1400,8 @@ FST_CORE_BEGIN("conf_h323")
 		{
 			switch_loadable_module_interface_t *module_interface = NULL;
 			switch_status_t status = SWITCH_STATUS_FALSE;
+			switch_status_t bound = SWITCH_STATUS_FALSE;
+			switch_status_t pooled = SWITCH_STATUS_FALSE;
 			FSProcess *process = NULL;
 
 			/* Defensive: clear any shared PProcess an earlier case left behind by
@@ -1338,19 +1419,50 @@ FST_CORE_BEGIN("conf_h323")
 			 * asserted in the codec case above, which runs while the first
 			 * PProcess of the run - and therefore the factory - is still alive. */
 
+			/* THE LAST FATAL CHECK IN THIS CASE, and it is made before anything
+			 * has been registered or allocated, so breaking out here leaves
+			 * nothing behind - the defensive release above has just run.  It
+			 * stays fatal on purpose: a second live PProcess would make PTLib
+			 * abort inside the load below, so refusing to continue is the only
+			 * safe response. */
 			fst_requires(!PProcess::IsInitialised());
-			fst_requires(fst_h323_bind_config(fst_h323_conf_module_load) == SWITCH_STATUS_SUCCESS);
+
+			/* From here on every check is NON-FATAL, so the cleanup tail at the
+			 * bottom of this case is reached on every path.
+			 *
+			 * Registration and pool creation are therefore performed as
+			 * statements whose status is checked afterwards, never as the
+			 * expression of a fatal assertion.  A fatal check placed after the
+			 * provider is registered would break out of the case body and leave
+			 * that provider bound for every later case to trip over, because
+			 * FST_TEARDOWN is deliberately empty. */
+			bound = fst_h323_bind_config(fst_h323_conf_module_load);
+			fst_xcheck(bound == SWITCH_STATUS_SUCCESS, "the h323.conf provider must be registered before the module reads its configuration");
 
 			/* The module is loaded against the module-lifetime pool, NEVER
 			 * against fst_pool: this case deliberately leaves the module loaded
 			 * for case 7, and fst_pool does not survive this case's teardown.
 			 * See fst_h323_module_pool above. */
-			fst_requires(fst_h323_module_pool_create() == SWITCH_STATUS_SUCCESS);
-			fst_requires(fst_h323_module_pool != NULL);
+			pooled = fst_h323_module_pool_create();
+			fst_xcheck(pooled == SWITCH_STATUS_SUCCESS, "the module-lifetime pool must be available before the module is loaded");
+			fst_check(fst_h323_module_pool != NULL);
 
-			/* mod_h323_load() creates the module interface itself
-			 * (mod_h323.cpp:159) and hands it back through the out-parameter */
-			status = mod_h323_load(&module_interface, fst_h323_module_pool);
+			/* The load is attempted only when both of its preconditions hold.
+			 * Without the pool, mod_h323_load() would hand NULL straight to
+			 * switch_loadable_module_create_module_interface() (mod_h323.cpp:159);
+			 * without the provider it would read no configuration at all and
+			 * Initialise() would take the empty-listener fallback that
+			 * wildcard-binds port 1720 (mod_h323.cpp:441-442).  Attempting it
+			 * regardless would trade a reported failure for an unreportable
+			 * one. */
+			if (bound == SWITCH_STATUS_SUCCESS && fst_h323_module_pool != NULL) {
+				/* mod_h323_load() creates the module interface itself
+				 * (mod_h323.cpp:159) and hands it back through the
+				 * out-parameter */
+				status = mod_h323_load(&module_interface, fst_h323_module_pool);
+			} else {
+				fst_fail("the module load was not attempted because a precondition failed");
+			}
 
 			/* POSIX builds return SUCCESS; WIN32 returns NOUNLOAD
 			 * (mod_h323.cpp:175-179).  Both are a successful load. */
@@ -1417,9 +1529,25 @@ FST_CORE_BEGIN("conf_h323")
 				fst_check_int_equals((int) endpoint.m_listeners.size(), 1);
 			}
 
-			fst_check(fst_h323_unbind_config() == SWITCH_STATUS_SUCCESS);
+			/*
+			 * SINGLE UNCONDITIONAL CLEANUP TAIL.  Every check above is
+			 * non-fatal, so control always arrives here.
+			 */
+			if (bound == SWITCH_STATUS_SUCCESS) {
+				fst_check(fst_h323_unbind_config() == SWITCH_STATUS_SUCCESS);
+			}
 
-			/* h323_process is deliberately left alive for the next case */
+			if (status != SWITCH_STATUS_SUCCESS && status != SWITCH_STATUS_NOUNLOAD) {
+				/* The load did not succeed, so nothing is handed on: reclaim
+				 * everything here rather than leaving a pool and a half-built
+				 * load behind for a case that would then have nothing to shut
+				 * down. */
+				fst_h323_suite_state_cleanup();
+			}
+
+			/* On the success path the module interface, h323_process and the
+			 * pool that backs them are deliberately left alive for the next
+			 * case, which asserts that shutting them down works. */
 		}
 		FST_TEST_END()
 
@@ -1464,6 +1592,19 @@ FST_CORE_BEGIN("conf_h323")
 		{
 			switch_status_t status = SWITCH_STATUS_FALSE;
 
+			/* The preceding case must have left NOTHING registered.  That is the
+			 * invariant every case's cleanup tail exists to keep, and this is
+			 * where a breach first becomes observable, so it is asserted rather
+			 * than assumed.  The unbind is the only public way to ask the
+			 * question and it is harmless when the answer is "nothing": FALSE
+			 * means no binding carried the pointer and nothing was changed
+			 * (src/switch_xml.c:315-338).  Should a future edit ever reintroduce
+			 * a fatal check after the provider is bound, this reports it here
+			 * instead of letting a stray provider silently answer a later
+			 * configuration lookup. */
+			fst_xcheck(fst_h323_unbind_config() == SWITCH_STATUS_FALSE,
+					   "the preceding case must leave no h323.conf provider registered");
+
 			/* The previous case left the module loaded.  Asserted through PTLib's
 			 * public singleton interface, not through the module's static
 			 * h323_process pointer. */
@@ -1498,13 +1639,30 @@ FST_CORE_BEGIN("conf_h323")
 			fst_check(status == SWITCH_STATUS_SUCCESS);
 			fst_check(!PProcess::IsInitialised());
 
-			/* ONLY NOW is the module-lifetime pool released.  Shutdown is the
-			 * last thing that touches pool-backed module state, so this is the
-			 * earliest point at which destroying it is safe - and doing it here,
-			 * inside the case, keeps it out of the per-case teardown that owns
-			 * fst_pool. */
-			fst_h323_module_pool_destroy();
+			/* ONLY NOW is retained state released.  Shutdown is the last thing
+			 * that touches pool-backed module state, so this is the earliest
+			 * point at which destroying the pool is safe - and doing it here,
+			 * inside the last declared case, keeps it out of the per-case
+			 * teardown that owns fst_pool.
+			 *
+			 * The sweep is total rather than a bare pool destroy so that it also
+			 * reclaims anything an earlier case could have orphaned by breaking
+			 * out on a fatal precondition: a still-registered provider, a stray
+			 * shared PProcess, and the pool.  Every step is idempotent, so
+			 * repeating the shutdown this case has already asserted twice costs
+			 * nothing.  No check in this case is fatal, so this tail is reached
+			 * unconditionally. */
+			fst_h323_suite_state_cleanup();
+
 			fst_check(fst_h323_module_pool == NULL);
+			fst_check(!PProcess::IsInitialised());
+
+			/* The positive closing statement that the suite exits with an empty
+			 * binding list.  FALSE here is the expected answer: the entry check
+			 * established that case 6 unbound its provider, no case binds
+			 * anything afterwards, and the sweep's own unbind was therefore a
+			 * no-op (src/switch_xml.c:315-338). */
+			fst_check(fst_h323_unbind_config() == SWITCH_STATUS_FALSE);
 		}
 		FST_TEST_END()
 	}
