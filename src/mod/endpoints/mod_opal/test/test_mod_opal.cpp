@@ -98,6 +98,57 @@
  * Determinism.  No case starts a runtime thread, dlopens or dlcloses a module,
  * talks to a third party, opens a random port or depends on the wall clock.
  * Every injected listener binds loopback on a fixed high port.
+ *
+ * Socket footprint, stated so that nobody has to rediscover it.  Two sockets
+ * exist while this suite runs, and only the first of them is the suite's own
+ * choice:
+ *
+ *   127.0.0.1:21720 TCP - the H.323 call-signalling listener the injected
+ *             configuration declares, held only for as long as the FSManager
+ *             that read that configuration lives.
+ *
+ *   0.0.0.0:4569 UDP - the IAX2 endpoint's own listener, on the IAX2 default
+ *             port.  FSManager's constructor allocates an IAX2EndPoint
+ *             unconditionally, OpalManager starts its listener on the wildcard
+ *             address, and no configuration parameter this module reads
+ *             narrows it.  It therefore appears the moment the first manager
+ *             is constructed, is reachable from off-box for the fraction of a
+ *             second the suite runs, and is released when the process exits.
+ *             Confining it would mean changing mod_opal itself, which this
+ *             harness must not do, so it is documented rather than avoided.
+ *             It is also not a source of flakiness: two instances of this
+ *             suite running concurrently both pass, because the endpoint
+ *             tolerates a listener it cannot start.
+ *
+ * What the listener cases actually assert.  FSManager::Initialise() reports a
+ * StartListener() failure only through PTRACE and propagates no status, so a
+ * listener that cannot bind leaves neither a FreeSWITCH log line nor a failed
+ * return behind.  The cases below consequently observe the listener
+ * *configuration* that reached ReadConfig() - its name, address and port - and
+ * not a socket proven to be bound.  That is deliberate: asserting on a real
+ * bind would turn any unrelated process already holding the port into a test
+ * failure, and a suite that is red for reasons outside the code under test is
+ * worse than one that verifies exactly what the parse produced.
+ *
+ * Distinguishing a bootstrap failure from case 1's intended failure.  Case 1
+ * is *supposed* to fail to open opal.conf, so the two failure modes must not be
+ * confusable.  They are not.  A successful bootstrap followed by case 1 prints
+ * the module's own "open of opal.conf failed" error and then PASS, and the
+ * remaining six cases follow.  A bootstrap that cannot find this suite's
+ * conf_opal fixture root never reaches FCTX at all and produces no case output
+ * whatsoever.  The fixture is committed beside this file, so the second mode is
+ * unreachable in a working tree; the note exists only to make triage
+ * unambiguous if the two SWITCH_TEST_BASE_DIR defines are ever lost from the
+ * module's Makefile.am.
+ *
+ * Reading this suite's output when something goes wrong.  FCTX buffers its
+ * per-case lines and flushes them from FCT_END(), which the bootstrap macro
+ * places after switch_core_destroy().  A process that aborts during core
+ * teardown therefore emits its abort diagnostic and nothing else - the case
+ * names and the pass/fail summary are lost.  This is framework-wide behaviour,
+ * identical for every FST suite in the tree, and the workaround when triaging
+ * is to run the binary under a pty; stdbuf cannot be used, because it cannot be
+ * combined with an address-sanitizer binary.
  */
 
 SWITCH_BEGIN_EXTERN_C

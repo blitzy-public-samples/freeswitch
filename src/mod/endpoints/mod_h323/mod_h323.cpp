@@ -483,6 +483,18 @@ switch_status_t FSH323EndPoint::ReadConfig(int reload)
 
 	if (xml == NULL) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "open of %s failed\n", cf);
+		/* Release everything this function allocated before taking the early
+		   return.  Required for testability: the module-local FST suite drives
+		   this branch deliberately, and the CI build enables the address
+		   sanitizer, whose leak checker would turn the leak below into a build
+		   failure rather than a test failure.
+		   `params' is destroyed at the end of the success path further down but
+		   was never released here, so each failed configuration open leaked the
+		   event and its header chain.  `pool' is created unconditionally above
+		   and is then never referenced again on either path, so it is released
+		   here too rather than left to accumulate per call. */
+		switch_event_destroy(&params);
+		switch_core_destroy_memory_pool(&pool);
 		return SWITCH_STATUS_FALSE;
 	}
 
