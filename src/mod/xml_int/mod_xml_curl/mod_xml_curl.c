@@ -1097,10 +1097,17 @@ static const char *xml_curl_json_sanitize_token(const char *token, char *buf, sw
 	return buf;
 }
 
-/* JSON: renders a gateway URL for a log line with its secrets removed. A configured
-   gateway-url legitimately carries userinfo, and query strings routinely carry tokens, so the
-   scheme, host, port and path are kept and everything capable of carrying a credential is
-   replaced with a marker. The result is sanitized and bounded like any other logged metadata. */
+/* JSON: renders a gateway URL for a log line with its secrets removed. Only the scheme and the
+   authority survive: a configured gateway-url legitimately carries userinfo, query strings
+   routinely carry tokens, and a provisioning path is just as capable of carrying a credential as
+   either of those - a tenant identifier, an account key or a bearer value is commonly one of its
+   segments. So the userinfo is replaced with a marker, and everything from the first '/', '?' or
+   '#' onwards is collapsed into one marker that records only that something followed the
+   authority. The marker is deliberately not a reconstruction of what was there: it reads the same
+   whether the original carried a path, a query, a fragment or all three. What is left - scheme,
+   host and port - is what an operator needs to identify which gateway degraded, and it is the
+   most that can be logged without persisting a secret. The result is sanitized and bounded like
+   any other logged metadata. */
 static const char *xml_curl_json_redact_url(const char *url, char *buf, switch_size_t buflen)
 {
 	char scratch[256] = "";
@@ -1148,15 +1155,20 @@ static const char *xml_curl_json_redact_url(const char *url, char *buf, switch_s
 
 	len = strlen(scratch);
 
-	/* Copy host, port and path, stopping at the query or the fragment. */
-	for (p = host; *p && *p != '?' && *p != '#' && len < sizeof(scratch) - 1; p++) {
+	/* Copy the authority only - host and port - stopping at the path, the query or the
+	   fragment. This loop is bounded by scratch, so a pathological URL truncates rather than
+	   overflowing. */
+	for (p = host; *p && *p != '/' && *p != '?' && *p != '#' && len < sizeof(scratch) - 1; p++) {
 		scratch[len++] = *p;
 	}
 
 	scratch[len] = '\0';
 
-	if (*p == '?' || *p == '#') {
-		switch_snprintf(scratch + len, sizeof(scratch) - len, "%s", "?[redacted]");
+	/* Anything at all after the authority is replaced wholesale, path included. Testing *p
+	   rather than the three delimiters also covers the truncation case above: if the authority
+	   itself did not fit, the marker records that the rendering is incomplete. */
+	if (*p) {
+		switch_snprintf(scratch + len, sizeof(scratch) - len, "%s", "/[redacted]");
 	}
 
 	return xml_curl_json_sanitize_token(scratch, buf, buflen);

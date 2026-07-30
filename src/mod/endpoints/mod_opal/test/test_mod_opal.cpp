@@ -44,22 +44,12 @@
  * de-staticised, no symbol is re-exported, no `friend' declaration is added and
  * not one line of mod_opal.cpp / mod_opal.h is modified.
  *
- * BUILD WIRING THIS FILE DEPENDS ON, STATED AS THE REQUIREMENT IT IS:
- * src/mod/endpoints/mod_opal/Makefile.am declares only the production module
- * target, so nothing in the tree builds or collects this suite yet.  Because the
- * suite includes the header alone, the module's own translation unit has to reach
- * the link some other way, and the shape that supplies it is the tree's C++
- * module-test precedent (src/mod/codecs/mod_openh264/Makefile.am:12-21): a
- * noinst_LTLIBRARIES = libmodopal.la convenience library reusing the module's two
- * verified `pkg-config opal` sed-filtered expressions, a noinst_PROGRAMS =
- * test/test_mod_opal program whose only source is test/test_mod_opal.cpp, an
- * _LDFLAGS carrying the OPAL --libs expansion, an _LDADD naming libmodopal.la and
- * $(switch_builddir)/libfreeswitch.la, the two -DSWITCH_TEST_BASE_DIR_* defines
- * described beside the suite below, and TESTS = $(noinst_PROGRAMS).  Every flag
- * the production target carries must be carried here too, because a binary built
- * with different flags is not testing the same code.  That file is owned
- * elsewhere and is not edited by this suite; no part of this file can stand in
- * for it.
+ * Link shape.  Because the suite includes the header alone, the module's own
+ * translation unit reaches the link through the libmodopal.la convenience library
+ * that src/mod/endpoints/mod_opal/Makefile.am declares, following the tree's C++
+ * module-test precedent (src/mod/codecs/mod_openh264/Makefile.am).  That target
+ * carries the production module's own compile flags, because a binary built with
+ * different flags is not testing the same code.
  *
  * Entry points.  SWITCH_MODULE_LOAD_FUNCTION / SWITCH_MODULE_SHUTDOWN_FUNCTION
  * expand to plain definitions with no storage class, so mod_opal_load() and
@@ -95,60 +85,50 @@
  * releases it before mod_opal_load() creates its own, so exactly one
  * PProcess-derived object is alive at any instant.
  *
- * Determinism.  No case starts a runtime thread, dlopens or dlcloses a module,
- * talks to a third party, opens a random port or depends on the wall clock.
- * Every injected listener binds loopback on a fixed high port.
+ * Determinism.  No case dlopens or dlcloses a module, talks to a third party,
+ * opens a random port or depends on the wall clock.  No case starts an OPAL
+ * runtime thread either, but that is an outcome of the containment described
+ * next rather than something the module does for us: left to itself,
+ * constructing an FSManager starts two.
  *
- * Socket footprint, stated so that nobody has to rediscover it.  Two sockets
- * exist while this suite runs, and only the first of them is the suite's own
- * choice:
+ * Socket footprint, stated so that nobody has to rediscover it.  Every socket
+ * this suite is responsible for is bound to loopback:
  *
  *   127.0.0.1:21720 TCP - the H.323 call-signalling listener the injected
  *             configuration declares, held only for as long as the FSManager
  *             that read that configuration lives.
  *
- *   0.0.0.0:4569 UDP - the IAX2 endpoint's own listener, on the IAX2 default
- *             port.  FSManager's constructor allocates an IAX2EndPoint
- *             unconditionally, OpalManager starts its listener on the wildcard
- *             address, and no configuration parameter this module reads
- *             narrows it.  It therefore appears the moment the first manager
- *             is constructed, is reachable from off-box for the fraction of a
- *             second the suite runs, and is released when the process exits.
- *             Confining it would mean changing mod_opal itself, which this
- *             harness must not do, so it is documented rather than avoided.
- *             It is also not a source of flakiness: two instances of this
- *             suite running concurrently both pass, because the endpoint
- *             tolerates a listener it cannot start.
+ *   127.0.0.1:4569 UDP - the suite's own guard on the IAX2 default port, held
+ *             for the whole suite.  It exists to make a socket NOT happen.
+ *             FSManager's constructor allocates an IAX2EndPoint
+ *             unconditionally (mod_opal.cpp:262-270) and IAX2EndPoint's
+ *             constructor calls Initialise(), which listens on the WILDCARD
+ *             address on this port and, if that succeeds, starts an
+ *             IAX2Transmit and an IAX2Receiver thread.  Nothing mod_opal reads
+ *             narrows the address, and the harness must not change the module,
+ *             so instead the suite takes the port on loopback before any
+ *             manager exists.  A loopback holder is enough to refuse a wildcard
+ *             bind, so the listen fails, Initialise() returns before creating
+ *             either thread, and no off-box-reachable socket is ever opened.
+ *             OPAL reports the failure through PTRACE only and propagates no
+ *             status, so nothing else about the module's observable behaviour
+ *             changes.  Case 1 asserts all of this rather than assuming it, from
+ *             inside the process and from outside it.  See the containment
+ *             section further down for the measured bind semantics this relies
+ *             on.
  *
- * What the listener cases actually assert.  FSManager::Initialise() reports a
- * StartListener() failure only through PTRACE and propagates no status, so a
- * listener that cannot bind leaves neither a FreeSWITCH log line nor a failed
- * return behind.  The cases below consequently observe the listener
- * *configuration* that reached ReadConfig() - its name, address and port - and
- * not a socket proven to be bound.  That is deliberate: asserting on a real
- * bind would turn any unrelated process already holding the port into a test
- * failure, and a suite that is red for reasons outside the code under test is
- * worse than one that verifies exactly what the parse produced.
+ *   0.0.0.0:4569 UDP - what the above prevents.  This is what the suite opened
+ *             before the guard existed: the IAX2 listener on the wildcard
+ *             address, reachable from off-box for as long as the suite ran
+ *             (CWE-668).  It must not reappear, and case 1 is what fails if it
+ *             does.
  *
- * Distinguishing a bootstrap failure from case 1's intended failure.  Case 1
- * is *supposed* to fail to open opal.conf, so the two failure modes must not be
- * confusable.  They are not.  A successful bootstrap followed by case 1 prints
- * the module's own "open of opal.conf failed" error and then PASS, and the
- * remaining six cases follow.  A bootstrap that cannot find this suite's
- * conf_opal fixture root never reaches FCTX at all and produces no case output
- * whatsoever.  The fixture is committed beside this file, so the second mode is
- * unreachable in a working tree; the note exists only to make triage
- * unambiguous if the two SWITCH_TEST_BASE_DIR defines are ever lost from the
- * module's Makefile.am.
- *
- * Reading this suite's output when something goes wrong.  FCTX buffers its
- * per-case lines and flushes them from FCT_END(), which the bootstrap macro
- * places after switch_core_destroy().  A process that aborts during core
- * teardown therefore emits its abort diagnostic and nothing else - the case
- * names and the pass/fail summary are lost.  This is framework-wide behaviour,
- * identical for every FST suite in the tree, and the workaround when triaging
- * is to run the binary under a pty; stdbuf cannot be used, because it cannot be
- * combined with an address-sanitizer binary.
+ * What the listener cases assert.  FSManager::Initialise() reports a
+ * StartListener() failure only through PTRACE and propagates no status
+ * (mod_opal.cpp:287-291), so a listener that cannot bind leaves neither a
+ * FreeSWITCH log line nor a failed return behind.  The cases below therefore
+ * observe the listener *configuration* that reached ReadConfig() - its name,
+ * address and port - and not a socket proven to be bound.
  */
 
 SWITCH_BEGIN_EXTERN_C
@@ -889,12 +869,242 @@ static switch_status_t test_opal_unbind_config(void)
 }
 
 /*
+ * ---------------------------------------------------------------------------
+ * Containment of the toolkit's own side effects
+ * ---------------------------------------------------------------------------
+ *
+ * Two side effects are not the suite's to want: PTLib's plugin search path and
+ * OPAL's IAX2 listener.  Both are established by constructors this suite has to
+ * call, so both have to be contained BEFORE the first of those constructors
+ * runs.  Neither is contained by mod_opal for us in the cases that build objects
+ * directly.
+ *
+ *
+ * (1) PLUGIN SEARCH PATH
+ *
+ * Constructing any PProcess makes PTLib enumerate its plugin directory and
+ * dlopen what it finds there.  The directory comes from the environment:
+ * PTLIBPLUGINDIR is the current name and PWLIBPLUGINDIR the legacy one, and both
+ * strings are present in the libpt this module links against, so both are live
+ * inputs.  A test binary is run by `make check' out of an environment nobody
+ * audits, which turns an inherited value into an arbitrary-code-execution seam
+ * (CWE-427, CWE-829).
+ *
+ * mod_opal does set PTLIBPLUGINDIR to "/no/thanks" - but it does so inside
+ * mod_opal_load() (mod_opal.cpp:108), which runs in exactly one case near the
+ * end of this suite, and it never touches the legacy name at all.  Every case
+ * that constructs an FSProcess directly - which is every case before the load
+ * case - therefore ran unprotected.
+ *
+ * So both variables are pinned here, unconditionally and before the first
+ * PProcess, to a fixed directory that does not exist: nothing can be enumerated
+ * in a directory that is not there.  "/no/thanks" is deliberately the same value
+ * and putenv() the same idiom the production module already uses, so harness and
+ * module agree.  putenv() REPLACES an existing entry of the same name, which is
+ * what makes this effective against an inherited value rather than merely a
+ * default for an unset one; a string literal has static storage, which is what
+ * makes putenv() safe here.
+ *
+ * It is wired in two places on purpose - the suite setup hook, which FCTX runs
+ * before every case body, and the acquire helper below, which is the only place
+ * in the suite that constructs a PProcess.  Either alone suffices today; both
+ * means no re-ordering and no new case can reintroduce the exposure.  It is
+ * idempotent, so paying twice costs nothing.
+ */
+#define TEST_OPAL_PLUGIN_DIR "/no/thanks"
+
+static int test_opal_plugin_path_pinned = 0;
+
+static void test_opal_pin_plugin_path(void)
+{
+	if (test_opal_plugin_path_pinned) {
+		return;
+	}
+
+	(void) putenv((char *) "PTLIBPLUGINDIR=" TEST_OPAL_PLUGIN_DIR);
+	(void) putenv((char *) "PWLIBPLUGINDIR=" TEST_OPAL_PLUGIN_DIR);
+
+	test_opal_plugin_path_pinned = 1;
+}
+
+/*
+ * True when both plugin-directory variables read back as the pinned value.  Used
+ * by the containment case to assert the pinning rather than assume it.
+ */
+static int test_opal_plugin_path_is_pinned(void)
+{
+	const char *ptlib = getenv("PTLIBPLUGINDIR");
+	const char *pwlib = getenv("PWLIBPLUGINDIR");
+
+	return ptlib && pwlib && !strcmp(ptlib, TEST_OPAL_PLUGIN_DIR) && !strcmp(pwlib, TEST_OPAL_PLUGIN_DIR);
+}
+
+/*
+ * (2) THE IAX2 WILDCARD LISTENER
+ *
+ * FSManager's constructor allocates an IAX2EndPoint unconditionally
+ * (mod_opal.cpp:262-270).  IAX2EndPoint's own constructor calls its Initialise(),
+ * which does `sock = new PUDPSocket(GetDefaultSignalPort())' followed by
+ * `sock->Listen(INADDR_ANY, 0, sock->GetPort())' and, ONLY if that listen
+ * succeeds, constructs the IAX2Transmit and IAX2Receiver threads.  So merely
+ * constructing a manager opened UDP 4569 on the WILDCARD address - reachable
+ * from off-box for as long as the suite ran - and started two live threads.  No
+ * configuration parameter mod_opal reads narrows it, and the harness must not
+ * change the module, so the address cannot be fixed at its source.
+ *
+ * It can, however, be made unavailable.  The suite takes the port itself, on
+ * loopback only, before any manager exists.  Three measured properties of the
+ * Linux UDP bind make that both sufficient and safe:
+ *
+ *   - a holder of 127.0.0.1:4569 blocks a subsequent bind of 0.0.0.0:4569,
+ *     with or without SO_REUSEADDR on the second socket.  So OPAL's listen
+ *     fails, sock is never bound, and Initialise() returns false before it can
+ *     construct either thread.  Containment therefore removes the exposed
+ *     socket AND the two threads, not just the socket;
+ *
+ *   - a bind of 127.0.0.1:4569 leaves any OTHER local address free, so the
+ *     guard reaches no further than it must, and probing a routable local
+ *     address is an exact test for "does anything own the wildcard" - it
+ *     succeeds while only the loopback guard is held and fails the moment a
+ *     wildcard owner exists.  That is what the containment case asserts;
+ *
+ *   - OPAL tolerates the failure: it is reported through PTRACE only, no status
+ *     is propagated, and the suite passes unchanged.  Verified independently by
+ *     holding the port from another process.
+ *
+ * SO_REUSEADDR is deliberately NOT set on the guard.  It is not needed to take
+ * a free port, and setting it would weaken exactly the exclusion the guard
+ * exists to create.
+ *
+ * The guard lives in its own pool rather than fst_pool because fst_pool lasts
+ * one case (FST_SETUP_BEGIN creates it, FST_TEARDOWN_BEGIN destroys it) while
+ * the guard must span the whole suite.  It is acquired from the setup hook, so
+ * it is held before any case body runs, and released by the suite-wide sweep -
+ * where re-acquisition by the next setup makes an early release harmless.
+ */
+#define TEST_OPAL_GUARD_ADDRESS "127.0.0.1"
+
+static switch_memory_pool_t *test_opal_guard_pool = NULL;
+static switch_socket_t *test_opal_iax2_guard = NULL;
+
+/*
+ * Set when the guard's bind was refused, which means some other holder already
+ * owns the port.  That produces the same containment - a wildcard bind will be
+ * refused too - so the containment case accepts it, while still refusing to
+ * accept a guard that failed for any other reason.
+ */
+static int test_opal_iax2_port_has_foreign_owner = 0;
+
+/*
+ * Take UDP DefaultUdpPort on loopback.  Idempotent: reports success when the
+ * guard is already held.  Modelled on test_port() in
+ * src/switch_core_port_allocator.c, which is the tree's own way of asking
+ * whether a port can be bound.
+ */
+static switch_status_t test_opal_iax2_guard_acquire(void)
+{
+	switch_sockaddr_t *guard_addr = NULL;
+
+	if (test_opal_iax2_guard) {
+		return SWITCH_STATUS_SUCCESS;
+	}
+
+	if (!test_opal_guard_pool && switch_core_new_memory_pool(&test_opal_guard_pool) != SWITCH_STATUS_SUCCESS) {
+		return SWITCH_STATUS_FALSE;
+	}
+
+	if (switch_sockaddr_new(&guard_addr, TEST_OPAL_GUARD_ADDRESS,
+							(switch_port_t) IAX2EndPoint::DefaultUdpPort, test_opal_guard_pool) != SWITCH_STATUS_SUCCESS) {
+		return SWITCH_STATUS_FALSE;
+	}
+
+	if (switch_socket_create(&test_opal_iax2_guard, switch_sockaddr_get_family(guard_addr),
+							 SOCK_DGRAM, 0, test_opal_guard_pool) != SWITCH_STATUS_SUCCESS) {
+		test_opal_iax2_guard = NULL;
+		return SWITCH_STATUS_FALSE;
+	}
+
+	/* No SWITCH_SO_REUSEADDR here, on purpose - see the note above. */
+
+	if (switch_socket_bind(test_opal_iax2_guard, guard_addr) != SWITCH_STATUS_SUCCESS) {
+		switch_socket_close(test_opal_iax2_guard);
+		test_opal_iax2_guard = NULL;
+		test_opal_iax2_port_has_foreign_owner = 1;
+		return SWITCH_STATUS_FALSE;
+	}
+
+	return SWITCH_STATUS_SUCCESS;
+}
+
+/*
+ * Release the guard and its pool.  Idempotent.
+ */
+static void test_opal_iax2_guard_release(void)
+{
+	if (test_opal_iax2_guard) {
+		switch_socket_close(test_opal_iax2_guard);
+		test_opal_iax2_guard = NULL;
+	}
+
+	if (test_opal_guard_pool) {
+		switch_core_destroy_memory_pool(&test_opal_guard_pool);
+	}
+}
+
+/*
+ * True when the IAX2 default port cannot be bound on the wildcard address by
+ * anyone - either because this suite holds it on loopback or because another
+ * holder already had it.
+ */
+static int test_opal_iax2_containment_in_effect(void)
+{
+	return (test_opal_iax2_guard != NULL) || test_opal_iax2_port_has_foreign_owner;
+}
+
+/*
+ * Can `ip' be bound on UDP `port' right now?  Used as the containment probe: a
+ * routable local address stays bindable while only the loopback guard is held
+ * and stops being bindable the moment something owns the wildcard.  The socket
+ * is closed again immediately, so the probe leaves nothing behind.
+ */
+static switch_bool_t test_opal_udp_port_is_bindable(const char *ip, switch_port_t port)
+{
+	switch_memory_pool_t *pool = NULL;
+	switch_sockaddr_t *addr = NULL;
+	switch_socket_t *sock = NULL;
+	switch_bool_t bindable = SWITCH_FALSE;
+
+	if (switch_core_new_memory_pool(&pool) != SWITCH_STATUS_SUCCESS) {
+		return SWITCH_FALSE;
+	}
+
+	if (switch_sockaddr_new(&addr, ip, port, pool) == SWITCH_STATUS_SUCCESS) {
+		if (switch_socket_create(&sock, switch_sockaddr_get_family(addr), SOCK_DGRAM, 0, pool) == SWITCH_STATUS_SUCCESS) {
+			if (switch_socket_bind(sock, addr) == SWITCH_STATUS_SUCCESS) {
+				bindable = SWITCH_TRUE;
+			}
+			switch_socket_close(sock);
+		}
+	}
+
+	switch_core_destroy_memory_pool(&pool);
+
+	return bindable;
+}
+
+/*
  * Return the suite-local PTLib process, creating it on first use.  Every
  * FSManager needs one to exist, because OpalManager's constructor reads
  * PProcess::Current().
+ *
+ * The plugin search path is pinned FIRST, on every call, because constructing a
+ * PProcess is what triggers PTLib's plugin enumeration and there is no second
+ * chance once it has run.
  */
 static FSProcess *test_opal_acquire_process(void)
 {
+	test_opal_pin_plugin_path();
+
 	if (!test_opal_process) {
 		test_opal_process = new FSProcess();
 	}
@@ -1015,8 +1225,9 @@ static FSManager *test_opal_module_manager(void)
  *     is a well-defined no-op, so it is safe with or without a prior load and
  *     safe to repeat.  It is also the ONLY way to reclaim a process the module
  *     created, including after a load that failed halfway;
- *   - test_opal_release_process() and test_opal_module_pool_destroy() both test
- *     their pointer first and null it afterwards.
+ *   - test_opal_release_process(), test_opal_module_pool_destroy() and
+ *     test_opal_iax2_guard_release() all test their pointer first and null it
+ *     afterwards.
  *
  * ORDER IS LOAD-BEARING:
  *   1. unbind the provider first, so nothing that follows can still resolve a
@@ -1028,7 +1239,9 @@ static FSManager *test_opal_module_manager(void)
  *   4. release the suite's own PTLib process, so at most one PProcess-derived
  *      object has existed at any instant and none outlives the suite;
  *   5. forget the module interface, which is memory owned by the pool destroyed
- *      on the next line, and only then destroy that pool.
+ *      on the next line, and only then destroy that pool;
+ *   6. release the IAX2 port guard last of all, so that nothing this suite
+ *      built can still be holding an endpoint when the port becomes free again.
  *
  * WHY THIS IS NOT INVOKED FROM FST_TEARDOWN.  FST_TEARDOWN runs after EVERY case,
  * and this suite deliberately hands live state from the load case to the shutdown
@@ -1055,6 +1268,13 @@ static void test_opal_suite_state_cleanup(void)
 	test_opal_module_interface = NULL;
 
 	test_opal_module_pool_destroy();
+
+	/*
+	 * Release the IAX2 port guard last, so it outlives every manager this suite
+	 * built.  Releasing it early is harmless anyway: the setup hook re-acquires
+	 * it before the next case body runs.
+	 */
+	test_opal_iax2_guard_release();
 }
 
 /*
@@ -1077,13 +1297,16 @@ static void test_opal_suite_state_cleanup(void)
  * FCTX runs cases in declaration order within a single process, and that order
  * is load bearing:
  *
- *   1. the configuration-absent failure runs first, before any successful
+ *   1. the containment case runs first, so the preconditions every later case
+ *      relies on are established as facts before anything depends on them, and
+ *      so the IAX2 listener is observed at the earliest moment it could exist;
+ *   2. the configuration-absent failure follows, still before any successful
  *      parse or load can leave module state behind;
- *   2. the three cases that only build objects follow, so they observe a
+ *   3. the three cases that only build objects come next, so they observe a
  *      pristine OPAL media-format registry - FSManager::Initialise() mutates
  *      the process-global registry;
- *   3. the load case comes next and takes over the PTLib process singleton;
- *   4. the shutdown case is declared last so it observes a fully initialised
+ *   4. the load case follows and takes over the PTLib process singleton;
+ *   5. the shutdown case is declared last so it observes a fully initialised
  *      module, and its result is asserted rather than discarded.
  */
 FST_CORE_BEGIN("conf_opal")
@@ -1092,6 +1315,16 @@ FST_CORE_BEGIN("conf_opal")
 	{
 		FST_SETUP_BEGIN()
 		{
+			/*
+			 * Contain the toolkit's two unwanted side effects before any case
+			 * body can trigger them.  FCTX runs this hook once per declared
+			 * case, ahead of the body, which makes it the earliest point no
+			 * case ordering can bypass.  Both calls are idempotent.  Neither
+			 * asserts here: a fixture cannot fail a case, so the containment
+			 * case below asserts both outcomes instead.
+			 */
+			test_opal_pin_plugin_path();
+			(void) test_opal_iax2_guard_acquire();
 		}
 		FST_SETUP_END()
 
@@ -1128,7 +1361,82 @@ FST_CORE_BEGIN("conf_opal")
 		FST_TEARDOWN_END()
 
 		/*
-		 * Case 1 - configuration absent.
+		 * Case 1 - the toolkit's side effects are contained.
+		 *
+		 * Declared first because it asserts the preconditions every later case
+		 * depends on, and because the thing it is asserting about - the IAX2
+		 * listener - appears the instant the first FSManager is constructed.
+		 *
+		 * Three independent observations, in increasing strength:
+		 *
+		 *   - both plugin-directory variables read back as the pinned
+		 *     nonexistent directory, so no later PProcess can enumerate an
+		 *     inherited path;
+		 *
+		 *   - a manager is constructed and its IAX2 endpoint reports
+		 *     InitialisedOK() false.  That is the direct, in-process proof that
+		 *     IAX2EndPoint::Initialise()'s `sock->Listen(INADDR_ANY, ...)' was
+		 *     refused, because Initialise() returns before constructing the
+		 *     transmitter and receiver when the listen fails and
+		 *     InitialisedOK() is exactly `transmitter != NULL && receiver !=
+		 *     NULL'.  So this single check covers both the unexposed socket and
+		 *     the two threads that were never started;
+		 *
+		 *   - while that manager is alive, a routable local address is still
+		 *     bindable on the same UDP port.  A wildcard owner would make that
+		 *     bind fail, so its success is an out-of-process proof that nothing
+		 *     is listening off-box.  It is skipped, not failed, when the only
+		 *     address discoverable on the host is loopback - there the probe
+		 *     would be indistinguishable from the guard itself and would prove
+		 *     nothing either way.
+		 */
+		FST_TEST_BEGIN(toolkit_side_effects_are_contained)
+		{
+			char local_ip[80] = "";
+			int local_mask = 0;
+			switch_bool_t have_routable_ip = SWITCH_FALSE;
+
+			/* the plugin search path was pinned before any PProcess existed */
+			fst_requires(test_opal_plugin_path_is_pinned());
+
+			/* the port is unavailable to a wildcard bind, by us or by another
+			 * holder - either way OPAL cannot take it */
+			fst_requires(test_opal_iax2_containment_in_effect());
+
+			if (switch_find_local_ip(local_ip, sizeof(local_ip), &local_mask, AF_INET) == SWITCH_STATUS_SUCCESS
+				&& *local_ip && strcmp(local_ip, TEST_OPAL_GUARD_ADDRESS)) {
+				have_routable_ip = SWITCH_TRUE;
+			}
+
+			fst_requires(test_opal_acquire_process() != NULL);
+
+			{
+				FSManager manager;
+				IAX2EndPoint *iax2_endpoint = manager.FindEndPointAs < IAX2EndPoint > ("iax2");
+
+				fst_requires(iax2_endpoint != NULL);
+
+				/* the listen was refused, so neither the socket nor the
+				 * transmitter/receiver threads came into being */
+				fst_check(iax2_endpoint->InitialisedOK() == PFalse);
+
+				if (have_routable_ip) {
+					/* nothing owns the wildcard while the manager is alive */
+					fst_check(test_opal_udp_port_is_bindable(local_ip,
+															(switch_port_t) IAX2EndPoint::DefaultUdpPort) == SWITCH_TRUE);
+				} else {
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
+									  "no routable IPv4 address on this host; off-box reachability probe skipped\n");
+				}
+			}
+
+			/* and the guard still holds the port after the manager is gone */
+			fst_check(test_opal_iax2_containment_in_effect());
+		}
+		FST_TEST_END()
+
+		/*
+		 * Case 2 - configuration absent.
 		 *
 		 * ReadConfig() is asserted directly rather than through
 		 * mod_opal_load(), because FSManager::Initialise() discards
@@ -1142,6 +1450,10 @@ FST_CORE_BEGIN("conf_opal")
 			switch_status_t status = SWITCH_STATUS_SUCCESS;
 
 			fst_requires(test_opal_acquire_process() != NULL);
+			/* Fatal precondition: the IAX2 wildcard listener must be unable to
+			 * bind before a manager is constructed.  Asserted per case, not just
+			 * once, so no re-ordering can leave a manager built without it. */
+			fst_requires(test_opal_iax2_containment_in_effect());
 
 			{
 				FSManager manager;
@@ -1154,14 +1466,19 @@ FST_CORE_BEGIN("conf_opal")
 		FST_TEST_END()
 
 		/*
-		 * Case 2 - dual endpoint construction.
+		 * Case 3 - dual endpoint construction.
 		 *
 		 * FSManager's constructor allocates an H.323, an IAX2 and a FreeSWITCH
 		 * local endpoint.  The first two are private members, so they are
 		 * observed through the inherited public OpalManager::FindEndPoint()
 		 * lookup rather than reached for directly, which keeps the assertion
-		 * valid across any refactoring of those members.  Constructing a
-		 * manager binds no socket.
+		 * valid across any refactoring of those members.
+		 *
+		 * Constructing a manager does attempt one bind - IAX2EndPoint's
+		 * constructor tries to listen on the wildcard address - and case 1
+		 * establishes that the attempt is refused before this case runs.  What
+		 * is asserted here is only which endpoints the constructor allocated;
+		 * an endpoint exists whether or not its listener started.
 		 */
 		FST_TEST_BEGIN(dual_endpoint_construction)
 		{
@@ -1174,6 +1491,10 @@ FST_CORE_BEGIN("conf_opal")
 			const OpalEndPoint *iax2_endpoint = NULL;
 
 			fst_requires(test_opal_acquire_process() != NULL);
+			/* Fatal precondition: the IAX2 wildcard listener must be unable to
+			 * bind before a manager is constructed.  Asserted per case, not just
+			 * once, so no re-ordering can leave a manager built without it. */
+			fst_requires(test_opal_iax2_containment_in_effect());
 
 			{
 				FSManager manager;
@@ -1199,7 +1520,7 @@ FST_CORE_BEGIN("conf_opal")
 		FST_TEST_END()
 
 		/*
-		 * Case 3 - default signalling port.
+		 * Case 4 - default signalling port.
 		 *
 		 * FSListener's public inline constructor is the module's only source of
 		 * a default signalling port, because ReadConfig() supplies none: a
@@ -1217,7 +1538,7 @@ FST_CORE_BEGIN("conf_opal")
 		FST_TEST_END()
 
 		/*
-		 * Case 4 - settings parsed from the injected configuration.
+		 * Case 5 - settings parsed from the injected configuration.
 		 *
 		 * ReadConfig() is driven directly because it is socket free, and it is
 		 * called exactly once on this manager: the listener list is appended to
@@ -1241,6 +1562,10 @@ FST_CORE_BEGIN("conf_opal")
 			switch_status_t status = SWITCH_STATUS_FALSE;
 
 			fst_requires(test_opal_acquire_process() != NULL);
+			/* Fatal precondition: the IAX2 wildcard listener must be unable to
+			 * bind before a manager is constructed.  Asserted per case, not just
+			 * once, so no re-ordering can leave a manager built without it. */
+			fst_requires(test_opal_iax2_containment_in_effect());
 			fst_requires(test_opal_bind_config_document(TEST_OPAL_CONFIG_XML_SETTINGS) == SWITCH_STATUS_SUCCESS);
 
 			{
@@ -1262,7 +1587,7 @@ FST_CORE_BEGIN("conf_opal")
 		FST_TEST_END()
 
 		/*
-		 * Case 5 - listener name defaults to "unnamed".
+		 * Case 6 - listener name defaults to "unnamed".
 		 *
 		 * ReadConfig() reads a listener's name with switch_xml_attr_soft(),
 		 * which yields "" rather than NULL for an absent attribute, and
@@ -1313,6 +1638,10 @@ FST_CORE_BEGIN("conf_opal")
 			switch_status_t armed = SWITCH_STATUS_FALSE;
 
 			fst_requires(test_opal_acquire_process() != NULL);
+			/* Fatal precondition: the IAX2 wildcard listener must be unable to
+			 * bind before a manager is constructed.  Asserted per case, not just
+			 * once, so no re-ordering can leave a manager built without it. */
+			fst_requires(test_opal_iax2_containment_in_effect());
 
 			/* Half one: a <listener> with no name attribute takes the default. */
 			bound = test_opal_bind_config_document(TEST_OPAL_CONFIG_XML_UNNAMED_LISTENER);
@@ -1414,7 +1743,7 @@ FST_CORE_BEGIN("conf_opal")
 		FST_TEST_END()
 
 		/*
-		 * Case 6 - module load and endpoint-interface registration.
+		 * Case 7 - module load and endpoint-interface registration.
 		 *
 		 * Two observations of the same registration, in the only order that
 		 * keeps a single PTLib process alive throughout:
@@ -1457,6 +1786,10 @@ FST_CORE_BEGIN("conf_opal")
 			switch_status_t pooled = SWITCH_STATUS_FALSE;
 
 			fst_requires(test_opal_acquire_process() != NULL);
+			/* Fatal precondition: the IAX2 wildcard listener must be unable to
+			 * bind before a manager is constructed.  Asserted per case, not just
+			 * once, so no re-ordering can leave a manager built without it. */
+			fst_requires(test_opal_iax2_containment_in_effect());
 
 			bound = test_opal_bind_config();
 			fst_xcheck(bound == SWITCH_STATUS_SUCCESS,
@@ -1550,7 +1883,7 @@ FST_CORE_BEGIN("conf_opal")
 		FST_TEST_END()
 
 		/*
-		 * Case 7 - module shutdown.
+		 * Case 8 - module shutdown.
 		 *
 		 * The module's shutdown entry point destroys the process object its
 		 * load created and is unconditionally successful: deleting a null

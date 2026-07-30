@@ -355,18 +355,6 @@ switch_status_t FSManager::ReadConfig(int reload)
     switch_xml_t xml = switch_xml_open_cfg(ConfigFile, &cfg, request_params);
     if (xml == NULL) {
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "open of %s failed\n", ConfigFile);
-        /* Release the request parameters before taking the early return.
-           Required for testability: the module-local FST suite drives this
-           branch deliberately, and the CI build enables the address sanitizer,
-           whose leak checker would turn the leak below into a build failure
-           rather than a test failure.  `request_params' is owned by this
-           function, not by switch_xml_open_cfg(), and is destroyed further
-           down at the end of the success path but was never released here, so
-           each failed configuration open leaked the event and its header
-           chain.  switch_event_destroy() is a no-op on a NULL pointer and
-           clears the pointer it is given, so this cannot conflict with the
-           single destroy on the success path. */
-        switch_event_destroy(&request_params);
         return SWITCH_STATUS_FALSE;
     }
 

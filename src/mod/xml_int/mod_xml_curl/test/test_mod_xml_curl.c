@@ -753,7 +753,7 @@ static int fst_xc_write_file(const char *path, const char *text, switch_size_t l
  * that timeout is the only use of the clock, and it can only turn a hang into a
  * diagnosable failure.
  */
-#define FST_XC_LOG_PATTERNS 2
+#define FST_XC_LOG_PATTERNS 3
 #define FST_XC_LOG_TIMEOUT_US 10000000
 
 /* The one JSON fallback warning, emitted by xml_curl_json_decode_response(). */
@@ -763,6 +763,16 @@ static int fst_xc_write_file(const char *path, const char *text, switch_size_t l
 /* The pre-existing error the production XML parse reports when it cannot parse. */
 #define FST_XC_LOG_PARSE_ERROR "Error Parsing Result!"
 #define FST_XC_LOG_IDX_PARSE_ERROR 1
+
+/*
+ * A third slot the caller fills in, used to assert the ABSENCE of a string from
+ * everything the module logs.  The confidentiality cases need that direction:
+ * proving a secret is redacted means proving no log line anywhere carried it, and
+ * a count of zero over every dispatched line is the only assertion that says so.
+ * Held in a buffer rather than as a borrowed pointer because the logger callback
+ * runs on the core's log thread and must not depend on a caller's stack.
+ */
+#define FST_XC_LOG_IDX_ABSENT 2
 
 static switch_memory_pool_t *fst_xc_log_pool = NULL;
 static switch_mutex_t *fst_xc_log_mutex = NULL;
@@ -774,6 +784,7 @@ static int fst_xc_log_bound = 0;
 static int fst_xc_log_barrier_seq = 0;
 static int fst_xc_log_sentinel_seen = 0;
 static char fst_xc_log_sentinel[64] = "";
+static char fst_xc_log_absent[256] = "";
 
 static switch_status_t fst_xc_logger(const switch_log_node_t *node, switch_log_level_t level)
 {
@@ -817,6 +828,7 @@ static int fst_xc_log_capture_start(void)
 	fst_xc_log_armed = 0;
 	fst_xc_log_sentinel_seen = 0;
 	*fst_xc_log_sentinel = '\0';
+	*fst_xc_log_absent = '\0';
 
 	if (fst_xc_log_bound) {
 		return 1;
@@ -900,7 +912,27 @@ static int fst_xc_log_barrier(void)
 	return seen;
 }
 
-/* Start counting the two production messages from zero. */
+/*
+ * Name the string whose ABSENCE the next armed run must demonstrate, or clear the
+ * slot with NULL.  Set before fst_xc_log_arm(), which is what installs it.
+ */
+static void fst_xc_log_watch_absent(const char *needle)
+{
+	if (!fst_xc_log_mutex) {
+		return;
+	}
+
+	switch_mutex_lock(fst_xc_log_mutex);
+	if (zstr(needle)) {
+		*fst_xc_log_absent = '\0';
+	} else {
+		switch_copy_string(fst_xc_log_absent, needle, sizeof(fst_xc_log_absent));
+	}
+	switch_mutex_unlock(fst_xc_log_mutex);
+}
+
+/* Start counting the two production messages -- and the watched string, when one
+   has been named -- from zero. */
 static void fst_xc_log_arm(void)
 {
 	if (!fst_xc_log_mutex) {
@@ -911,6 +943,7 @@ static void fst_xc_log_arm(void)
 	memset(fst_xc_log_counts, 0, sizeof(fst_xc_log_counts));
 	fst_xc_log_patterns[FST_XC_LOG_IDX_FALLBACK] = FST_XC_LOG_FALLBACK;
 	fst_xc_log_patterns[FST_XC_LOG_IDX_PARSE_ERROR] = FST_XC_LOG_PARSE_ERROR;
+	fst_xc_log_patterns[FST_XC_LOG_IDX_ABSENT] = *fst_xc_log_absent ? fst_xc_log_absent : NULL;
 	fst_xc_log_armed = 1;
 	switch_mutex_unlock(fst_xc_log_mutex);
 }
@@ -2145,16 +2178,29 @@ FST_CORE_BEGIN("conf")
 			char buf[128] = "";
 
 			/*
-			 * A configured gateway-url legitimately carries userinfo and query strings
-			 * routinely carry tokens, so the one fallback warning has to be able to name
-			 * the gateway without reproducing its credentials.
+			 * A configured gateway-url legitimately carries userinfo, query strings
+			 * routinely carry tokens and a provisioning path routinely carries a tenant
+			 * or account identifier, so the one fallback warning has to be able to name
+			 * the gateway without reproducing any of them. Only the scheme and the
+			 * authority survive; everything from the first '/', '?' or '#' onwards is
+			 * collapsed into a single marker.
 			 */
 			fst_check_string_equals(xml_curl_json_redact_url("https://user:pass@example.com:8080/prov?token=abc#frag", buf, sizeof(buf)),
-									"https://[redacted]@example.com:8080/prov?[redacted]");
-			fst_check_string_equals(xml_curl_json_redact_url("http://example.com/prov", buf, sizeof(buf)), "http://example.com/prov");
+									"https://[redacted]@example.com:8080/[redacted]");
+			fst_check_string_equals(xml_curl_json_redact_url("http://example.com/prov", buf, sizeof(buf)),
+									"http://example.com/[redacted]");
 			fst_check_string_equals(xml_curl_json_redact_url("http://example.com/prov#frag", buf, sizeof(buf)),
-									"http://example.com/prov?[redacted]");
-			fst_check_string_equals(xml_curl_json_redact_url("example.com/prov?t=1", buf, sizeof(buf)), "example.com/prov?[redacted]");
+									"http://example.com/[redacted]");
+			fst_check_string_equals(xml_curl_json_redact_url("example.com/prov?t=1", buf, sizeof(buf)), "example.com/[redacted]");
+			/* a bare gateway host has nothing to collapse, so it carries no marker and
+			 * stays distinguishable from one that did */
+			fst_check_string_equals(xml_curl_json_redact_url("http://example.com", buf, sizeof(buf)), "http://example.com");
+			fst_check_string_equals(xml_curl_json_redact_url("http://example.com:8080", buf, sizeof(buf)), "http://example.com:8080");
+			/* the marker is the same however the remainder was spelled: a bare '/', a
+			 * query with no path, and a fragment with no path all render identically */
+			fst_check_string_equals(xml_curl_json_redact_url("http://example.com/", buf, sizeof(buf)), "http://example.com/[redacted]");
+			fst_check_string_equals(xml_curl_json_redact_url("http://example.com?t=1", buf, sizeof(buf)), "http://example.com/[redacted]");
+			fst_check_string_equals(xml_curl_json_redact_url("http://example.com#f", buf, sizeof(buf)), "http://example.com/[redacted]");
 			fst_check_string_equals(xml_curl_json_redact_url(NULL, buf, sizeof(buf)), "(none)");
 			fst_check_string_equals(xml_curl_json_redact_url("", buf, sizeof(buf)), "(none)");
 
@@ -2510,6 +2556,95 @@ FST_CORE_BEGIN("conf")
 			switch_xml_free(xml);
 			xml = NULL;
 
+			fst_xc_log_capture_stop();
+		}
+		FST_TEST_END()
+
+		/*
+		 * The confidentiality regression: no part of the gateway URL's path may
+		 * survive into the fallback warning.
+		 *
+		 * The path of a provisioning URL is not inert.  Deployments routinely
+		 * address a tenant by putting its identifier - or an account key, or a
+		 * bearer value - in a path segment, exactly as they put tokens in a query
+		 * string, and a warning is written to whatever the operator's logger
+		 * persists to.  Redacting the userinfo and the query while reproducing the
+		 * path therefore leaves the same class of secret in the same place.
+		 *
+		 * This case drives the REAL fetch, so it observes the bytes the module
+		 * actually logs rather than the return value of the redaction helper: the
+		 * bound counting logger sees every dispatched line, and the assertion is
+		 * that the count of lines containing the secret is zero while the count of
+		 * fallback warnings is one.  Asserting the helper alone would still pass if
+		 * a future edit logged binding->url directly somewhere else in the fetch.
+		 */
+		FST_TEST_BEGIN(log_hygiene_url_path_is_never_logged)
+		{
+			/* announced as XML against a JSON binding, so the decode is abandoned
+			   and the one fallback warning is emitted */
+			static const char xml_body[] = "<document type=\"freeswitch/xml\"><section name=\"directory\">"
+				"<user id=\"2000\"></user></section></document>";
+			static const char secret_path_segment[] = "s3cr3t-tenant-token";
+			static const char secret_password[] = "hunter2";
+			static const char secret_query_value[] = "deadbeefapikey";
+			static const char gateway_url[] = "https://provisioner:hunter2@127.0.0.1:1"
+				"/tenants/s3cr3t-tenant-token/directory?apikey=deadbeefapikey#frag";
+			char rendered[256] = "";
+			xml_binding_t binding;
+			switch_xml_t xml = NULL;
+
+			fst_requires(fst_xc_log_capture_start());
+
+			memset(&binding, 0, sizeof(binding));
+			binding.url = (char *) gateway_url;
+			binding.curl_max_bytes = XML_CURL_MAX_BYTES;
+			binding.response_format = (char *) "json";
+
+			/* 1. the secret path segment reaches no log line at all */
+			fst_xc_log_watch_absent(secret_path_segment);
+			xml = fst_xc_drive_fetch(&binding, "directory", xml_body, "text/xml", 200);
+			fst_xcheck(fst_xc_fetch_barrier_ok, "the log queue must drain before the warning counters are read");
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_FALLBACK), 1);
+			fst_xcheck(fst_xc_log_count(FST_XC_LOG_IDX_ABSENT) == 0, "no log line may carry a path segment of the gateway URL");
+			switch_xml_free(xml);
+			xml = NULL;
+
+			/* 2. neither does the userinfo password, which was already redacted */
+			fst_xc_log_watch_absent(secret_password);
+			xml = fst_xc_drive_fetch(&binding, "directory", xml_body, "text/xml", 200);
+			fst_xcheck(fst_xc_fetch_barrier_ok, "the log queue must drain before the warning counters are read");
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_FALLBACK), 1);
+			fst_xcheck(fst_xc_log_count(FST_XC_LOG_IDX_ABSENT) == 0, "no log line may carry the gateway URL's userinfo");
+			switch_xml_free(xml);
+			xml = NULL;
+
+			/* 3. nor the query value */
+			fst_xc_log_watch_absent(secret_query_value);
+			xml = fst_xc_drive_fetch(&binding, "directory", xml_body, "text/xml", 200);
+			fst_xcheck(fst_xc_fetch_barrier_ok, "the log queue must drain before the warning counters are read");
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_FALLBACK), 1);
+			fst_xcheck(fst_xc_log_count(FST_XC_LOG_IDX_ABSENT) == 0, "no log line may carry the gateway URL's query string");
+			switch_xml_free(xml);
+			xml = NULL;
+
+			/*
+			 * 4. and the warning is still useful: what survives is precisely the
+			 *    scheme and the authority, which is what names the gateway that
+			 *    degraded.  Asserted on the helper as well as on the log, because
+			 *    "logs nothing" would satisfy the three checks above on its own.
+			 */
+			fst_xc_log_watch_absent("127.0.0.1:1");
+			xml = fst_xc_drive_fetch(&binding, "directory", xml_body, "text/xml", 200);
+			fst_xcheck(fst_xc_fetch_barrier_ok, "the log queue must drain before the warning counters are read");
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_FALLBACK), 1);
+			fst_xcheck(fst_xc_log_count(FST_XC_LOG_IDX_ABSENT) == 1, "the warning must still identify the gateway by authority");
+			switch_xml_free(xml);
+			xml = NULL;
+
+			fst_check_string_equals(xml_curl_json_redact_url(gateway_url, rendered, sizeof(rendered)),
+									"https://[redacted]@127.0.0.1:1/[redacted]");
+
+			fst_xc_log_watch_absent(NULL);
 			fst_xc_log_capture_stop();
 		}
 		FST_TEST_END()
