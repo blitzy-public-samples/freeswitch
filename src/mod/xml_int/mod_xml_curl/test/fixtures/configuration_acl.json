@@ -1,0 +1,34 @@
+{
+  "configuration": {
+    "configuration": {
+      "@name": "acl.conf",
+      "@description": "Network Lists",
+      "network-lists": {
+        "list": [
+          {
+            "@name": "lan",
+            "@default": "allow",
+            "node": [
+              {
+                "@type": "deny",
+                "@cidr": "192.168.42.0/24"
+              },
+              {
+                "@type": "allow",
+                "@cidr": "192.168.42.42/32"
+              }
+            ]
+          },
+          {
+            "@name": "domains",
+            "@default": "deny",
+            "node": {
+              "@type": "allow",
+              "@domain": "example.com"
+            }
+          }
+        ]
+      }
+    }
+  }
+}

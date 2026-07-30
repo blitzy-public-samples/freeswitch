@@ -1,0 +1,28 @@
+{
+  "configuration": {
+    "configuration": {
+      "@name": "event_socket.conf",
+      "@description": "Socket Client",
+      "settings": {
+        "param": [
+          {
+            "@name": "nat-map",
+            "@value": "false"
+          },
+          {
+            "@name": "listen-ip",
+            "@value": "::"
+          },
+          {
+            "@name": "listen-port",
+            "@value": "8021"
+          },
+          {
+            "@name": "password",
+            "@value": "ClueCon"
+          }
+        ]
+      }
+    }
+  }
+}

@@ -44,6 +44,14 @@
 
       <!-- one or more of these imply you want to pick the exact variables that are transmitted -->
       <!--<param name="enable-post-var" value="Unique-ID"/>-->
+
+      <!-- optional: accept a BadgerFish JSON provisioning response instead of XML. omit
+           this parameter to keep the existing XML only behaviour exactly. with the value
+           "json" the module sends "Accept: application/json" and decodes a BadgerFish JSON
+           body into the same document tree it builds from XML. a response that is not
+           declared as application/json, or a body that does not parse, falls back to XML
+           parsing and logs a warning. -->
+      <!-- <param name="response-format" value="json"/> -->
     </binding>
   </bindings>
 </configuration>
