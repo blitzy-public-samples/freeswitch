@@ -60,10 +60,8 @@ struct xml_binding {
 	long auth_scheme;
 	int timeout;
 	switch_size_t curl_max_bytes;
-	/* JSON: opt-in response representation for this binding. Left NULL by the wholesale
-	   memset() in do_config() whenever the response-format parameter is absent, which is
-	   exactly what preserves the legacy XML-only behaviour. Appended last so that no
-	   existing member offset moves. */
+	/* JSON: opt-in response representation for this binding. NULL selects the XML decoder;
+	   keep this append-only field last so no other member offset moves. */
 	char *response_format;
 };
 
@@ -141,18 +139,472 @@ static size_t file_callback(void *ptr, size_t size, size_t nmemb, void *data)
 }
 
 /*
- * JSON: everything from here down to xml_url_fetch() is new, JSON-specific logic, kept in
- * separate file-static functions so that the original XML fetch path below reads exactly as
- * it did before. None of it executes unless a binding opts in with response-format=json.
- * Every function reports failure through a falsy return so that the single dispatch point in
- * xml_url_fetch() can fall back to the untouched switch_xml_parse_file() call.
+ * JSON: the JSON-specific logic from here down to xml_url_fetch() lives in its own file-static
+ * functions, separate from the XML fetch path below. None of it executes unless a binding opts
+ * in with response-format=json. Every function reports failure through a falsy return so that
+ * the single dispatch point in xml_url_fetch() can fall back to the switch_xml_parse_file()
+ * call it shares with the XML path.
  *
  * The translation implements the BadgerFish convention: attributes are members prefixed with
  * '@', text content lives under '$', child elements are nested keys, repeated children of the
  * same name collapse into an array, and the single top-level key is the requested provisioning
  * section name. cJSON is reached through <switch.h> alone, which already pulls in switch_json.h
  * and therefore switch_cJSON.h.
+ *
+ * SECURITY POSTURE. A provisioning response is remote, untrusted input that goes on to decide
+ * directory, dialplan and configuration policy, so this module owns the canonical JSON contract
+ * and the payload must conform to it rather than the reverse. The decoder is therefore a
+ * whitelist, not a best-effort parser, and it is layered:
+ *
+ *   1. xml_curl_json_read_file()     - reads the whole capped body exactly, refusing a short
+ *                                      read, a premature EOF or an embedded NUL byte.
+ *   2. xml_curl_json_validate_text() - a lexical gate applied to the RAW bytes before cJSON is
+ *                                      ever called. Only objects, arrays and strings may appear,
+ *                                      so no number, boolean or null token can reach the parser;
+ *                                      nesting depth, value count and string length are bounded
+ *                                      here, independently of how the vendored parser happens to
+ *                                      be configured on any given platform.
+ *   3. xml_curl_json_to_xml()        - requires exactly one top-level key and requires it to be
+ *                                      the section the core actually asked for, so a response
+ *                                      can never substitute a different provisioning section.
+ *   4. xml_curl_json_to_xml_node()   - validates every element and attribute name as an XML name
+ *                                      and every text value as legal, well-formed UTF-8 before
+ *                                      it reaches a builder, rejects duplicate member names and
+ *                                      mixed content, and spends from a shared node/byte budget.
+ *
+ * Every layer reports failure the same way, so the module still has exactly one place where a
+ * decode failure is finally reported.
  */
+
+/*
+ * JSON: hard resource ceilings for the decoder. These are deliberately compile-time constants
+ * enforced by this module rather than parser configuration: the vendored cJSON honours
+ * CJSON_NESTING_LIMIT, but that is set by the autotools build only, so a build that does not
+ * define it would otherwise inherit a far looser default. Bounding the input here keeps the
+ * behaviour identical on every platform and every build.
+ */
+#define XML_CURL_JSON_MAX_DEPTH 32			/* nesting levels in the JSON document */
+#define XML_CURL_JSON_MAX_VALUES 50000		/* objects + arrays + strings in the document */
+#define XML_CURL_JSON_MAX_OBJECT_MEMBERS 256	/* members of one JSON object */
+#define XML_CURL_JSON_MAX_ARRAY_ELEMENTS 4096	/* repeated children under one name */
+#define XML_CURL_JSON_MAX_NODES 20000		/* elements + attributes built in total */
+#define XML_CURL_JSON_MAX_STRING_BYTES 8192	/* bytes in one name or one value */
+#define XML_CURL_JSON_MAX_NAME_BYTES 128	/* bytes in one element or attribute name */
+
+/*
+ * JSON: the budget threaded through the recursive translation. Keeping the counters in one
+ * caller-owned structure is what makes the ceilings above document-wide rather than per-node, so
+ * a wide-and-shallow document cannot amplify past a deep-and-narrow one. max_text_bytes is
+ * seeded from the length of the payload actually received, so the cumulative volume of decoded
+ * names and values can never exceed the response size the binding already capped - escape
+ * sequences only ever shrink, so anything larger is amplification and is refused.
+ */
+struct xml_curl_json_budget {
+	int depth;						/* nesting depth of the node being translated */
+	switch_size_t nodes;			/* elements and attributes built so far */
+	switch_size_t text_bytes;		/* cumulative decoded name and value bytes */
+	switch_size_t max_text_bytes;	/* ceiling for text_bytes: the payload length */
+};
+
+typedef struct xml_curl_json_budget xml_curl_json_budget_t;
+
+/* JSON: length of the UTF-8 sequence starting at p, or 0 when the bytes are not a well-formed
+   sequence. Strict by design: overlong encodings, surrogate code points and anything above
+   U+10FFFF are all rejected, because cJSON does not validate UTF-8 and the XML serializer would
+   otherwise emit a document no conforming parser can read back. */
+static int xml_curl_json_utf8_len(const unsigned char *p, switch_size_t remaining)
+{
+	unsigned char c;
+	int len = 0;
+	int i;
+
+	if (!p || !remaining) {
+		return 0;
+	}
+
+	c = p[0];
+
+	if (c < 0x80) {
+		return 1;
+	} else if (c >= 0xc2 && c <= 0xdf) {
+		len = 2;
+	} else if (c >= 0xe0 && c <= 0xef) {
+		len = 3;
+	} else if (c >= 0xf0 && c <= 0xf4) {
+		len = 4;
+	} else {
+		/* 0x80-0xc1 and 0xf5-0xff never start a valid sequence */
+		return 0;
+	}
+
+	if (remaining < (switch_size_t) len) {
+		return 0;
+	}
+
+	for (i = 1; i < len; i++) {
+		if (p[i] < 0x80 || p[i] > 0xbf) {
+			return 0;
+		}
+	}
+
+	/* Reject the overlong, surrogate and out-of-range second bytes */
+	if (len == 3) {
+		if (c == 0xe0 && p[1] < 0xa0) {
+			return 0;
+		}
+		if (c == 0xed && p[1] > 0x9f) {
+			return 0;
+		}
+	} else if (len == 4) {
+		if (c == 0xf0 && p[1] < 0x90) {
+			return 0;
+		}
+		if (c == 0xf4 && p[1] > 0x8f) {
+			return 0;
+		}
+	}
+
+	return len;
+}
+
+/* JSON: true when a code point may appear in XML 1.0 character data. Tab, newline and carriage
+   return are the only control characters XML permits; NUL, backspace, form feed and the rest of
+   the C0 range are forbidden, as are the two permanently invalid code points. */
+static int xml_curl_json_is_xml_char(unsigned long cp)
+{
+	if (cp == 0x09 || cp == 0x0a || cp == 0x0d) {
+		return 1;
+	}
+
+	if (cp < 0x20) {
+		return 0;
+	}
+
+	if (cp >= 0xd800 && cp <= 0xdfff) {
+		return 0;
+	}
+
+	if (cp == 0xfffe || cp == 0xffff) {
+		return 0;
+	}
+
+	if (cp > 0x10ffff) {
+		return 0;
+	}
+
+	return 1;
+}
+
+/* JSON: validates a decoded string that is about to be handed to a duplicating builder. The
+   builders measure with strlen(), so a string carrying an embedded NUL would be silently
+   truncated - "alice\u0000admin" becoming the identifier "alice" - which is why length is taken
+   from the caller and the buffer is walked byte by byte rather than trusted. Returns 1 when the
+   string is bounded, well-formed UTF-8 and legal XML character data throughout. */
+static int xml_curl_json_is_valid_text(const char *text)
+{
+	const unsigned char *p = (const unsigned char *) text;
+	switch_size_t len = 0;
+	switch_size_t i = 0;
+	int seq;
+	unsigned long cp;
+
+	if (!text) {
+		return 0;
+	}
+
+	len = strlen(text);
+
+	if (len > XML_CURL_JSON_MAX_STRING_BYTES) {
+		return 0;
+	}
+
+	while (i < len) {
+		if (!(seq = xml_curl_json_utf8_len(p + i, len - i))) {
+			return 0;
+		}
+
+		if (seq == 1) {
+			cp = p[i];
+		} else if (seq == 2) {
+			cp = ((unsigned long) (p[i] & 0x1f) << 6) | (p[i + 1] & 0x3f);
+		} else if (seq == 3) {
+			cp = ((unsigned long) (p[i] & 0x0f) << 12) | ((unsigned long) (p[i + 1] & 0x3f) << 6) | (p[i + 2] & 0x3f);
+		} else {
+			cp = ((unsigned long) (p[i] & 0x07) << 18) | ((unsigned long) (p[i + 1] & 0x3f) << 12) |
+				((unsigned long) (p[i + 2] & 0x3f) << 6) | (p[i + 3] & 0x3f);
+		}
+
+		if (!xml_curl_json_is_xml_char(cp)) {
+			return 0;
+		}
+
+		i += (switch_size_t) seq;
+	}
+
+	return 1;
+}
+
+/* JSON: one character of the provisioning-safe element and attribute name alphabet. This is a
+   deliberate subset of the XML Name production - ASCII letters, digits, underscore, hyphen and
+   period, with a letter or underscore leading - because a JSON member name reaches
+   switch_xml_add_child_d() and switch_xml_set_attr_d() verbatim and the serializer writes names
+   without escaping. A name such as x></x><evil would otherwise forge document structure, and
+   a name carrying a quote would forge an attribute. Every tag and attribute FreeSWITCH
+   provisioning actually uses is inside this subset. */
+static int xml_curl_json_is_name_char(char c, int first)
+{
+	if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_') {
+		return 1;
+	}
+
+	if (!first && ((c >= '0' && c <= '9') || c == '-' || c == '.')) {
+		return 1;
+	}
+
+	return 0;
+}
+
+/* JSON: validates an element or attribute name. A single colon is accepted as a namespace
+   separator, and both halves must then be well-formed names in their own right, so ":x", "x:"
+   and "a:b:c" are all refused rather than passed through as malformed namespace syntax. */
+static int xml_curl_json_is_valid_xml_name(const char *name)
+{
+	switch_size_t len = 0;
+	switch_size_t i = 0;
+	int colons = 0;
+	int first = 1;
+
+	if (zstr(name)) {
+		return 0;
+	}
+
+	len = strlen(name);
+
+	if (len > XML_CURL_JSON_MAX_NAME_BYTES) {
+		return 0;
+	}
+
+	for (i = 0; i < len; i++) {
+		if (name[i] == ':') {
+			if (++colons > 1 || first) {
+				/* a leading colon, or a second one */
+				return 0;
+			}
+			/* the local part after the colon must start a name of its own */
+			first = 1;
+			continue;
+		}
+
+		if (!xml_curl_json_is_name_char(name[i], first)) {
+			return 0;
+		}
+
+		first = 0;
+	}
+
+	/* first is still set only when the name ended on a colon */
+	return first ? 0 : 1;
+}
+
+/* JSON: validates one \uXXXX escape and, when it opens a surrogate pair, its partner. Returns
+   the number of bytes consumed from p (which points at the 'u') or 0 when the escape is
+   malformed, names a code point XML forbids, or is an unpaired surrogate half. Rejecting
+   \u0000 here is what stops cJSON from decoding it into an embedded NUL. */
+static switch_size_t xml_curl_json_validate_unicode_escape(const char *p, switch_size_t remaining)
+{
+	unsigned long cp = 0;
+	switch_size_t i = 0;
+
+	/* 'u' plus four hex digits */
+	if (remaining < 5) {
+		return 0;
+	}
+
+	for (i = 1; i <= 4; i++) {
+		char c = p[i];
+
+		cp <<= 4;
+
+		if (c >= '0' && c <= '9') {
+			cp |= (unsigned long) (c - '0');
+		} else if (c >= 'a' && c <= 'f') {
+			cp |= (unsigned long) (c - 'a' + 10);
+		} else if (c >= 'A' && c <= 'F') {
+			cp |= (unsigned long) (c - 'A' + 10);
+		} else {
+			return 0;
+		}
+	}
+
+	if (cp >= 0xd800 && cp <= 0xdbff) {
+		unsigned long low = 0;
+
+		/* high surrogate: the low half must follow immediately as another escape */
+		if (remaining < 11 || p[5] != '\\' || p[6] != 'u') {
+			return 0;
+		}
+
+		for (i = 7; i <= 10; i++) {
+			char c = p[i];
+
+			low <<= 4;
+
+			if (c >= '0' && c <= '9') {
+				low |= (unsigned long) (c - '0');
+			} else if (c >= 'a' && c <= 'f') {
+				low |= (unsigned long) (c - 'a' + 10);
+			} else if (c >= 'A' && c <= 'F') {
+				low |= (unsigned long) (c - 'A' + 10);
+			} else {
+				return 0;
+			}
+		}
+
+		if (low < 0xdc00 || low > 0xdfff) {
+			return 0;
+		}
+
+		return 11;
+	}
+
+	if (!xml_curl_json_is_xml_char(cp)) {
+		/* covers \u0000, \u0008, \u000c, the rest of C0, lone low surrogates and U+FFFE/FFFF */
+		return 0;
+	}
+
+	return 5;
+}
+
+/*
+ * JSON: the lexical gate. Walks the raw payload once, before cJSON sees it, and accepts only the
+ * restricted profile this module documents: every value is an object, an array or a string.
+ *
+ * Refusing number, boolean and null tokens here is the point. They have no representation in the
+ * translation - the builders take const char * and there is no guaranteed lexical round trip for
+ * a JSON number - so they were already a translation error, but only after the parser had
+ * consumed them. Rejecting the token before the parser runs keeps untrusted input away from the
+ * number scanner altogether.
+ *
+ * The same pass bounds nesting depth, total value count and individual string length, and
+ * validates every escape sequence and every raw UTF-8 sequence. Returns 1 when the payload is
+ * inside the profile.
+ */
+static int xml_curl_json_validate_text(const char *json_text)
+{
+	char stack[XML_CURL_JSON_MAX_DEPTH];
+	const char *p = json_text;
+	switch_size_t len = 0;
+	switch_size_t i = 0;
+	switch_size_t values = 0;
+	int depth = 0;
+	int seq = 0;
+
+	if (zstr(json_text)) {
+		return 0;
+	}
+
+	len = strlen(json_text);
+
+	/* Skip one UTF-8 byte order mark, which the parser tolerates as well */
+	if (len >= 3 && (unsigned char) p[0] == 0xef && (unsigned char) p[1] == 0xbb && (unsigned char) p[2] == 0xbf) {
+		i = 3;
+	}
+
+	for (; i < len; i++) {
+		char c = p[i];
+
+		if (c == '{' || c == '[') {
+			if (depth >= XML_CURL_JSON_MAX_DEPTH) {
+				return 0;
+			}
+			if (++values > XML_CURL_JSON_MAX_VALUES) {
+				return 0;
+			}
+			stack[depth++] = c;
+			continue;
+		}
+
+		if (c == '}' || c == ']') {
+			if (!depth || stack[depth - 1] != (c == '}' ? '{' : '[')) {
+				return 0;
+			}
+			depth--;
+			continue;
+		}
+
+		if (c == ':' || c == ',' || c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+			continue;
+		}
+
+		if (c == '"') {
+			switch_size_t start = ++i;
+
+			if (++values > XML_CURL_JSON_MAX_VALUES) {
+				return 0;
+			}
+
+			while (i < len && p[i] != '"') {
+				if (p[i] == '\\') {
+					switch_size_t consumed = 0;
+
+					if (i + 1 >= len) {
+						return 0;
+					}
+
+					switch (p[i + 1]) {
+					case '"':
+					case '\\':
+					case '/':
+					case 'n':
+					case 'r':
+					case 't':
+						/* legal in JSON and legal in XML character data */
+						i += 2;
+						continue;
+					case 'u':
+						if (!(consumed = xml_curl_json_validate_unicode_escape(p + i + 1, len - (i + 1)))) {
+							return 0;
+						}
+						i += 1 + consumed;
+						continue;
+					default:
+						/* \b and \f name characters XML forbids; anything else is not an
+						   escape at all */
+						return 0;
+					}
+				}
+
+				if ((unsigned char) p[i] < 0x20) {
+					/* a raw control byte is invalid inside a JSON string */
+					return 0;
+				}
+
+				if (!(seq = xml_curl_json_utf8_len((const unsigned char *) p + i, len - i))) {
+					return 0;
+				}
+
+				i += (switch_size_t) seq;
+			}
+
+			if (i >= len) {
+				/* unterminated string */
+				return 0;
+			}
+
+			if (i - start > XML_CURL_JSON_MAX_STRING_BYTES) {
+				return 0;
+			}
+
+			continue;
+		}
+
+		/* Anything else - a digit, a sign, a period, or the first letter of true/false/null -
+		   is outside the profile and is refused before the parser can interpret it. */
+		return 0;
+	}
+
+	return depth == 0 && values > 0;
+}
 
 /* JSON: true when an HTTP response Content-Type names the JSON media type. Accepts
    "application/json" bare or carrying parameters such as "; charset=utf-8"; rejects an absent
@@ -188,16 +640,31 @@ static int xml_curl_json_is_json_content_type(const char *content_type)
 	return !strcasecmp(media_type, "application/json") ? 1 : 0;
 }
 
-/* JSON: reads the already size-capped response body that file_callback() streamed to the
-   temporary file into a NUL-terminated heap buffer. The binding's response ceiling is
-   re-checked here rather than re-implemented, so the 1 MiB default and any operator override
-   are inherited for free. The caller owns the result and releases it with switch_safe_free().
-   Returns NULL on any error, which converges on the XML fallback. */
+/*
+ * JSON: reads the already size-capped response body that file_callback() streamed to the
+ * temporary file into a NUL-terminated heap buffer. The binding's response ceiling is re-checked
+ * here rather than re-implemented, so the 1 MiB default and any operator override are inherited
+ * for free. The caller owns the result and releases it with switch_safe_free(). Returns NULL on
+ * any error, which converges on the XML fallback.
+ *
+ * The body is read in a loop until the exact size fstat() reported has been consumed. A single
+ * read() is allowed to return fewer bytes than asked for, and accepting a short count would hand
+ * the decoder a truncated document whose accidental prefix might still parse - so a short read,
+ * a premature EOF and a read error are all treated as failures rather than as a smaller payload.
+ * An interrupted read is retried, because EINTR is not a data error.
+ *
+ * A NUL byte anywhere inside the recorded length is likewise refused. Everything downstream is
+ * NUL-terminated C strings, so a payload of "{...}\0<more bytes>" would otherwise be silently
+ * split, letting a caller-visible document hide arbitrary trailing content.
+ */
 static char *xml_curl_json_read_file(const char *filename, switch_size_t max_bytes)
 {
 	struct stat st;
 	char *buf = NULL;
-	switch_ssize_t bytes_read = 0;
+	switch_size_t want = 0;
+	switch_size_t total = 0;
+	switch_ssize_t bytes_read;
+	int failed = 0;
 	int fd = -1;
 
 	if (zstr(filename)) {
@@ -213,113 +680,292 @@ static char *xml_curl_json_read_file(const char *filename, switch_size_t max_byt
 		return NULL;
 	}
 
+	want = (switch_size_t) st.st_size;
+
 	/* Plain malloc with an explicit check rather than switch_must_malloc(): an allocation
 	   failure has to degrade to the XML fallback, never abort the process. */
-	if (!(buf = malloc((size_t) st.st_size + 1))) {
+	if (!(buf = malloc(want + 1))) {
 		close(fd);
 		return NULL;
 	}
 
-	bytes_read = read(fd, buf, (size_t) st.st_size);
+	while (total < want) {
+		bytes_read = read(fd, buf + total, want - total);
+
+		if (bytes_read < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			failed = 1;
+			break;
+		}
+
+		if (bytes_read == 0) {
+			/* the file shrank under us, or was never as long as fstat() claimed */
+			failed = 1;
+			break;
+		}
+
+		total += (switch_size_t) bytes_read;
+	}
+
 	close(fd);
 
-	if (bytes_read <= 0) {
+	if (failed || total != want || memchr(buf, '\0', total)) {
 		switch_safe_free(buf);
 		return NULL;
 	}
 
-	buf[bytes_read] = '\0';
+	buf[total] = '\0';
 
 	return buf;
 }
 
-/* JSON: recursive BadgerFish visitor. Populates an existing switch_xml_t node from a cJSON
-   object by dispatching on the kind of each member. Returns 1 on success and 0 on any
-   translation error; a partially built subtree stays attached to the caller's tree, which the
-   root entry point releases with a single switch_xml_free(). */
-static int xml_curl_json_to_xml_node(switch_xml_t node, cJSON *object)
+/*
+ * JSON: checks one JSON object against the structural half of the canonical contract before any
+ * of it is translated, so that a document which cannot be represented faithfully is refused
+ * rather than half-built.
+ *
+ * Three properties are enforced, all of them cases where cJSON is happy but the mapping is not
+ * well defined:
+ *
+ *   - Bounded width. An object may not carry more members than the ceiling allows.
+ *   - No duplicate member names. cJSON preserves duplicates, so "@id" twice would silently be
+ *     last-wins on an attribute while a repeated child key would become two elements. Either way
+ *     the document a producer validated and the tree this module builds could disagree, so the
+ *     duplicate is refused and an array remains the one and only way to express repetition.
+ *   - No mixed content. switch_xml serialization emits an element's text only when the element
+ *     has no children, so a node carrying both "$" and child keys could not round trip; the
+ *     BadgerFish convention cannot recover the separate text runs of mixed content either.
+ *
+ * Returns 1 when the object is acceptable.
+ */
+static int xml_curl_json_check_object(cJSON *object)
 {
 	cJSON *member = NULL;
-	cJSON *element = NULL;
-	switch_xml_t child = NULL;
+	cJSON *other = NULL;
+	int members = 0;
+	int has_text = 0;
+	int has_children = 0;
 
-	if (!node || !object) {
+	if (!object) {
 		return 0;
 	}
 
-	cJSON_ArrayForEach(member, object) {
+	for (member = object->child; member; member = member->next) {
 		/* Every member of a JSON object carries its own key in ->string. A missing or empty
 		   key can name neither an element, nor an attribute, nor the text marker. */
 		if (zstr(member->string)) {
 			return 0;
 		}
 
-		if (member->string[0] == '@') {
-			/* BadgerFish attribute. The name must survive stripping the '@' and the value
-			   must be a string, because switch_xml_set_attr_d() duplicates both unguarded.
-			   Attributes are set in JSON member order, which the serializer preserves. */
-			if (zstr(member->string + 1) || !cJSON_IsString(member) || !member->valuestring) {
-				return 0;
-			}
-			switch_xml_set_attr_d(node, member->string + 1, member->valuestring);
-		} else if (!strcmp(member->string, "$")) {
-			/* BadgerFish text content. */
-			if (!cJSON_IsString(member) || !member->valuestring) {
-				return 0;
-			}
-			switch_xml_set_txt_d(node, member->valuestring);
-		} else if (cJSON_IsArray(member)) {
-			/* Repeated children of one name collapse into a JSON array. A constant offset of
-			   zero makes switch_xml_insert() append, so array order becomes document order. */
-			cJSON_ArrayForEach(element, member) {
-				if (!cJSON_IsObject(element)) {
-					return 0;
-				}
-				if (!(child = switch_xml_add_child_d(node, member->string, 0))) {
-					return 0;
-				}
-				if (!xml_curl_json_to_xml_node(child, element)) {
-					return 0;
-				}
-			}
-		} else if (cJSON_IsObject(member)) {
-			/* A single child element of this name. */
-			if (!(child = switch_xml_add_child_d(node, member->string, 0))) {
-				return 0;
-			}
-			if (!xml_curl_json_to_xml_node(child, member)) {
-				return 0;
-			}
-		} else {
-			/* Numbers, booleans, nulls and raw values have no guaranteed lexical round trip
-			   through the const char * builders, so they are a translation error rather than
-			   an implicit coercion. */
+		if (++members > XML_CURL_JSON_MAX_OBJECT_MEMBERS) {
 			return 0;
+		}
+
+		if (!strcmp(member->string, "$")) {
+			has_text = 1;
+		} else if (member->string[0] != '@') {
+			has_children = 1;
+		}
+	}
+
+	if (has_text && has_children) {
+		return 0;
+	}
+
+	/* Width is bounded above, so this pairwise scan is bounded too */
+	for (member = object->child; member; member = member->next) {
+		for (other = member->next; other; other = other->next) {
+			if (!strcmp(member->string, other->string)) {
+				return 0;
+			}
 		}
 	}
 
 	return 1;
 }
 
-/* JSON: BadgerFish adapter and root entry point. Translates a JSON provisioning response into
-   the same kind of switch_xml_t the XML path produces, or returns NULL on any error. The single
-   top-level key names the provisioning section, and the <document type="freeswitch/xml">
-   <section name="..."> envelope that switch_xml_locate() searches for is synthesised here: a
-   tree without it could not be resolved by the core. Only the duplicating builder variants are
-   used, because the cJSON tree owning every name and value is released before the result is
-   returned. */
-static switch_xml_t xml_curl_json_to_xml(const char *json_text)
+/*
+ * JSON: recursive BadgerFish visitor. Populates an existing switch_xml_t node from a cJSON
+ * object by dispatching on the kind of each member. Returns 1 on success and 0 on any
+ * translation error; a partially built subtree stays attached to the caller's tree, which the
+ * root entry point releases with a single switch_xml_free().
+ *
+ * Every name and every value is validated before it reaches a builder. That is not defensive
+ * duplication of the lexical gate: the gate proves the payload is well-formed JSON of the right
+ * shape, whereas these checks prove the strings inside it are usable as XML. The builders
+ * duplicate whatever they are given with no inspection, and the serializer writes names without
+ * escaping, so this function is the last place an unusable name or value can be stopped.
+ *
+ * The budget is shared across the whole document, so breadth is bounded as tightly as depth: a
+ * flat response with a million repeated children is refused for the same reason a deeply nested
+ * one is.
+ */
+static int xml_curl_json_to_xml_node(switch_xml_t node, cJSON *object, xml_curl_json_budget_t *budget)
+{
+	cJSON *member = NULL;
+	cJSON *element = NULL;
+	switch_xml_t child = NULL;
+	int elements;
+
+	if (!node || !object || !budget) {
+		return 0;
+	}
+
+	if (++budget->depth > XML_CURL_JSON_MAX_DEPTH) {
+		return 0;
+	}
+
+	if (!xml_curl_json_check_object(object)) {
+		return 0;
+	}
+
+	cJSON_ArrayForEach(member, object) {
+		if (member->string[0] == '@') {
+			/* BadgerFish attribute: the name must be a legal XML name once the '@' is stripped
+			   and the value must be a string. switch_xml_set_attr_d() duplicates the name as
+			   given and the value through switch_str_nil(), so neither is validated there and
+			   both are detached from cJSON lifetime here. Attributes are set in JSON member
+			   order, which the serializer preserves. */
+			if (!xml_curl_json_is_valid_xml_name(member->string + 1)) {
+				return 0;
+			}
+			if (!cJSON_IsString(member) || !member->valuestring || !xml_curl_json_is_valid_text(member->valuestring)) {
+				return 0;
+			}
+			if (++budget->nodes > XML_CURL_JSON_MAX_NODES) {
+				return 0;
+			}
+			budget->text_bytes += strlen(member->string) + strlen(member->valuestring);
+			if (budget->text_bytes > budget->max_text_bytes) {
+				return 0;
+			}
+			switch_xml_set_attr_d(node, member->string + 1, member->valuestring);
+		} else if (!strcmp(member->string, "$")) {
+			/* BadgerFish text content. */
+			if (!cJSON_IsString(member) || !member->valuestring || !xml_curl_json_is_valid_text(member->valuestring)) {
+				return 0;
+			}
+			budget->text_bytes += strlen(member->valuestring);
+			if (budget->text_bytes > budget->max_text_bytes) {
+				return 0;
+			}
+			switch_xml_set_txt_d(node, member->valuestring);
+		} else if (cJSON_IsArray(member)) {
+			/* Repeated children of one name collapse into a JSON array. A constant offset of
+			   zero makes switch_xml_insert() append, so array order becomes document order.
+			   That append walks the existing same-name list, so the element ceiling bounds
+			   the quadratic term as well as the allocation. */
+			if (!xml_curl_json_is_valid_xml_name(member->string)) {
+				return 0;
+			}
+			if (!(elements = cJSON_GetArraySize(member)) || elements > XML_CURL_JSON_MAX_ARRAY_ELEMENTS) {
+				/* An empty array expresses nothing that omitting the key would not express,
+				   and is not part of the canonical contract. */
+				return 0;
+			}
+			cJSON_ArrayForEach(element, member) {
+				if (!cJSON_IsObject(element)) {
+					return 0;
+				}
+				if (++budget->nodes > XML_CURL_JSON_MAX_NODES) {
+					return 0;
+				}
+				budget->text_bytes += strlen(member->string);
+				if (budget->text_bytes > budget->max_text_bytes) {
+					return 0;
+				}
+				if (!(child = switch_xml_add_child_d(node, member->string, 0))) {
+					return 0;
+				}
+				if (!xml_curl_json_to_xml_node(child, element, budget)) {
+					return 0;
+				}
+			}
+		} else if (cJSON_IsObject(member)) {
+			/* A single child element of this name. */
+			if (!xml_curl_json_is_valid_xml_name(member->string)) {
+				return 0;
+			}
+			if (++budget->nodes > XML_CURL_JSON_MAX_NODES) {
+				return 0;
+			}
+			budget->text_bytes += strlen(member->string);
+			if (budget->text_bytes > budget->max_text_bytes) {
+				return 0;
+			}
+			if (!(child = switch_xml_add_child_d(node, member->string, 0))) {
+				return 0;
+			}
+			if (!xml_curl_json_to_xml_node(child, member, budget)) {
+				return 0;
+			}
+		} else {
+			/* Numbers, booleans, nulls and raw values have no guaranteed lexical round trip
+			   through the const char * builders, so they are a translation error rather than
+			   an implicit coercion. The lexical gate already refuses these tokens; this arm
+			   keeps the invariant local to the translator as well. */
+			return 0;
+		}
+	}
+
+	/* Only the success path unwinds the depth counter. Every failure abandons the whole
+	   translation, so there is no sibling left to account for. */
+	budget->depth--;
+
+	return 1;
+}
+
+/*
+ * JSON: BadgerFish adapter and root entry point. Translates a JSON provisioning response into the
+ * same kind of switch_xml_t the XML path produces, or returns NULL on any error. The
+ * <document type="freeswitch/xml"><section name="..."> envelope that switch_xml_locate() searches
+ * for is synthesised here: a tree without it could not be resolved by the core. Only the
+ * duplicating builder variants are used, because the cJSON tree owning every name and value is
+ * released before the result is returned.
+ *
+ * requested_section is the section the core asked this binding for, and the single top-level key
+ * of the payload must be exactly that. Accepting whatever key the response happened to carry, and
+ * naming the section after it, would let a gateway answer a directory lookup with a configuration
+ * document: the decode would report success, the XML path would be skipped, and the core would
+ * see a section it never requested - or, worse, resolve nothing and quietly fall back to static
+ * local configuration. Requiring the two to agree removes that whole class of substitution.
+ */
+static switch_xml_t xml_curl_json_to_xml(const char *json_text, const char *requested_section)
 {
 	cJSON *json = NULL;
 	cJSON *root_member = NULL;
+	const char *parse_end = NULL;
 	switch_xml_t document = NULL;
 	switch_xml_t section = NULL;
+	xml_curl_json_budget_t budget;
 
-	if (zstr(json_text)) {
+	if (zstr(json_text) || zstr(requested_section)) {
 		return NULL;
 	}
 
-	if (!(json = cJSON_Parse(json_text))) {
+	/* The section name is core-supplied rather than remote, but it still ends up in a builder,
+	   so it is held to the same alphabet as every other name in the document. */
+	if (!xml_curl_json_is_valid_xml_name(requested_section)) {
+		return NULL;
+	}
+
+	/* Lexical gate first: the parser never sees a payload outside the documented profile. */
+	if (!xml_curl_json_validate_text(json_text)) {
+		return NULL;
+	}
+
+	/* cJSON_Parse() stops at the end of the first complete value and reports success even when
+	   the buffer continues, so a document of "{...}GARBAGE" would be accepted. Requiring the
+	   parse to land on the terminator refuses the trailing bytes instead of ignoring them, and
+	   the returned end pointer is checked as well rather than trusted. */
+	if (!(json = cJSON_ParseWithOpts(json_text, &parse_end, 1))) {
+		return NULL;
+	}
+
+	if (!parse_end || *parse_end != '\0') {
+		cJSON_Delete(json);
 		return NULL;
 	}
 
@@ -333,6 +979,12 @@ static switch_xml_t xml_curl_json_to_xml(const char *json_text)
 	root_member = json->child;
 
 	if (!root_member || zstr(root_member->string) || !cJSON_IsObject(root_member)) {
+		cJSON_Delete(json);
+		return NULL;
+	}
+
+	/* The sole top-level key must name the section that was actually requested. */
+	if (strcmp(root_member->string, requested_section)) {
 		cJSON_Delete(json);
 		return NULL;
 	}
@@ -352,9 +1004,12 @@ static switch_xml_t xml_curl_json_to_xml(const char *json_text)
 
 	/* Set the section name before translating the member so that it is the first attribute,
 	   matching the attribute order of the equivalent XML document. */
-	switch_xml_set_attr_d(section, "name", root_member->string);
+	switch_xml_set_attr_d(section, "name", requested_section);
 
-	if (!xml_curl_json_to_xml_node(section, root_member)) {
+	memset(&budget, 0, sizeof(budget));
+	budget.max_text_bytes = strlen(json_text);
+
+	if (!xml_curl_json_to_xml_node(section, root_member, &budget)) {
 		switch_xml_free(document);
 		cJSON_Delete(json);
 		return NULL;
@@ -365,35 +1020,160 @@ static switch_xml_t xml_curl_json_to_xml(const char *json_text)
 	return document;
 }
 
+/* JSON: renders untrusted metadata for a log line. Copies at most buflen-1 bytes and replaces
+   every byte outside printable ASCII with '.', so a response header cannot inject a newline to
+   forge a second log entry, cannot smuggle terminal control sequences, and cannot grow the line
+   without bound. Always returns a NUL-terminated buf. */
+static const char *xml_curl_json_sanitize_token(const char *token, char *buf, switch_size_t buflen)
+{
+	switch_size_t i = 0;
+
+	if (!buf || buflen < 2) {
+		return "";
+	}
+
+	if (zstr(token)) {
+		switch_copy_string(buf, "(absent)", buflen);
+		return buf;
+	}
+
+	while (i < buflen - 1 && token[i]) {
+		buf[i] = (token[i] >= 0x20 && token[i] <= 0x7e) ? token[i] : '.';
+		i++;
+	}
+
+	buf[i] = '\0';
+
+	return buf;
+}
+
+/* JSON: renders a gateway URL for a log line with its secrets removed. A configured
+   gateway-url legitimately carries userinfo, and query strings routinely carry tokens, so the
+   scheme, host, port and path are kept and everything capable of carrying a credential is
+   replaced with a marker. The result is sanitized and bounded like any other logged metadata. */
+static const char *xml_curl_json_redact_url(const char *url, char *buf, switch_size_t buflen)
+{
+	char scratch[256] = "";
+	const char *host = NULL;
+	const char *at = NULL;
+	const char *p = NULL;
+	switch_size_t len = 0;
+
+	if (!buf || buflen < 2) {
+		return "";
+	}
+
+	if (zstr(url)) {
+		switch_copy_string(buf, "(none)", buflen);
+		return buf;
+	}
+
+	/* Everything up to and including "://" is the scheme and is safe to keep verbatim. */
+	if ((host = strstr(url, "://"))) {
+		host += 3;
+	} else {
+		host = url;
+	}
+
+	/* Userinfo, when present, ends at the last '@' before the start of the path. */
+	for (p = host; *p && *p != '/' && *p != '?' && *p != '#'; p++) {
+		if (*p == '@') {
+			at = p;
+		}
+	}
+
+	len = (switch_size_t) (host - url);
+
+	if (len >= sizeof(scratch)) {
+		len = sizeof(scratch) - 1;
+	}
+
+	memcpy(scratch, url, len);
+	scratch[len] = '\0';
+
+	if (at) {
+		switch_snprintf(scratch + len, sizeof(scratch) - len, "%s", "[redacted]@");
+		host = at + 1;
+	}
+
+	len = strlen(scratch);
+
+	/* Copy host, port and path, stopping at the query or the fragment. */
+	for (p = host; *p && *p != '?' && *p != '#' && len < sizeof(scratch) - 1; p++) {
+		scratch[len++] = *p;
+	}
+
+	scratch[len] = '\0';
+
+	if (*p == '?' || *p == '#') {
+		switch_snprintf(scratch + len, sizeof(scratch) - len, "%s", "?[redacted]");
+	}
+
+	return xml_curl_json_sanitize_token(scratch, buf, buflen);
+}
+
+/*
+ * JSON: appends one header to a curl slist without ever losing the list it was given.
+ * switch_curl_slist_append() returns NULL when it cannot allocate, and libcurl leaves the
+ * original list untouched in that case - so assigning the result straight back to the variable
+ * would drop every header appended so far, leak them, and send a request whose headers depend on
+ * an allocation outcome. Appending through a temporary keeps the caller's list intact and lets
+ * the caller decide what to do about the failure. Returns 1 when the header was added.
+ */
+static int xml_curl_json_append_header(switch_curl_slist_t **list, const char *header)
+{
+	switch_curl_slist_t *appended = NULL;
+
+	if (!list || zstr(header)) {
+		return 0;
+	}
+
+	if (!(appended = switch_curl_slist_append(*list, header))) {
+		return 0;
+	}
+
+	*list = appended;
+
+	return 1;
+}
+
 /* JSON: the response decode step reached from the single format dispatch point in
    xml_url_fetch(). Validates the response Content-Type, reads the capped temporary file and
-   runs the BadgerFish translation. Every failure edge - and only a failure edge - emits one
-   SWITCH_LOG_WARNING and returns NULL, so the caller falls through to the unmodified XML
-   parse; a fallback is a degradation worth surfacing rather than a failure. cJSON_GetErrorPtr()
-   is deliberately not consulted: it is process global while this code runs concurrently on
-   many fetch threads, so it could report an unrelated thread's error. */
-static switch_xml_t xml_curl_json_decode_response(const char *filename, const char *content_type, switch_size_t max_bytes, const char *url)
+   runs the BadgerFish translation for the section that was requested. Every failure edge - and
+   only a failure edge - emits one SWITCH_LOG_WARNING and returns NULL, so the caller falls
+   through to the unmodified XML parse; a fallback is a degradation worth surfacing rather than a
+   failure. The URL and the Content-Type are redacted and sanitized before they are logged,
+   because both are attacker-influenced or credential-bearing. cJSON_GetErrorPtr() is
+   deliberately not consulted: it is process global while this code runs concurrently on many
+   fetch threads, so it could report an unrelated thread's error. */
+static switch_xml_t xml_curl_json_decode_response(const char *filename, const char *content_type, switch_size_t max_bytes, const char *url,
+												  const char *section)
 {
 	switch_xml_t xml = NULL;
 	char *json_text = NULL;
+	char safe_url[256] = "";
+	char safe_content_type[96] = "";
 	const char *reason = "unknown translation error";
 
 	if (zstr(filename)) {
 		reason = "no response body was captured";
+	} else if (zstr(section)) {
+		reason = "the requested provisioning section is unknown";
 	} else if (!xml_curl_json_is_json_content_type(content_type)) {
 		reason = "response Content-Type is not application/json";
 	} else if (!(json_text = xml_curl_json_read_file(filename, max_bytes))) {
-		reason = "response body could not be read";
-	} else if (!(xml = xml_curl_json_to_xml(json_text))) {
-		reason = "response body is not a well-formed BadgerFish JSON document";
+		reason = "response body could not be read in full";
+	} else if (!(xml = xml_curl_json_to_xml(json_text, section))) {
+		reason = "response body is not a well-formed BadgerFish JSON document for the requested section";
 	}
 
 	switch_safe_free(json_text);
 
 	if (!xml) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-						  "JSON decode of the response from [%s] failed (%s) [Content-Type: %s]; falling back to XML parsing\n",
-						  switch_str_nil(url), reason, zstr(content_type) ? "(absent)" : content_type);
+						  "JSON decode of the [%s] response from [%s] failed (%s) [Content-Type: %s]; falling back to XML parsing\n",
+						  switch_str_nil(section), xml_curl_json_redact_url(url, safe_url, sizeof(safe_url)), reason,
+						  xml_curl_json_sanitize_token(content_type, safe_content_type, sizeof(safe_content_type)));
 	}
 
 	return xml;
@@ -425,12 +1205,26 @@ static switch_xml_t xml_url_fetch(const char *section, const char *tag_name, con
 	char *dynamic_url = NULL;
 	char content_type[256] = "";	/* JSON: copy of the response Content-Type, taken while the curl handle is alive */
 	char *curl_content_type = NULL;	/* JSON: libcurl-owned; never freed here */
+	char safe_url[256] = "";		/* JSON: redacted rendering of the gateway URL, for logging only */
+	int json_response = 0;			/* JSON: 1 once this fetch has actually negotiated JSON */
+	switch_curl_slist_t **request_headers = NULL;	/* JSON: the list curl is finally handed */
 
     strncpy(hostname, switch_core_get_switchname(), sizeof(hostname) - 1);
 
 	if (!binding) {
 		return NULL;
 	}
+
+	/* JSON: the format decision is taken once, here, and then only consulted. Keeping it in a
+	   local is what lets the request path lower it again if the Accept header cannot be sent,
+	   so the decode step can never expect a representation this fetch did not ask for. */
+	json_response = (binding->response_format && !strcasecmp(binding->response_format, "json")) ? 1 : 0;
+
+	/* JSON: the Accept header has to land on the list curl is finally handed, and that is not
+	   always the list the other request headers are built on: when disable100continue is set,
+	   the Expect: branch below hands curl its own list instead. Selecting the target here keeps
+	   the format decision single and leaves that branch exactly as it is. */
+	request_headers = binding->disable100continue ? &slist : &headers;
 
 	if ((file_url = strstr(binding->url, "file:"))) {
 		file_url += 5;
@@ -487,11 +1281,16 @@ static switch_xml_t xml_url_fetch(const char *section, const char *tag_name, con
 		headers = switch_curl_slist_append(headers, "Content-Type: application/x-www-form-urlencoded");
 
 		/* JSON: when the binding opted in, advertise that a BadgerFish JSON response is
-		   acceptable. Purely additive - the request Content-Type above, the form body and the
-		   rest of the XML request path are untouched, and switch_curl_slist_free_all(headers)
-		   below already releases this entry. */
-		if (binding->response_format && !strcasecmp(binding->response_format, "json")) {
-			headers = switch_curl_slist_append(headers, "Accept: application/json");
+		   acceptable. This is the only place the request path acts on the format decision. It is
+		   additive - the request Content-Type above, the form body and the rest of the XML
+		   request path are untouched, and switch_curl_slist_free_all() below releases whichever
+		   list carries this entry. If the header cannot be added the request is still made, but
+		   it is made as an XML request, so the response is handled as one. */
+		if (json_response && !xml_curl_json_append_header(request_headers, "Accept: application/json")) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+							  "Could not add the Accept: application/json request header for [%s]; requesting XML instead\n",
+							  xml_curl_json_redact_url(binding->url, safe_url, sizeof(safe_url)));
+			json_response = 0;
 		}
 
 		if (!strncasecmp(binding->url, "https", 5)) {
@@ -523,15 +1322,6 @@ static switch_xml_t xml_url_fetch(const char *section, const char *tag_name, con
 
 		if (binding->disable100continue) {
 			slist = switch_curl_slist_append(slist, "Expect:");
-			/* JSON: this pre-existing branch REPLACES the header list assigned above rather
-			   than adding to it, which is long-standing behaviour that must not change. The
-			   Accept header therefore has to be restated on the list curl will actually use,
-			   or it would silently never reach the gateway - disable100continue defaults to
-			   1, so this is the common path. Guarded identically to the append above, so a
-			   binding without response-format still sends byte-for-byte what it sends today. */
-			if (binding->response_format && !strcasecmp(binding->response_format, "json")) {
-				slist = switch_curl_slist_append(slist, "Accept: application/json");
-			}
 			switch_curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, slist);
 		}
 
@@ -603,22 +1393,23 @@ static switch_xml_t xml_url_fetch(const char *section, const char *tag_name, con
 		xml = NULL;
 	} else {
 		if (httpRes == 200) {
-			/* JSON: the single response-format dispatch point. When this binding opted in with
-			   response-format=json, attempt the BadgerFish decode first. The helper emits one
-			   WARNING on every failure edge and returns NULL, so a non-JSON Content-Type, an
-			   unreadable body, unparseable JSON or a wrongly shaped document all converge on
-			   the original XML parse below. */
-			if (binding->response_format && !strcasecmp(binding->response_format, "json")) {
-				xml = xml_curl_json_decode_response(filename, content_type, binding->curl_max_bytes, binding->url);
+			/* JSON: the single response-format dispatch point. When this fetch negotiated JSON,
+			   attempt the BadgerFish decode first. The helper emits one WARNING on every failure
+			   edge and returns NULL, so a non-JSON Content-Type, a body that could not be read
+			   in full, unparseable JSON, a document naming a section other than the one that was
+			   requested, and a document outside the canonical contract all converge on the
+			   original XML parse below. */
+			if (json_response) {
+				xml = xml_curl_json_decode_response(filename, content_type, binding->curl_max_bytes, binding->url, section);
 			}
 
-			/* JSON: this guard is the only change made to the XML path. The two statements it
-			   wraps are the pre-existing parse call and its error report, kept byte for byte -
-			   including their original indentation - so the fallback is provably unchanged. */
+			/* JSON: parse the response as XML whenever the JSON decode did not produce a
+			   document. This is the shared fallback: it reports a genuine parse failure and
+			   returns NULL exactly as it does for a binding that never asked for JSON. */
 			if (!xml) {
-			if (!(xml = switch_xml_parse_file(filename))) {
-				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Error Parsing Result! [%s]\ndata: [%s]\n", binding->url, data);
-			}
+				if (!(xml = switch_xml_parse_file(filename))) {
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Error Parsing Result! [%s]\ndata: [%s]\n", binding->url, data);
+				}
 			}
 		} else {
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Received HTTP error %ld trying to fetch %s\ndata: [%s]\n", httpRes, binding->url,
@@ -776,9 +1567,8 @@ static switch_status_t do_config(void)
 					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Can't set a negative maximum response bytes!\n");
 				}
 			} else if (!strcasecmp(var, "response-format")) {
-				/* JSON: opt-in response representation. Appended at the tail of the chain so
-				   that every pre-existing comparison keeps its current evaluation order. When
-				   this parameter is absent the module behaves exactly as it did before. */
+				/* JSON: opt-in response representation. This arm sits at the tail of the chain
+				   so every other parameter keeps its evaluation order; absence selects XML. */
 				response_format = val;
 			}
 		}

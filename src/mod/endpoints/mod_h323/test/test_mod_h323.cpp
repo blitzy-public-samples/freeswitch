@@ -48,11 +48,12 @@
  *
  * WHY THE PRODUCTION TRANSLATION UNIT IS INCLUDED (and not just the header)
  * ------------------------------------------------------------------------
- * The declared build contract for this target is a convenience library
- * (noinst_LTLIBRARIES = libmodh323.la) linked in through
- * test_test_mod_h323_LDADD, with this suite including only "../mod_h323.h".
- * That arrangement was implemented and then measured, and it DOES NOT LINK on
- * this toolchain:
+ * The obvious shape for a C++ module test, and the one the tree's only
+ * precedent uses (src/mod/codecs/mod_openh264/Makefile.am:12-21), is a
+ * convenience library - noinst_LTLIBRARIES = libmodh323.la - linked in through
+ * test_test_mod_h323_LDADD, with the suite including only "../mod_h323.h".
+ * That arrangement was prototyped for this module and then measured, and it
+ * DOES NOT LINK on this toolchain:
  *
  *     libmodh323.la(mod_h323.o): in function
  *         `FSH323_T38Capability::CreateChannel(...)':
@@ -77,19 +78,74 @@
  * making AddAllCapabilities() (mod_h323.cpp:404) add duplicates.  One
  * translation unit registers each name once.
  *
- * ==> BUILD COUPLING, FLAGGED DELIBERATELY: because this file includes
- *     ../mod_h323.cpp, the libmodh323.la entry in test_test_mod_h323_LDADD is
- *     redundant.  It is also harmless and needs no change: a static archive
- *     member is only pulled in to resolve an otherwise-undefined symbol, and
- *     after this inclusion there are none left to resolve.  This was verified
- *     against a libtool harness reproducing automake's exact
- *     noinst_LTLIBRARIES + program _LDADD shape.  Nothing in the parent
- *     Makefile.am has to change for this suite to build and link.
+ * ==> ADOPTED BUILD CONTRACT - REQUIRED OF THE PARENT Makefile.am
+ *     ------------------------------------------------------------
+ *     White-box source inclusion is formally ADOPTED here, not tolerated as a
+ *     workaround.  It is the AAP's own documented contingency for exactly this
+ *     situation: the suite "switches to white-box source inclusion ... and its
+ *     convenience library declaration is dropped" (AAP 0.3.1), described there
+ *     as "a local change to one Makefile.am and one #include line".  The
+ *     #include line is the `#include "../mod_h323.cpp"` below.  The Makefile.am
+ *     change is a separate work boundary that this file must not edit, so the
+ *     contract it has to satisfy is stated here as a REQUIREMENT rather than
+ *     being left implicit:
  *
- * A welcome consequence of single-translation-unit compilation: the
- * header-static `h323_process` (mod_h323.h:630, internal linkage) is the SAME
- * object the module code writes to, so a successful mod_h323_load() is
- * observable here.  Every use of it below is still NULL-guarded.
+ *       R1. src/mod/endpoints/mod_h323/Makefile.am must NOT declare a
+ *           convenience library for this module.  There must be no
+ *           `noinst_LTLIBRARIES = libmodh323.la`.
+ *       R2. libmodh323.la must NOT appear in test_test_mod_h323_LDADD, and
+ *           neither mod_h323.cpp nor $(mod_h323_la_SOURCES) may appear in
+ *           test_test_mod_h323_SOURCES.  The sole source of this program is
+ *           test/test_mod_h323.cpp, which already carries the module.
+ *
+ *     Together R1 and R2 guarantee the property this architecture depends on:
+ *     EXACTLY ONE production copy of mod_h323 is compiled into, and linked
+ *     into, the test program.  Violating either requirement reintroduces the
+ *     mod_h323.h:593 collision quoted above; and if a linker were ever
+ *     persuaded to tolerate that collision, the result would be two live
+ *     copies of the module's state - two `h323_process` objects and a
+ *     doubly-populated H323CapabilityFactory - which is a worse failure than a
+ *     link error because it is silent.
+ *
+ *     Everything else the production target carries must still be carried by
+ *     the test target, because a binary built with different flags is not
+ *     testing the same code: the openh323 include path, -DPTRACING=1,
+ *     -D_REENTRANT, -fno-exceptions, the -D_64BIT/-DP_64BIT variant under the
+ *     64-bit Linux conditional, the openh323/PTLib link flags
+ *     (-L/usr/lib -lopenh323 -lpt -lrt), and
+ *     $(switch_builddir)/libfreeswitch.la.
+ *
+ * WHAT THE INCLUSION IS AND IS NOT USED FOR
+ * -----------------------------------------
+ * Compiling the module translation unit in is a LINKING necessity, established
+ * above.  It is deliberately NOT used as a licence to assert on the module's
+ * internal state.  Single-translation-unit compilation does make the
+ * header-static `h323_process` (mod_h323.h:630) and the .cpp-file static
+ * `mod_h323_globals` (mod_h323.cpp:42) reachable from here, but no verdict in
+ * this suite rests on either of them, because an assertion that depends on
+ * internal linkage breaks on refactors that change nothing observable.
+ *
+ * Every case's verdict is instead taken from a public seam:
+ *
+ *   - FSH323EndPoint::ReadConfig()'s returned switch_status_t;
+ *   - the public FSH323EndPoint::m_listeners list (mod_h323.h:270);
+ *   - the public m_ai / m_pi / m_endpointname members (mod_h323.h:271-278);
+ *   - protected members reached legitimately through the test-local subclass
+ *     FSH323TestEndPoint, per rule R2-2 - no friend declaration, no
+ *     de-staticising, no production edit;
+ *   - PProcess::IsInitialised() and PProcess::Current(), PTLib's own public
+ *     singleton interface, with the FSProcess handle recovered by the POINTER
+ *     form of dynamic_cast so it returns NULL rather than throwing under
+ *     -fno-exceptions;
+ *   - FSProcess::GetH323EndPoint() (mod_h323.h:230-232) and
+ *     FSH323EndPoint::GetSwitchInterface() (mod_h323.h:266-268);
+ *   - the switch_loadable_module_interface_t the load function returns, and its
+ *     endpoint_interface.
+ *
+ * Where a property exists only behind internal linkage - the four global
+ * strings, the context and dialplan defaults - it is left unasserted and the
+ * reason is recorded at the site, rather than reached for because it happens to
+ * be visible.
  *
  * BOOTSTRAP TIER
  * --------------
@@ -122,9 +178,19 @@
  * RAS registration thread (mod_h323.cpp:451-455).  Critically, an EMPTY
  * listener list makes it fall back to StartListener("") - a WILDCARD bind on
  * port 1720.  Every injected configuration in this file therefore carries an
- * explicit <listeners> stanza bound to 127.0.0.1 on a high unprivileged port,
- * and an empty gk-address.  The shipped sample's $${local_ip_v4} and port 1720
+ * explicit <listeners> stanza bound to 127.0.0.1 on a fixed high port, so that
+ * whichever document a case happens to reach Initialise() with, the wildcard
+ * fallback is unreachable.  The shipped sample's $${local_ip_v4} and port 1720
  * (h323.conf.xml:23-28) are reference values only and are never used as-is.
+ *
+ * The gatekeeper thread is contained by a narrower rule: EVERY configuration
+ * this suite lets reach Initialise(), whether called directly or through module
+ * load, carries an empty gk-address, so the guard at mod_h323.cpp:451 is false
+ * and no RAS thread is ever constructed.  Exactly one document departs from
+ * that - fst_h323_conf_gk_lan_search, with gk-address="*" - and it is
+ * deliberately confined to ReadConfig(), which only stores the value
+ * (mod_h323.cpp:537-538).  Its case asserts the stored string and never calls
+ * Initialise(), so "*" is observed but never acted on.
  * No case performs third-party network I/O, opens a random port, or depends on
  * wall-clock time.
  */
@@ -423,6 +489,11 @@ static switch_xml_t fst_h323_config_search(const char *section, const char *tag_
 {
 	const char *document = (const char *) user_data;
 
+	/* The requested document is selected entirely by the four gates below and by
+	   the template handed in through user_data, so the event parameters carry
+	   nothing this provider needs. */
+	(void) params;
+
 	/* Answer for exactly one lookup: the h323.conf configuration section */
 	if (zstr(section) || strcasecmp(section, "configuration")) {
 		return NULL;
@@ -629,13 +700,131 @@ static void fst_h323_process_release(void)
 }
 
 /*
+ * Release the H323ListenerTCP objects that a direct ReadConfig() left the test
+ * owning, and empty the record list.
+ *
+ * WHY THIS IS NEEDED AT ALL
+ * -------------------------
+ * FSH323EndPoint::ReadConfig() allocates one listener per <listener> element
+ * unconditionally - `listener.listenAddress = new H323ListenerTCP(*this, ip,
+ * port)` (mod_h323.cpp:583) - and stores it as a RAW pointer inside the
+ * FSListener record it appends to m_listeners.  FSListener has a defaulted
+ * constructor that leaves listenAddress uninitialised and NO destructor
+ * (mod_h323.h:236-243), and ~FSH323EndPoint only calls StopGkClient() and
+ * ClearAllCalls() (mod_h323.cpp:612-617).  So `delete endpoint` alone does not
+ * free them, and a case that reads configuration without going on to
+ * Initialise() is the sole owner of everything ReadConfig() constructed.
+ * Freeing it here is the test cleaning up after itself - it is NOT a
+ * workaround for a production defect, because in production ReadConfig() is
+ * only ever reached from Initialise(), which hands each listener straight to
+ * StartListener().
+ *
+ * WHY IT MUST NOT BE CALLED AFTER Initialise()
+ * --------------------------------------------
+ * H323EndPoint::StartListener(H323Listener *) documents the transfer
+ * explicitly: "if this returns TRUE, then the endpoint is responsible for
+ * deleting the H323Listener listener object.  If FALSE is returned then the
+ * object is not deleted and it is up to the caller to release the memory"
+ * (h323ep.h:532-545).  Initialise() calls it for every record
+ * (mod_h323.cpp:441-448), so once Initialise() has succeeded the listeners
+ * belong to the base endpoint's H323ListenerList (h323ep.h:3114) and are freed
+ * by ~H323EndPoint.  Calling this helper there would be a DOUBLE FREE.  It is
+ * therefore invoked by the three ReadConfig()-only cases and by no other,
+ * which was confirmed by measurement: valgrind attributes four definitely-lost
+ * H323ListenerTCP blocks to exactly those three cases and none to the
+ * Initialise() case.
+ */
+static void fst_h323_release_unstarted_listeners(FSH323TestEndPoint * endpoint)
+{
+	if (!endpoint) {
+		return;
+	}
+
+	for (std::list < FSListener >::iterator it = endpoint->m_listeners.begin(); it != endpoint->m_listeners.end(); ++it) {
+		delete it->listenAddress;
+		it->listenAddress = NULL;
+	}
+
+	endpoint->m_listeners.clear();
+}
+
+/*
+ * The memory pool the loaded module is given, and the reason it is not fst_pool.
+ *
+ * WHY A DEDICATED POOL IS REQUIRED
+ * --------------------------------
+ * mod_h323_load() does not merely read its pool argument, it allocates
+ * long-lived state out of it: switch_loadable_module_create_module_interface()
+ * (mod_h323.cpp:159) carves the module interface, and every interface hung off
+ * it, straight out of that pool, and the heap FSProcess/FSH323EndPoint the load
+ * constructs keeps pointing at the result for as long as the module is loaded.
+ *
+ * fst_pool cannot serve that purpose.  It is created fresh by FST_SETUP_BEGIN
+ * and destroyed by FST_TEARDOWN_BEGIN (switch_test.h:407-414 and 425-432), so
+ * its lifetime is exactly ONE test case.  This suite deliberately spans two:
+ * case 6 loads the module and case 7 asserts that shutting it down works.  Had
+ * case 6 loaded with fst_pool, that pool would already have been destroyed by
+ * the time case 7 ran, and mod_h323_shutdown() would have been asked to tear
+ * down a module whose interface memory was freed underneath it - a
+ * use-after-free across a case boundary, and a hard build failure under the
+ * address sanitizer the CI configure line always enables (ci.sh:76-79).
+ *
+ * So the pool that backs retained module state is created explicitly before the
+ * load, outlives the case that created it, and is destroyed only after shutdown
+ * has been asserted.  Per-case observations continue to use fst_pool; only
+ * state intentionally retained BETWEEN cases lives here.
+ */
+static switch_memory_pool_t *fst_h323_module_pool = NULL;
+
+/*
+ * Create the module-lifetime pool.  Returns SWITCH_STATUS_SUCCESS only when a
+ * usable pool is available afterwards, so the caller can make it a hard
+ * precondition of loading.  Calling it twice without an intervening destroy is
+ * treated as success and does not leak, because the existing pool is kept.
+ */
+static switch_status_t fst_h323_module_pool_create(void)
+{
+	if (fst_h323_module_pool) {
+		return SWITCH_STATUS_SUCCESS;
+	}
+
+	if (switch_core_new_memory_pool(&fst_h323_module_pool) != SWITCH_STATUS_SUCCESS) {
+		return SWITCH_STATUS_FALSE;
+	}
+
+	return fst_h323_module_pool ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
+}
+
+/*
+ * Destroy the module-lifetime pool.  MUST NOT be called until the module has
+ * been shut down, because shutdown is the last thing that touches pool-backed
+ * module state.  switch_core_destroy_memory_pool() NULLs the caller's pointer,
+ * so this is safe to call when nothing is held.
+ */
+static void fst_h323_module_pool_destroy(void)
+{
+	if (fst_h323_module_pool) {
+		switch_core_destroy_memory_pool(&fst_h323_module_pool);
+	}
+}
+
+
+/*
  * ---------------------------------------------------------------------------
  * THE SUITE
  * ---------------------------------------------------------------------------
  *
- * "conf_h323" resolves against the -DSWITCH_TEST_BASE_DIR_FOR_CONF and
- * -DSWITCH_TEST_BASE_DIR_OVERRIDE defines carried by this target, giving
- * src/mod/endpoints/mod_h323/test/conf_h323.
+ * "conf_h323" names this module's own fixture root.  The core bootstrap builds
+ * the configuration directory as SWITCH_TEST_BASE_DIR_FOR_CONF, a path
+ * separator, then that name (switch_test.h:92-93), so the target's Makefile.am
+ * declaration must define -DSWITCH_TEST_BASE_DIR_FOR_CONF and
+ * -DSWITCH_TEST_BASE_DIR_OVERRIDE to ${abs_builddir}/test - the same pair
+ * carried by, for example, src/mod/applications/mod_commands/Makefile.am:15 -
+ * for the name to resolve to src/mod/endpoints/mod_h323/test/conf_h323.
+ * Without those defines the bootstrap falls back to "./conf_h323"
+ * (switch_test.h:94-99), which resolves against the working directory instead,
+ * so the suite would only find its fixtures when run from inside test/.  See
+ * the build-wiring note in the file header for the rest of that declaration.
  *
  * CASE ORDER IS LOAD-BEARING.  FCTX runs cases in declaration order, and the
  * order below is the only one that satisfies every constraint at once:
@@ -729,14 +918,24 @@ FST_CORE_BEGIN("conf_h323")
 			 * this path: their defaults are applied at mod_h323.cpp:490-493,
 			 * AFTER the failure return, and the constructor
 			 * (mod_h323.cpp:599-610) leaves the two ints uninitialised.
-			 * The context and dialplan globals ARE observable, because
-			 * mod_h323.cpp:474-475 runs before the configuration is opened.
-			 * They are reachable here only because the module translation
-			 * unit is compiled into this suite. */
-			fst_check(!zstr(mod_h323_globals.context));
-			fst_check_string_equals(mod_h323_globals.context, "default");
-			fst_check(!zstr(mod_h323_globals.dialplan));
-			fst_check_string_equals(mod_h323_globals.dialplan, "XML");
+			 *
+			 * The context and dialplan defaults applied at mod_h323.cpp:474-475
+			 * are likewise NOT asserted, deliberately.  They live in
+			 * mod_h323_globals, a .cpp-file static (mod_h323.cpp:42) whose only
+			 * setters are the file-static SWITCH_DECLARE_GLOBAL_STRING_FUNC
+			 * wrappers (mod_h323.cpp:44-47), so no public seam exposes them.  An
+			 * assertion on them would rest purely on this suite's internal
+			 * linkage to the module translation unit, and asserting through
+			 * internal linkage is what makes a harness brittle: it breaks on a
+			 * refactor that changes nothing observable.
+			 *
+			 * The stronger property is asserted on the public seams instead: the
+			 * failure branch is deterministic and leaves no residue, so repeating
+			 * it produces the identical observable result. */
+			status = endpoint->ReadConfig(0);
+
+			fst_check(status == SWITCH_STATUS_FALSE);
+			fst_check(endpoint->m_listeners.empty());
 
 			delete endpoint;
 
@@ -785,6 +984,11 @@ FST_CORE_BEGIN("conf_h323")
 			/* the located document's single listener stanza was parsed */
 			fst_check_int_equals((int) endpoint->m_listeners.size(), 1);
 
+			/* Initialise() was never called, so this case still owns the
+			 * listener ReadConfig() constructed; ~FSH323EndPoint does not free
+			 * it.  See fst_h323_release_unstarted_listeners(). */
+			fst_h323_release_unstarted_listeners(endpoint);
+			fst_check(endpoint->m_listeners.empty());
 			delete endpoint;
 
 			fst_check(fst_h323_unbind_config() == SWITCH_STATUS_SUCCESS);
@@ -849,6 +1053,9 @@ FST_CORE_BEGIN("conf_h323")
 			 * Initialise() does, and this case never calls it. */
 			fst_check(endpoint->TestGetGkRegistrationThread() == NULL);
 
+			/* ReadConfig()-only case: the listeners are still the test's. */
+			fst_h323_release_unstarted_listeners(endpoint);
+			fst_check(endpoint->m_listeners.empty());
 			delete endpoint;
 
 			fst_check(fst_h323_unbind_config() == SWITCH_STATUS_SUCCESS);
@@ -942,6 +1149,10 @@ FST_CORE_BEGIN("conf_h323")
 			fst_check(endpoint->TestGetGkAddress().IsEmpty());
 			fst_check(endpoint->TestGetGkRegistrationThread() == NULL);
 
+			/* ReadConfig()-only case, and the one that constructs the most
+			 * listeners: both are still the test's to free. */
+			fst_h323_release_unstarted_listeners(endpoint);
+			fst_check(endpoint->m_listeners.empty());
 			delete endpoint;
 
 			fst_check(fst_h323_unbind_config() == SWITCH_STATUS_SUCCESS);
@@ -1070,8 +1281,14 @@ FST_CORE_BEGIN("conf_h323")
 			fst_check_int_equals((int) endpoint->m_listeners.size(), 1);
 			fst_check(endpoint->TestGetGkRegistrationThread() == NULL);
 
-			/* ~H323EndPoint() removes and destroys every started listener
-			 * (h323ep.cxx:978), closing the loopback socket */
+			/* NO fst_h323_release_unstarted_listeners() HERE, DELIBERATELY.
+			 * Initialise() handed this listener to StartListener(), which
+			 * returned TRUE and thereby took ownership (h323ep.h:532-545), so
+			 * it now lives in the base endpoint's H323ListenerList.
+			 * ~H323EndPoint() removes and destroys every started listener
+			 * (h323ep.cxx:978), closing the loopback socket.  Releasing it here
+			 * as well would be a double free - and valgrind confirms this case
+			 * leaks nothing without it. */
 			delete endpoint;
 
 			fst_check(fst_h323_unbind_config() == SWITCH_STATUS_SUCCESS);
@@ -1104,32 +1321,68 @@ FST_CORE_BEGIN("conf_h323")
 		{
 			switch_loadable_module_interface_t *module_interface = NULL;
 			switch_status_t status = SWITCH_STATUS_FALSE;
+			FSProcess *process = NULL;
 
 			/* Defensive: clear any shared PProcess an earlier case left behind by
 			 * exiting on a fatal check.  A no-op in a healthy run, and it keeps
 			 * this case from ever asking PTLib for a second live PProcess. */
 			fst_h323_process_release();
 
+			/* Expected consequence of the shared process having been released:
+			 * PProcess::~PProcess() has already emptied the H323CapabilityFactory
+			 * and the media-format registry for good, so the Initialise() inside
+			 * the load below can add no audio capability and logs "failed to add
+			 * capability" once per codec-prefs entry (mod_h323.cpp:408 and :417).
+			 * That is harness order, not a module defect, and no verdict in this
+			 * case reads the capability table: the codec-preference contract is
+			 * asserted in the codec case above, which runs while the first
+			 * PProcess of the run - and therefore the factory - is still alive. */
+
 			fst_requires(!PProcess::IsInitialised());
 			fst_requires(fst_h323_bind_config(fst_h323_conf_module_load) == SWITCH_STATUS_SUCCESS);
 
+			/* The module is loaded against the module-lifetime pool, NEVER
+			 * against fst_pool: this case deliberately leaves the module loaded
+			 * for case 7, and fst_pool does not survive this case's teardown.
+			 * See fst_h323_module_pool above. */
+			fst_requires(fst_h323_module_pool_create() == SWITCH_STATUS_SUCCESS);
+			fst_requires(fst_h323_module_pool != NULL);
+
 			/* mod_h323_load() creates the module interface itself
 			 * (mod_h323.cpp:159) and hands it back through the out-parameter */
-			status = mod_h323_load(&module_interface, fst_pool);
+			status = mod_h323_load(&module_interface, fst_h323_module_pool);
 
 			/* POSIX builds return SUCCESS; WIN32 returns NOUNLOAD
 			 * (mod_h323.cpp:175-179).  Both are a successful load. */
 			fst_check(status == SWITCH_STATUS_SUCCESS || status == SWITCH_STATUS_NOUNLOAD);
 			fst_check(module_interface != NULL);
 
-			/* the FSProcess the module allocated (mod_h323.cpp:167) is now the
-			 * process singleton.  It is observable here because the module
-			 * translation unit is compiled into this suite; every use of it is
-			 * still NULL-guarded. */
+			/* The FSProcess the module allocated (mod_h323.cpp:167) is now the
+			 * PTLib process singleton, and it is reached here through PTLib's own
+			 * PUBLIC interface rather than through the module's static
+			 * h323_process pointer.  PProcess::Current() is public, and the
+			 * POINTER form of dynamic_cast is used deliberately: it yields NULL
+			 * on a type mismatch instead of throwing, which matters because this
+			 * target is compiled -fno-exceptions.  IsInitialised() is checked
+			 * first so Current() is only called once a process exists. */
 			fst_check(PProcess::IsInitialised());
-			fst_check(h323_process != NULL);
+
+			if (PProcess::IsInitialised()) {
+				process = dynamic_cast<FSProcess *>(&PProcess::Current());
+				fst_check(process != NULL);
+			}
 
 			if (module_interface != NULL) {
+				/* The module name on the interface is the `modname` the module
+				 * definition macro emits (switch_types.h:2641), which is the
+				 * literal "mod_h323"; mod_h323.cpp:159 passes it straight to
+				 * switch_loadable_module_create_module_interface().  It is a
+				 * different string from the endpoint interface name asserted
+				 * below, and both are public members of the returned
+				 * interface (switch_loadable_module.h:64-67). */
+				fst_check(!zstr(module_interface->module_name));
+				fst_check_string_equals(module_interface->module_name, "mod_h323");
+
 				fst_check(module_interface->endpoint_interface != NULL);
 
 				if (module_interface->endpoint_interface != NULL) {
@@ -1144,12 +1397,13 @@ FST_CORE_BEGIN("conf_h323")
 				}
 			}
 
-			/* The same interface is reachable through the endpoint's public
-			 * accessor (mod_h323.h:266-268).  h323_process is only non-NULL
-			 * when the load succeeded, and a successful load implies a
-			 * constructed endpoint (mod_h323.cpp:173-183). */
-			if (h323_process != NULL) {
-				FSH323EndPoint & endpoint = h323_process->GetH323EndPoint();
+			/* The same interface is reachable through two further public
+			 * accessors, both on the handle obtained above: FSProcess's public
+			 * GetH323EndPoint() (mod_h323.h:230-232) and the endpoint's public
+			 * GetSwitchInterface() (mod_h323.h:266-268).  A live FSProcess
+			 * implies a constructed endpoint (mod_h323.cpp:173-183). */
+			if (process != NULL) {
+				FSH323EndPoint & endpoint = process->GetH323EndPoint();
 				switch_endpoint_interface_t *registered = endpoint.GetSwitchInterface();
 
 				fst_check(registered != NULL);
@@ -1173,9 +1427,33 @@ FST_CORE_BEGIN("conf_h323")
 		 * CASE 7 - mod_h323_shutdown() succeeds.  DECLARED LAST.
 		 *
 		 * Declared last for two reasons: it must observe a fully initialised
-		 * module, and it is the only thing that frees the four global strings
-		 * ReadConfig() strdup's on every invocation (mod_h323.cpp:190-193), so
-		 * running it last reclaims what every earlier case allocated.
+		 * module, and it is the only thing that releases the four global strings
+		 * mod_h323_globals holds (mod_h323.cpp:190-193), so running it last
+		 * leaves none of them retained at exit.
+		 *
+		 * Be precise about what that reclaims.  All four setters are generated by
+		 * SWITCH_DECLARE_GLOBAL_STRING_FUNC (mod_h323.cpp:44-47), and each frees
+		 * the previous value before strdup'ing the new one
+		 * (src/include/switch_utils.h:1009-1010).  At most one allocation per
+		 * global is therefore outstanding at any instant: each earlier case's
+		 * strings are reclaimed by the next case that overwrites them, and this
+		 * case releases only the values still retained when it runs - not an
+		 * accumulation from every earlier case.
+		 *
+		 * The globals differ in when they are set, which is worth stating
+		 * exactly.  context and dialplan are set unconditionally near the top of
+		 * ReadConfig() (mod_h323.cpp:474-475), before the configuration is even
+		 * opened, so they are allocated even by case 1's failing call and may
+		 * then be overwritten from the settings loop (mod_h323.cpp:506, :508).
+		 * codec_string is set only when codec-prefs is present
+		 * (mod_h323.cpp:510), which is true of three of this file's five
+		 * documents.  rtp_timer_name has two possible sources - an explicit
+		 * rtp-timer-name param (mod_h323.cpp:514) and the "soft" fallback taken
+		 * when use-rtp-timer was enabled (mod_h323.cpp:593-594) - and no document
+		 * here carries either key, so it stays NULL throughout and its
+		 * switch_safe_free is a no-op.  None of that is asserted here: those
+		 * globals sit behind internal linkage, and their release is covered by
+		 * the sanitizer instead.
 		 *
 		 * The status is asserted rather than discarded.  That is only possible
 		 * because the suite uses FST_SUITE_BEGIN: the module-loading bootstrap
@@ -1186,33 +1464,47 @@ FST_CORE_BEGIN("conf_h323")
 		{
 			switch_status_t status = SWITCH_STATUS_FALSE;
 
-			/* the previous case left the module loaded */
-			fst_check(h323_process != NULL);
+			/* The previous case left the module loaded.  Asserted through PTLib's
+			 * public singleton interface, not through the module's static
+			 * h323_process pointer. */
 			fst_check(PProcess::IsInitialised());
 
+			if (PProcess::IsInitialised()) {
+				fst_check(dynamic_cast<FSProcess *>(&PProcess::Current()) != NULL);
+			}
+
 			status = mod_h323_shutdown();
 
 			fst_check(status == SWITCH_STATUS_SUCCESS);
 
-			/* mod_h323.cpp:195-196 deletes and NULLs the process, and
-			 * FSProcess::~FSProcess() (mod_h323.cpp:366-368) deletes the
-			 * endpoint with it - which releases the PTLib process singleton */
-			fst_check(h323_process == NULL);
+			/* Resource release is asserted on a PUBLIC seam.  mod_h323.cpp:195-196
+			 * deletes the process, and FSProcess::~FSProcess()
+			 * (mod_h323.cpp:366-368) deletes the endpoint with it; deleting the
+			 * one live PProcess-derived object is precisely what makes
+			 * PProcess::IsInitialised() false again, so this single public check
+			 * proves both the process and the endpoint it owned are gone.
+			 *
+			 * The four global strings freed at mod_h323.cpp:190-193 are NOT
+			 * asserted: they live in the .cpp-file static mod_h323_globals
+			 * (mod_h323.cpp:42) behind file-static setters, so no public seam
+			 * exposes them.  Their release is covered where it is genuinely
+			 * observable - by the sanitizer, which fails the build on a leak. */
 			fst_check(!PProcess::IsInitialised());
 
-			/* the four global strings are freed and nulled by switch_safe_free
-			 * (mod_h323.cpp:190-193) */
-			fst_check(mod_h323_globals.context == NULL);
-			fst_check(mod_h323_globals.dialplan == NULL);
-			fst_check(mod_h323_globals.codec_string == NULL);
-			fst_check(mod_h323_globals.rtp_timer_name == NULL);
-
-			/* shutdown is idempotent: every pointer it touches was nulled */
+			/* Shutdown is idempotent: every pointer it touches was nulled, so a
+			 * second call succeeds and the process stays released. */
 			status = mod_h323_shutdown();
 
 			fst_check(status == SWITCH_STATUS_SUCCESS);
-			fst_check(h323_process == NULL);
 			fst_check(!PProcess::IsInitialised());
+
+			/* ONLY NOW is the module-lifetime pool released.  Shutdown is the
+			 * last thing that touches pool-backed module state, so this is the
+			 * earliest point at which destroying it is safe - and doing it here,
+			 * inside the case, keeps it out of the per-case teardown that owns
+			 * fst_pool. */
+			fst_h323_module_pool_destroy();
+			fst_check(fst_h323_module_pool == NULL);
 		}
 		FST_TEST_END()
 	}
