@@ -113,25 +113,56 @@ h323_toolkit_available()
 # effective state this script cannot reason about.
 #
 # The count is always a number on success, so a caller can compare it directly.
-# An absent modules.conf is not reported as a count of zero, because "the file
-# does not exist" and "the module is not listed" are different facts and only the
-# second one is safe to act on: it is diagnosed and reported as a failure so that
-# a caller asserting a module is disabled cannot be satisfied by a missing file.
+# Failing to READ the module list is never reported as a count, because "the list
+# could not be read" and "the module is not listed" are different facts and only
+# the second one is safe to act on: a caller asserting a module is disabled must
+# not be able to satisfy that assertion with an answer nobody ever obtained.  Both
+# ways the read can fail are therefore diagnosed and returned as a failure - an
+# absent modules.conf before the read, and a grep that could not complete it.
 modules_conf_active_count()
 {
 	local module="$1"
 	local count
+	local status
 
 	if [ ! -f modules.conf ]; then
 		echo "Error: modules.conf is missing, cannot determine whether '$module' is enabled" >&2
 		return 1
 	fi
 
-	# grep -c prints 0 and exits 1 when nothing matched, which is a valid answer
-	# here rather than an error, so the status is discarded and the value kept.
+	# grep's exit status is the only thing that separates the two ways of finding
+	# no match, so it is captured on the very next line and acted on rather than
+	# discarded.  There are three outcomes, not two: 0 means lines matched and the
+	# count is on stdout; 1 means nothing matched, which is a legitimate answer
+	# here and normalises to zero; and anything above 1 means grep could not
+	# complete the read at all - modules.conf unreadable, removed between the -f
+	# test above and the read, or an I/O error - printing nothing.  Only the middle
+	# case may become a count, because require_module_disabled_for_tests() treats a
+	# count of zero as PROOF that a module will not be built, and a read that never
+	# happened proves nothing.
 	count=$(grep -c -E "^[[:space:]]*${module}[[:space:]]*$" modules.conf)
+	status=$?
 
-	echo "${count:-0}"
+	if [ "$status" -gt 1 ]; then
+		echo "Error: could not read modules.conf (grep exited $status), cannot determine whether '$module' is enabled" >&2
+		return 1
+	fi
+
+	if [ "$status" -eq 1 ]; then
+		count=0
+	fi
+
+	# Whatever is echoed here is compared against a literal by both callers, so it
+	# has to be a number or the comparison is meaningless rather than merely wrong.
+	# Anything else is treated as a failed read for the same reason as above.
+	case "$count" in
+		'' | *[![:digit:]]*)
+			echo "Error: modules.conf produced an unusable active-line count '$count' for '$module'" >&2
+			return 1
+			;;
+	esac
+
+	echo "$count"
 
 	return 0
 }
