@@ -29,301 +29,131 @@
  */
 
 /*
- * ---------------------------------------------------------------------------
  * HARNESS ARCHITECTURE
- * ---------------------------------------------------------------------------
+ * --------------------
+ * This suite observes mod_h323; it does not alter it.  No line of mod_h323.cpp,
+ * mod_h323.h or h323.conf.xml is modified.
  *
- * This suite is the first automated test coverage for mod_h323.  It observes
- * the production module; it does not alter it.  Not one line of mod_h323.cpp,
- * mod_h323.h or h323.conf.xml is modified by this work.
+ * Subjects: the two module entry points, which are the complete entry-point set --
+ * SWITCH_MODULE_DEFINITION(mod_h323, mod_h323_load, mod_h323_shutdown, NULL) passes
+ * NULL as its runtime argument, so the module declares no switch_module_runtime --
+ * plus FSH323EndPoint::ReadConfig() and FSH323EndPoint::Initialise() driven directly.
  *
- * Subjects under test
- * -------------------
- * The two module entry points, which are the COMPLETE entry-point set for this
- * module: SWITCH_MODULE_DEFINITION(mod_h323, mod_h323_load, mod_h323_shutdown,
- * NULL) passes NULL as its fourth (runtime) argument, so mod_h323 declares no
- * switch_module_runtime entry point, and no case here can start one because
- * there is none to start.  Alongside those, the suite drives
- * FSH323EndPoint::ReadConfig() and FSH323EndPoint::Initialise() directly.
+ * ONE DEFINITION, ONE PRODUCTION COPY
+ * -----------------------------------
+ * The module translation unit is compiled into this one because a convenience library
+ * cannot link against it.  mod_h323.h declares FSH323_T38Capability::CreateChannel
+ * inside the class (mod_h323.h:568-572) but defines it at namespace scope
+ * (mod_h323.h:588-601) without `inline', so every translation unit including the
+ * header emits a strong definition, and Initialise() constructs
+ * FSH323_T38Capability, which always pulls in the archive member carrying the second
+ * one.  The header also instantiates H323_REGISTER_CAPABILITY nine times at namespace
+ * scope (mod_h323.h:620-628), so two translation units would register the same
+ * capability names into the global H323CapabilityFactory twice.  This program
+ * therefore has one source file, and the module must not also arrive through a
+ * convenience library or _LDADD: two live copies of `h323_process' and a
+ * doubly-populated capability factory would be a silent failure where the link error
+ * is a loud one.
  *
- * That statement is about FreeSWITCH's runtime entry point, and the H.323 TOOLKIT
- * would ordinarily start threads of its own on top of it: FSH323EndPoint::
- * Initialise() hands every configured listener to H323EndPoint::StartListener(),
- * an H323Listener IS a PThread (h323plus transports.h), and a listener that binds
- * successfully would leave a live toolkit thread behind for as long as the
- * endpoint owning it lives.  IN THIS SUITE IT DOES NOT HAPPEN AT ALL.  Both of
- * the toolkit entry points that would do it - StartListener() and
- * UseGatekeeper() - are retargeted onto local doubles by a preprocessor rewrite
- * installed immediately before the production translation unit is included and
- * withdrawn immediately after it, so the production call sites reach
- * fst_h323_start_listener() and fst_h323_use_gatekeeper() instead.  Those doubles
- * record the request, open no socket, adopt no listener object and start no
- * thread.  Consequently NO case in this suite binds a socket, NO case leaves a
- * toolkit listener thread behind, and NO case starts a gatekeeper RAS thread; the
- * two cases that do run the real Initialise() assert exactly that, by requiring
- * the endpoint's own H323ListenerList to be EMPTY afterwards.  The loopback
- * address and fixed high port that every injected configuration carries are
- * therefore defence in depth rather than the containment itself - they bound what
- * a regression in the rewrite could reach.  See NETWORK SIDE-EFFECT CONTAINMENT
- * and HERMETIC TOOLKIT INTERPOSITION below for the full argument.
- *
- * WHY THE PRODUCTION TRANSLATION UNIT IS INCLUDED (and not just the header)
- * ------------------------------------------------------------------------
- * The obvious shape for a C++ module test, and the one the tree's only
- * precedent uses (src/mod/codecs/mod_openh264/Makefile.am:12-21), is a
- * convenience library - noinst_LTLIBRARIES = libmodh323.la - linked in through
- * test_test_mod_h323_LDADD, with the suite including only "../mod_h323.h".
- * That arrangement was built for this module and then measured, and it DOES NOT
- * LINK.  Reproduced verbatim under g++ 12.5.0 with GNU ld 2.45:
- *
- *     /usr/bin/ld: ./.libs/libmodh323.a(libmodh323_la-mod_h323.o): in function
- *         `BaseG7231Capab::OnReceivedPDU(H245_AudioCapability const&,
- *          unsigned int&)':
- *     mod_h323.h:593: multiple definition of
- *         `FSH323_T38Capability::CreateChannel(H323Connection&,
- *          H323Channel::Directions, unsigned int,
- *          const H245_H2250LogicalChannelParameters*) const';
- *     test/test_mod_h323-test_mod_h323.o:mod_h323.h:593: first defined here
- *     collect2: error: ld returned 1 exit status
- *
- * The cause is in the header, not in this file: mod_h323.h declares
- * FSH323_T38Capability::CreateChannel inside the class (mod_h323.h:568-572)
- * but DEFINES it at namespace scope (mod_h323.h:588-601) without `inline`, so
- * every translation unit that includes the header emits a strong definition of
- * it.  FSH323EndPoint::Initialise() constructs FSH323_T38Capability
- * (mod_h323.cpp:426 and :429), so the archive member carrying the second
- * strong definition is always pulled in to satisfy the vtable.
- *
- * The sanctioned remedy is to compile the module source INTO the test
- * translation unit, which yields exactly one definition of that member and no
- * archive member to collide with.  It also removes a second, quieter hazard:
- * mod_h323.h instantiates H323_REGISTER_CAPABILITY nine times at namespace
- * scope (mod_h323.h:620-628), and two translation units would register the
- * same capability NAME STRINGS into the global H323CapabilityFactory twice,
- * making AddAllCapabilities() (mod_h323.cpp:404) add duplicates.  One
- * translation unit registers each name once.
- *
- * ==> ADOPTED BUILD CONTRACT - REQUIRED OF THE PARENT Makefile.am
- *     ------------------------------------------------------------
- *     White-box source inclusion is formally ADOPTED here, not tolerated as a
- *     workaround.  It is the AAP's own documented contingency for exactly this
- *     situation, and the trigger is named explicitly: white-box inclusion is
- *     "held as the documented contingency for a duplicate-symbol failure"
- *     (AAP 0.8.4 Correction 5), on which the suite "switches to white-box
- *     source inclusion ... and its convenience library declaration is dropped"
- *     (AAP 0.3.1), described there as "a local change to one Makefile.am and
- *     one #include line", with "the compile-twice convenience-library shape ...
- *     the documented fallback in either direction" (AAP 0.8.8 R2).  The link
- *     error quoted above IS that duplicate-symbol failure, so the contingency
- *     is live rather than hypothetical.
- *
- *     Every alternative is closed off by a rule this work may not break.
- *     Adding `inline` at mod_h323.h:588 would fix the collision at its root but
- *     is a production edit to a file listed under "Source that must not change"
- *     (AAP 0.2.2), barred by R2-1, whose minimum required production change is
- *     zero (AAP 0.8.1).  -Wl,--allow-multiple-definition only hides an ODR
- *     violation and is not portable.  Renaming the member is barred by exactly
- *     the same rule - it is another edit to the same frozen production header,
- *     and it would additionally change a public class's API for the convenience
- *     of a test - and it is unnecessary anyway, because compiling the module
- *     translation unit in removes the collision without touching the module.
- *
- *     The #include line is the `#include "../mod_h323.cpp"` below.  The
- *     Makefile.am change is a separate work boundary that this file must not
- *     edit, so the contract it has to satisfy is stated here as a REQUIREMENT
- *     rather than being left implicit:
- *
- *       R1. src/mod/endpoints/mod_h323/Makefile.am must NOT declare a
- *           convenience library for this module.  There must be no
- *           `noinst_LTLIBRARIES = libmodh323.la`.
- *       R2. libmodh323.la must NOT appear in test_test_mod_h323_LDADD, and
- *           neither mod_h323.cpp nor $(mod_h323_la_SOURCES) may appear in
- *           test_test_mod_h323_SOURCES.  The sole source of this program is
- *           test/test_mod_h323.cpp, which already carries the module.
- *
- *     Together R1 and R2 guarantee the property this architecture depends on:
- *     EXACTLY ONE production copy of mod_h323 is compiled into, and linked
- *     into, the test program.  Violating either requirement reintroduces the
- *     mod_h323.h:593 collision quoted above; and if a linker were ever
- *     persuaded to tolerate that collision, the result would be two live
- *     copies of the module's state - two `h323_process` objects and a
- *     doubly-populated H323CapabilityFactory - which is a worse failure than a
- *     link error because it is silent.
- *
- *     Everything else the production target carries must still be carried by
- *     the test target, because a binary built with different flags is not
- *     testing the same code: the openh323 include path, -DPTRACING=1,
- *     -D_REENTRANT, -fno-exceptions, -DP_64BIT under the 64-bit Linux
- *     conditional, the openh323/PTLib link flags
- *     (-L/usr/lib -lopenh323 -lpt -lrt), and
- *     $(switch_builddir)/libfreeswitch.la.
- *
- * WHAT THE INCLUSION IS AND IS NOT USED FOR
- * -----------------------------------------
- * Compiling the module translation unit in is a LINKING necessity, established
- * above.  It is deliberately NOT used as a licence to assert on the module's
- * internal state.  Single-translation-unit compilation does make the
- * header-static `h323_process` (mod_h323.h:630) and the .cpp-file static
- * `mod_h323_globals` (mod_h323.cpp:42) reachable from here, but no verdict in
- * this suite rests on either of them, because an assertion that depends on
- * internal linkage breaks on refactors that change nothing observable.
- *
- * Every case's verdict is instead taken from a public seam:
- *
- *   - FSH323EndPoint::ReadConfig()'s returned switch_status_t;
- *   - the public FSH323EndPoint::m_listeners list (mod_h323.h:270);
- *   - the public m_ai / m_pi / m_endpointname members (mod_h323.h:271-278);
- *   - protected members reached legitimately through the test-local subclass
- *     FSH323TestEndPoint, per rule R2-2 - no friend declaration, no
- *     de-staticising, no production edit;
- *   - PProcess::IsInitialised() and PProcess::Current(), PTLib's own public
- *     singleton interface, with the FSProcess handle recovered by the POINTER
- *     form of dynamic_cast so it returns NULL rather than throwing under
- *     -fno-exceptions;
- *   - FSProcess::GetH323EndPoint() (mod_h323.h:230-232) and
- *     FSH323EndPoint::GetSwitchInterface() (mod_h323.h:266-268);
- *   - the switch_loadable_module_interface_t the load function returns, and its
- *     endpoint_interface.
- *
- * Where a property exists only behind internal linkage - the four global
- * strings, the context and dialplan defaults - it is left unasserted and the
- * reason is recorded at the site, rather than reached for because it happens to
- * be visible.
+ * VERDICTS COME FROM PUBLIC SEAMS
+ * -------------------------------
+ * Single-translation-unit compilation makes the header-static `h323_process'
+ * (mod_h323.h:630) and the file-static `mod_h323_globals' (mod_h323.cpp:42)
+ * reachable, but no verdict rests on either, because an assertion on internal linkage
+ * breaks on refactors that change nothing observable.  Verdicts come from
+ * ReadConfig()'s returned switch_status_t, the public m_listeners list
+ * (mod_h323.h:270), the public m_ai and m_pi members (mod_h323.h:271-272), protected
+ * members reached through the test-local subclass FSH323TestEndPoint -- no friend
+ * declaration, nothing de-staticised -- PTLib's PProcess::IsInitialised() and
+ * PProcess::Current(), FSProcess::GetH323EndPoint(), GetSwitchInterface(), and the
+ * module interface the load function returns.
  *
  * BOOTSTRAP TIER
  * --------------
- * FST_CORE_BEGIN + FST_SUITE_BEGIN, never the module-loading bootstrap tier
- * (switch_test.h:346-364).  A real core is
- * mandatory because switch_xml_open_cfg() asserts MAIN_XML_ROOT != NULL
- * (src/switch_xml.c:2541), and FSH323EndPoint::ReadConfig() reaches it.
- * That tier is unusable here for two independent reasons: it dlopens the
- * module from <confdir>/../.libs/, which would load a second copy of code
- * already linked into this binary, and its matching end macro
- * (switch_test.h:379-387) performs an UNASSERTED unload - whereas this suite
- * must assert the shutdown status.  For
- * the same reason the teardown hook never unloads anything: the harness never
- * dlopens or dlcloses the module at all.
+ * FST_CORE_BEGIN + FST_SUITE_BEGIN.  A real core is mandatory because
+ * switch_xml_open_cfg() asserts MAIN_XML_ROOT != NULL and ReadConfig() reaches it.
+ * The module-loading tier (switch_test.h:346-364) is unusable: it dlopens the module
+ * from <confdir>/../.libs/, which would load a second copy of code already linked in,
+ * and its end macro unloads without asserting, whereas this suite asserts the
+ * shutdown status.  Nothing here ever dlopens or dlcloses.
  *
  * PProcess SINGLETON DISCIPLINE
  * -----------------------------
  * PTLib allows at most one live PProcess-derived object per process, and
  * H323EndPoint's constructor calls PProcess::Current().GetUserName()
- * (h323ep.cxx:713), which _exit(1)s the process when no PProcess exists.  A
- * single FSProcess is therefore shared by the cases that construct an endpoint
- * directly and released by the last of them, so two are never alive at once.
- * The reason it is SHARED rather than per-case is a measured, irreversible
- * PTLib property spelt out in full beside the ownership helpers below.
+ * (h323ep.cxx:713), which _exit(1)s when none exists.  A single FSProcess is
+ * therefore shared by the cases that construct an endpoint and released by the last
+ * of them; the irreversible PTLib property behind that is stated beside the ownership
+ * helpers below.
  *
  * NETWORK SIDE-EFFECT CONTAINMENT
  * -------------------------------
- * FSH323EndPoint::Initialise() starts a listener per configured address
- * (mod_h323.cpp:441-448) and, when the gatekeeper address is non-empty, a live
- * RAS registration thread (mod_h323.cpp:451-455).  Critically, an EMPTY
- * listener list makes it fall back to StartListener("") - a WILDCARD bind on
- * port 1720.
+ * Initialise() starts a listener per configured address (mod_h323.cpp:441-448) and,
+ * when gk-address is non-empty, a live RAS registration thread (mod_h323.cpp:451-455);
+ * an empty listener list makes it fall back to StartListener(""), a wildcard bind on
+ * port 1720.  Containment has three independent layers, so no single mistake leaks a
+ * socket:
  *
- * Containment is structural and has three independent layers, so that no single
- * mistake can leak a socket:
+ *   1. Both StartListener() overloads and UseGatekeeper() are retargeted onto
+ *      file-static doubles that record the request and perform no I/O.  Every case
+ *      that runs Initialise() then asserts the endpoint's listener list is empty.
+ *   2. Every injected document pins a listener to 127.0.0.1 on a fixed high port, so
+ *      the wildcard fallback is unreachable regardless; the shipped sample's
+ *      $${local_ip_v4} and port 1720 (h323.conf.xml:23-28) are reference values only.
+ *   3. No configuration with a non-empty gk-address ever reaches Initialise().
+ *      StartGkClient()'s early return clears m_stop_gk but leaves m_thread pointing at
+ *      a self-deleted thread, and ~FSH323EndPoint -> StopGkClient() then spins forever
+ *      waiting on it (mod_h323.cpp:671-674 against :693-701).  The LAN-search case
+ *      drives StartGkClient() directly, reaching the same decision with no thread.
  *
- *   1. THE TOOLKIT ENTRY POINTS ARE INTERPOSED.  Both StartListener() overloads
- *      and UseGatekeeper() are retargeted onto file-static doubles that record
- *      the request and perform no I/O - see the interposition block above the
- *      subject include.  NO PORT IS EVER BOUND by this suite, on any path, and
- *      every case that runs Initialise() asserts the endpoint's own listener
- *      list is empty afterwards as the positive proof of it.
- *   2. EVERY INJECTED DOCUMENT DECLARES A LISTENER, pinned to 127.0.0.1 on a
- *      fixed high port, so the wildcard fallback is unreachable regardless.  The
- *      shipped sample's $${local_ip_v4} and port 1720 (h323.conf.xml:23-28) are
- *      reference values only and are never used as-is.  Each case additionally
- *      asserts that the default-interface overload was not the one invoked.
- *   3. NO CONFIGURATION WITH A NON-EMPTY gk-address EVER REACHES Initialise().
- *      That is not merely about RAS traffic: StartGkClient()'s early return
- *      clears m_stop_gk but leaves m_thread pointing at a self-deleted thread,
- *      and ~FSH323EndPoint -> StopGkClient() then spins forever waiting on it
- *      (mod_h323.cpp:670-673 against :693-701).  The LAN-search case therefore
- *      drives StartGkClient() directly instead, which reaches the same decision
- *      with no thread at all; its case comment carries the full derivation.
- *
- * No case performs third-party network I/O, opens a random port, binds any port,
- * or depends on wall-clock time.
+ * No case performs third-party network I/O, opens a random port, binds any port, or
+ * depends on wall-clock time.
  *
  * RESOURCE RECLAMATION
  * --------------------
- * The run is balanced, because CI configures the address sanitizer with leak
- * detection live and a leak there is a build failure rather than a test failure.
- * Three things need reclaiming and each is anchored where it is unconditionally
- * correct.  The unstarted H323ListenerTCP objects ReadConfig() produced are owned
- * by the FSListener records in the public FSH323EndPoint::m_listeners list and are
- * freed from there - the StartListener() double deliberately adopts nothing, so
- * there is one owner and one release path whether a case reached Initialise() or
- * stopped at ReadConfig().  The root pool FSH323EndPoint::ReadConfig() allocates
- * and abandons (mod_h323.cpp:469) is captured by a preprocessor seam scoped to the
- * module translation unit and released from the per-case teardown - see the
- * ROOT-POOL RECORDING SEAM below, including why that is a seam and not a
- * production edit.  And the module's own retained state - provider registration,
- * PProcess, module-lifetime pool - is handed forward deliberately from case to
- * case and swept by the last declared case, see fst_h323_suite_state_cleanup().
+ * CI configures the address sanitizer with leak detection live, so a leak is a build
+ * failure.  The unstarted H323ListenerTCP objects ReadConfig() produces are owned by
+ * the FSListener records in m_listeners and freed from there -- the StartListener()
+ * double adopts nothing, so there is one owner and one release path whether a case
+ * reached Initialise() or stopped at ReadConfig().  The root pool ReadConfig()
+ * allocates and abandons (mod_h323.cpp:469) is captured by a preprocessor seam scoped
+ * to the module translation unit and released from the per-case teardown.  The
+ * module's retained state -- provider registration, PProcess, module-lifetime pool --
+ * is handed forward from case to case and swept by the last declared case, see
+ * fst_h323_suite_state_cleanup().
  */
 
 #include <switch.h>
 #include <test/switch_test.h>
 
 /*
- * ---------------------------------------------------------------------------
  * HERMETIC TOOLKIT INTERPOSITION
- * ---------------------------------------------------------------------------
+ * ------------------------------
+ * Three production decisions can only be observed by EXECUTING them, and each
+ * reaches the H.323 toolkit when it runs: Initialise() hands every configured
+ * listener to StartListener(), which opens a TCP socket and takes ownership on
+ * success (h323ep.h:519-545); Initialise() resumes a live FSGkRegThread whenever
+ * gk-address is non-empty; and StartGkClient() asks the toolkit to register with, or
+ * search the LAN for, a gatekeeper through UseGatekeeper(), which is live RAS
+ * signalling.  Asserting those decisions from stored configuration alone would prove
+ * only that ReadConfig() copied a string.  Interposing the two toolkit entry points
+ * lets the decisions run for real while nothing leaves the process.
  *
- * WHY THIS EXISTS
- * ---------------
- * Three production decisions can only be observed by EXECUTING them, and all
- * three reach out to the H.323 toolkit when they run:
+ * Neither H323EndPoint::StartListener nor H323EndPoint::UseGatekeeper is virtual
+ * (h323ep.h:532, :547 and :354), so a subclass cannot override either; rewriting the
+ * call sites is the only seam available.  It is applied here, immediately before the
+ * subject include, and nowhere else in this file.
  *
- *   - Initialise() hands every configured listener to StartListener()
- *     (mod_h323.cpp:441-448), which OPENS A TCP SOCKET on the configured
- *     address and port and takes ownership of the object on success
- *     (h323ep.h:519-545);
- *   - Initialise() constructs and resumes a live FSGkRegThread whenever
- *     gk-address is non-empty (mod_h323.cpp:451-455);
- *   - StartGkClient() asks the toolkit to register with, or search the LAN
- *     for, a gatekeeper through UseGatekeeper() (mod_h323.cpp:663), which is
- *     live RAS signalling.
+ * The rewrite is confined by construction.  Exactly one header in this translation
+ * unit's include set names either token -- the toolkit's own h323ep.h -- and the
+ * <ptlib.h> / <h323.h> pre-include below pulls it in behind its include guard BEFORE
+ * either macro exists.  mod_h323.h names neither token, so the only text the macros
+ * can reach is mod_h323.cpp's own call sites.  The pre-include reproduces
+ * mod_h323.h's visibility bracket (mod_h323.h:38-40 and :55-57) so the toolkit's
+ * declarations are seen with the visibility the production build sees them with.
  *
- * Asserting those decisions from stored configuration alone proves only that
- * ReadConfig() copied a string.  Executing them against the real toolkit binds
- * ports this process does not own and performs network I/O, which makes the
- * suite non-hermetic and port-collision-prone.  Interposing the two toolkit
- * entry points removes both problems at once: the decisions run for real, and
- * nothing leaves the process.
- *
- * WHY MACRO REWRITING IS THE ONLY AVAILABLE SEAM
- * ----------------------------------------------
- * Neither H323EndPoint::StartListener nor H323EndPoint::UseGatekeeper is
- * virtual (h323ep.h:532, :547 and :354), so a subclass cannot override either
- * and the existing FSH323TestEndPoint cannot help.  Rewriting the CALL SITES
- * is therefore the only seam available, and it is applied here - immediately
- * before the subject is included, and nowhere else in this file.
- *
- * WHY THIS IS SAFE
- * ----------------
- * The rewrite is confined by construction.  Exactly ONE header in this
- * translation unit's include set names either token - the toolkit's own
- * /usr/include/openh323/h323ep.h - and it is pulled in, in full and behind its
- * include guard, by the <ptlib.h> and <h323.h> pre-include below, BEFORE either
- * macro exists.  mod_h323.h names neither token.  The only text the macros can
- * therefore reach is mod_h323.cpp's own call sites, which is exactly the intent.
- *
- * The pre-include reproduces mod_h323.h's visibility bracket verbatim
- * (mod_h323.h:38-40 and :55-57), so the toolkit's declarations are seen with
- * the same visibility the production build sees them with.  The result was
- * verified at the symbol level: the three undefined toolkit references carried
- * by the module's own object file - H323EndPoint::StartListener(H323Listener*),
- * H323EndPoint::StartListener(H323TransportAddress const&) and
- * H323EndPoint::UseGatekeeper(PString const&, PString const&, PString const&) -
- * are absent from this suite's object, and nothing else changed.
- *
- * NO PRODUCTION LINE IS MODIFIED.  mod_h323.cpp and mod_h323.h are compiled
- * from byte-identical text with the module target's own flags; only this file's
- * preprocessor state differs.
+ * mod_h323.cpp and mod_h323.h are compiled from byte-identical text with the module
+ * target's own flags; only this file's preprocessor state differs.
  */
 #if defined(__GNUC__) && defined(HAVE_VISIBILITY)
 #pragma GCC visibility push(default)
@@ -353,26 +183,21 @@
  * hard requirement rather than a stylistic choice.
  */
 typedef struct {
-	/* UseGatekeeper (mod_h323.cpp:663) */
 	int gk_calls;
 	char gk_address[FST_H323_ADDRESS_MAX];
 	char gk_identifier[FST_H323_ADDRESS_MAX];
 	char gk_interface[FST_H323_ADDRESS_MAX];
 
-	/* StartListener(H323Listener *) - the per-record overload, mod_h323.cpp:446 */
 	int listener_calls;
 	int listener_nulls;
 	char listener_address[FST_H323_MAX_OBSERVED_LISTENERS][FST_H323_ADDRESS_MAX];
 
-	/* StartListener(const H323TransportAddress &) - the empty-list fallback,
-	 * mod_h323.cpp:442 */
 	int listener_default_calls;
 	char listener_default_address[FST_H323_ADDRESS_MAX];
 } fst_h323_toolkit_t;
 
 static fst_h323_toolkit_t fst_h323_toolkit;
 
-/* Called from per-case setup, so every case observes only its own calls */
 static void fst_h323_toolkit_reset(void)
 {
 	memset(&fst_h323_toolkit, 0, sizeof(fst_h323_toolkit));
@@ -390,19 +215,14 @@ static void fst_h323_record_string(char *dst, switch_size_t size, const PString 
 }
 
 /*
- * UseGatekeeper double.  Records the request and reports FAILURE.
- *
- * FALSE is the only safe answer, and the reason is production code rather than
- * preference: once the retry loop exits normally StartGkClient() dereferences
- * GetGatekeeper() unconditionally (mod_h323.cpp:684-685), and this double
- * registers nothing, so GetGatekeeper() is NULL and TRUE would segfault.  FALSE
- * enters the loop, whose FIRST m_stop_gk check returns cleanly
- * (mod_h323.cpp:670-673) - before any h_timer() sleep, before
- * RemoveGatekeeper(), and before that dereference.  The LAN-search case arms
- * m_stop_gk for precisely that reason.
- *
- * The default arguments reproduce the declaration at h323ep.h:354-358 so that
- * every call shape the production code is allowed to use still compiles.
+ * UseGatekeeper double.  Records the request and reports FAILURE, which is the only
+ * safe answer: once the retry loop exits normally StartGkClient() dereferences
+ * GetGatekeeper() unconditionally (mod_h323.cpp:684-685), and this double registers
+ * nothing, so GetGatekeeper() is NULL and TRUE would segfault.  FALSE enters the
+ * loop, whose first m_stop_gk check returns cleanly (mod_h323.cpp:671-674) -- before
+ * any h_timer() sleep, before RemoveGatekeeper(), and before that dereference.  The
+ * default arguments reproduce h323ep.h:354-358 so every call shape the production
+ * code may use still compiles.
  */
 static PBoolean fst_h323_use_gatekeeper(const PString & address, const PString & identifier = PString::Empty(),
 										const PString & localAddress = PString::Empty())
@@ -417,29 +237,20 @@ static PBoolean fst_h323_use_gatekeeper(const PString & address, const PString &
 }
 
 /*
- * StartListener(H323Listener *) double - the overload Initialise() uses for
- * every configured listener (mod_h323.cpp:446).
+ * StartListener(H323Listener *) double - the overload Initialise() uses for every
+ * configured listener.  Records the transport address, opens nothing, and reports
+ * success so production's success path is the one under test.
  *
- * Records the transport address the production code asked to listen on, opens
- * NOTHING, and reports success so that production's success path is the one
- * under test.
- *
- * OWNERSHIP, which is the whole reason this double is worth its comment.  The
- * real overload ADOPTS the object when it returns TRUE (h323ep.h:519-531), by
- * putting it in the endpoint's H323ListenerList.  This double deliberately does
- * not, because adopting it would mean handing it to the very toolkit this seam
- * exists to keep out of the test.  Ownership therefore stays exactly where
- * ReadConfig() put it - in the FSListener record inside
- * FSH323EndPoint::m_listeners (mod_h323.h:270) - which is public, is the single
- * canonical record of every listener the configuration produced, and is where
- * fst_h323_release_listeners() drains it from.  That keeps the ownership rule
- * UNIFORM for every case in this suite, whether it reaches Initialise() or
- * stops at ReadConfig(), and makes a double free structurally impossible:
- * there is one owner and one release path.
- *
- * The endpoint's own listener list staying empty is not a footnote, it is the
- * assertion that proves no socket was ever bound - every case that runs
- * Initialise() checks GetListeners().GetSize() (h323ep.h:2027) is zero.
+ * OWNERSHIP.  The real overload ADOPTS the object when it returns TRUE
+ * (h323ep.h:519-531) by putting it in the endpoint's H323ListenerList.  This double
+ * does not, because adopting it would hand it to the toolkit this seam exists to keep
+ * out.  Ownership therefore stays where ReadConfig() put it -- in the FSListener
+ * record inside the public FSH323EndPoint::m_listeners (mod_h323.h:270), which
+ * fst_h323_release_listeners() drains.  One owner and one release path, uniform
+ * whether a case reaches Initialise() or stops at ReadConfig(), makes a double free
+ * structurally impossible.  The endpoint's own listener list staying empty is the
+ * assertion that proves no socket was bound: every case running Initialise() checks
+ * GetListeners().GetSize() (h323ep.h:2027) is zero.
  */
 static PBoolean fst_h323_start_listener(H323Listener * listener)
 {
@@ -461,14 +272,12 @@ static PBoolean fst_h323_start_listener(H323Listener * listener)
 }
 
 /*
- * StartListener(const H323TransportAddress &) double - the DEFAULT-INTERFACE
+ * StartListener(const H323TransportAddress &) double - the default-interface
  * fallback, taken only when the configuration declares no listener at all
- * (mod_h323.cpp:441-443, which passes "" and so would listen on 0.0.0.0:1720).
- *
- * Every document this suite injects declares at least one listener, so this
- * overload must never be reached, and every Initialise() case asserts exactly
- * that.  It is nonetheless required for the suite to compile: the macro rewrite
- * below retargets BOTH call sites, so both overloads must exist.
+ * (mod_h323.cpp:441-443 passes "", which would listen on 0.0.0.0:1720).  Every
+ * document this suite injects declares a listener, so this overload must never be
+ * reached and every Initialise() case asserts that; it exists because the macro
+ * rewrite retargets both call sites, so both overloads must be defined.
  */
 static PBoolean fst_h323_start_listener(const H323TransportAddress & iface)
 {
@@ -479,44 +288,27 @@ static PBoolean fst_h323_start_listener(const H323TransportAddress & iface)
 }
 
 /*
- * ---------------------------------------------------------------------------
  * ROOT-POOL RECORDING SEAM
- * ---------------------------------------------------------------------------
+ * ------------------------
  * FSH323EndPoint::ReadConfig() opens with an unconditional
- * `switch_core_new_memory_pool(&pool)` (mod_h323.cpp:469) and then never uses
- * the result: `pool` is a local, no pointer derived from it is stored anywhere,
- * and no destroy call exists on any of the function's exit paths.  It is the
- * only pool allocation in the whole translation unit.  Every case that reads
- * configuration - directly or through the module load - therefore strands one
- * independent, parentless root pool, and CI configures the address sanitizer
- * with leak detection live, so a suite that exercised those paths repeatedly
- * would not be sanitizer-clean.
+ * `switch_core_new_memory_pool(&pool)` (mod_h323.cpp:469) and never uses the result:
+ * `pool` is a local, no pointer derived from it is stored, and no exit path destroys
+ * it.  Every case that reads configuration therefore strands one parentless root
+ * pool, and CI runs the address sanitizer with leak detection live.
  *
- * WHY A SEAM RATHER THAN A PRODUCTION EDIT
- * ----------------------------------------
- * The AAP freezes mod_h323.cpp (rule R2-1: zero production translation units
- * are edited) and permits a production change only as a last resort, for the
- * minimum strictly required for testability (0.8.1, directive 4).  Here it is
- * not required at all, because this suite already compiles the production
- * translation unit into itself and switch_core_new_memory_pool() is a MACRO
- * (switch_core.h:633) rather than a function - so the allocation is
- * interceptable at the preprocessor, with no edit to the module and no change
- * to its symbol surface.  The interception is bounded to exactly the region
- * that needs it: defined just above the module include, restored
- * immediately after it, so nothing outside mod_h323.cpp is affected - including
- * this file's own module-lifetime pool below, which must keep the real
- * allocator because a different owner destroys it.
+ * The allocation is interceptable at the preprocessor because
+ * switch_core_new_memory_pool() is a macro (switch_core.h:633), so no edit to the
+ * module and no change to its symbol surface is needed.  The interception is bounded
+ * to the region that needs it: defined just above the module include and restored
+ * immediately after it, so nothing outside mod_h323.cpp is affected -- including this
+ * file's own module-lifetime pool below, which must keep the real allocator because a
+ * different owner destroys it.
  *
- * WHY DESTROYING THE RECORDED POOLS IS SAFE
- * -----------------------------------------
- * Because nothing escapes.  `pool` is written once, tested once, and never read
- * again; no switch_core_alloc(), no switch_core_strdup() and no subpool is
- * taken from it anywhere in mod_h323.cpp.  Destroying it after the call has
- * returned therefore cannot invalidate any live reference, and the recorded
- * pointer is the only remaining reference in the process.  This is the test
- * cleaning up an allocation the code under test abandoned - not a substitute
- * for a production fix, and not a suppression: the pool really is released, so
- * the sanitizer sees a balanced process.
+ * Destroying the recorded pools is safe because nothing escapes them: `pool` is
+ * written once, tested once and never read again, and no switch_core_alloc(),
+ * switch_core_strdup() or subpool is taken from it anywhere in mod_h323.cpp.  The
+ * recorded pointer is the only remaining reference in the process, so releasing it
+ * after the call returns cannot invalidate a live reference.
  */
 #define FST_H323_MAX_RECORDED_POOLS 64
 
@@ -578,7 +370,6 @@ static int fst_h323_release_recorded_pools(void)
 	return released;
 }
 
-/* The interception, scoped to the module translation unit and nothing else. */
 #undef switch_core_new_memory_pool
 #define switch_core_new_memory_pool(p) fst_h323_record_pool(p, __FILE__, __SWITCH_FUNC__, __LINE__)
 
@@ -694,7 +485,7 @@ class FSH323TestEndPoint:public FSH323EndPoint {
 	}
 
 	/* m_stop_gk is the flag StartGkClient() tests to abandon its retry loop
-	 * (mod_h323.cpp:670-673 and :675-678).  The LAN-search case ARMS it before
+	 * (mod_h323.cpp:671-674 and :677-680).  The LAN-search case ARMS it before
 	 * calling StartGkClient() directly and then asserts that production
 	 * CONSUMED it - production clears it on the way out - which is the
 	 * observable proving the early-return path was the one taken. */
@@ -728,20 +519,15 @@ class FSH323TestEndPoint:public FSH323EndPoint {
 /*
  * Loopback-only, high-unprivileged listener ports.
  *
- * NOT ONE OF THESE PORTS IS EVER BOUND, and that is a structural property of
- * this suite rather than an incidental one.  ReadConfig() constructs an
- * H323ListenerTCP but does not open it (mod_h323.cpp:583); only
- * StartListener() opens a socket, and every StartListener() call site is
- * retargeted onto fst_h323_start_listener(), which records the requested
- * address and opens nothing.  The suite therefore cannot collide with another
- * process, with a parallel copy of itself, or with a service that happens to
- * hold one of these numbers - and the Initialise() cases assert the endpoint's
- * own listener list is empty afterwards, which is the positive proof of it.
+ * None of these ports is ever bound: ReadConfig() constructs an H323ListenerTCP
+ * without opening it (mod_h323.cpp:583), and every StartListener() call site is
+ * retargeted onto fst_h323_start_listener(), which records the requested address and
+ * opens nothing.  The suite therefore cannot collide with another process, with a
+ * parallel copy of itself, or with a service holding one of these numbers.
  *
- * They remain FIXED and DISTINCT rather than random because each one is now
- * pure test data: a distinct value per document lets each case assert that the
- * address production asked to listen on is the one ITS document configured, and
- * never another case's.
+ * They are fixed and distinct rather than random because a distinct value per
+ * document lets each case assert that the address production asked to listen on is
+ * the one ITS document configured and never another case's.
  */
 #define FST_H323_PORT_CODEC_PREFS   "21721"
 #define FST_H323_PORT_MODULE_LOAD   "21722"
@@ -1097,122 +883,78 @@ static int fst_h323_name_position(const char *haystack, const char *needle)
 }
 
 /*
- * ---------------------------------------------------------------------------
  * PTLib PROCESS OWNERSHIP
- * ---------------------------------------------------------------------------
- *
- * PTLib permits at most ONE live PProcess-derived object per process, and
+ * -----------------------
+ * PTLib permits at most one live PProcess-derived object per process, and
  * H323EndPoint's constructor calls PProcess::Current().GetUserName()
- * (h323ep.cxx:713) - which prints "Catastrophic failure" and _exit(1)s when no
- * PProcess exists.  So every case that constructs an endpoint needs exactly one
- * live PProcess, and never two.
+ * (h323ep.cxx:713), which prints "Catastrophic failure" and _exit(1)s when none
+ * exists.  Every case that constructs an endpoint therefore needs exactly one live
+ * PProcess and never two.
  *
- * That alone would allow each case to own a private FSProcess.  A second,
- * measured property of PTLib rules that out:
+ * A per-case FSProcess is ruled out by a second PTLib property: PProcess::~PProcess()
+ * runs PostShutdown() (osutils.cxx:1646-1654), which calls DestroySingletons() on
+ * every PFactory and irreversibly empties both the OpalMediaFormat registry and the
+ * H323CapabilityFactory key list.  They are never repopulated, because the objects
+ * that register them are static and their constructors ran at program start.
+ * AddAllCapabilities() (mod_h323.cpp:404) enumerates that factory and validates each
+ * match against the media-format registry, so once any PProcess has been destroyed no
+ * audio capability can be added again -- and whichever case ran second would observe a
+ * hollowed-out module through no fault of the module.
  *
- *   PProcess::~PProcess() runs PostShutdown() (osutils.cxx:1646-1654), which
- *   calls DestroySingletons() on EVERY PFactory.  That IRREVERSIBLY empties
- *   both the OpalMediaFormat registry and the H323CapabilityFactory key list -
- *   measured going from 15 media formats and 11 capability keys down to 0 and
- *   0, and they are never repopulated, because the objects that register them
- *   are static and their constructors ran once at program start.
+ * So exactly one PProcess-derived object exists in this process for the whole run, and
+ * it is the one the MODULE creates: the module-load case constructs that FSProcess
+ * (mod_h323.cpp:167) while both registries are still populated, every later case
+ * adopts it through PTLib's public singleton accessor, and the last declared case
+ * shuts the module down, which is the only thing that destroys it.
  *
- * The consequence is decisive for every case that builds a capability table.
- * AddAllCapabilities() (mod_h323.cpp:404) enumerates that factory and validates
- * each match against the media-format registry, so once ANY PProcess has been
- * destroyed no audio capability can ever be added again - by a directly
- * constructed endpoint or by the module's own.  A per-case FSProcess, or any
- * arrangement that destroys one process and then creates another, therefore
- * leaves whichever case runs second observing a hollowed-out module: not
- * because mod_h323 is wrong, but because the harness had already burnt down the
- * registry underneath it.
+ * The configuration-absent branch cannot fit inside that arrangement -- it must be
+ * declared first and still needs a PProcess to construct an endpoint against -- so it
+ * runs in a separately exec'd helper process, whose PProcess is not a second live one
+ * here and whose destruction empties no factory here.  See
+ * fst_h323_run_readconfig_isolated().
  *
- * THE ISOLATION STRATEGY, STATED EXACTLY
- * --------------------------------------
- * Exactly ONE PProcess-derived object exists in THIS process for the whole run,
- * and it is the one the MODULE creates.  The module-load case loads the module,
- * which constructs that FSProcess (mod_h323.cpp:167) while both registries are
- * still fully populated; every later case ADOPTS it through PTLib's public
- * singleton accessor instead of constructing a second; and the last declared
- * case shuts the module down, which is the only thing that destroys it.  So no
- * PProcess is destroyed until every assertion has been made, the factories are
- * populated for the entire run, the one-live-PProcess invariant holds at every
- * instant, and the module is observed fully initialised rather than degraded.
- *
- * The one case that cannot fit inside that arrangement is the
- * configuration-absent branch, which must be declared first AND must have a
- * PProcess to construct an endpoint against.  It is given an address space of
- * its own instead of a share of this one: it runs in a separately exec'd helper
- * process, so the process it brings up is not a second live PProcess here and
- * its destruction empties no factory here.  The invariant above is therefore stated per process
- * and holds exactly as written.  See fst_h323_run_readconfig_isolated().
- *
- * The harness therefore normally owns no process at all.  fst_h323_process
- * below stays NULL for the whole of a healthy run and exists only as the
- * fallback for a run in which the module load did not happen - so that the
- * direct-object cases still have a process to work against and report their own
- * verdicts instead of collapsing.  Ownership is unambiguous either way: the
- * release helper frees only a process this file created, never the module's.
+ * The harness therefore normally owns no process at all: fst_h323_process stays NULL
+ * for a healthy run and exists only as the fallback for a run in which the module load
+ * did not happen, so the direct-object cases still have a process to work against.
+ * The release helper frees only a process this file created, never the module's.
  */
 static FSProcess *fst_h323_process = NULL;
 
 /*
- * ---------------------------------------------------------------------------
  * PLUGIN-SEARCH-PATH CONTAINMENT
- * ---------------------------------------------------------------------------
+ * ------------------------------
+ * PTLib resolves its plugin directory from the environment before falling back to the
+ * P_DEFAULT_PLUGIN_DIR compiled into libpt: PPluginManager honours PTLIBPLUGINDIR and,
+ * for backward compatibility, the older PWLIBPLUGINDIR.  Whichever it settles on it
+ * enumerates recursively and dlopen()s every matching shared object, running each one's
+ * initialisers, as a side effect of bringing a PProcess up -- before any test code gets
+ * a say.
  *
- * PTLib resolves its plugin directory from the environment before falling back
- * to the P_DEFAULT_PLUGIN_DIR compiled into libpt: PPluginManager honours
- * PTLIBPLUGINDIR and, for backward compatibility, the older PWLIBPLUGINDIR.
- * Whichever it settles on it then ENUMERATES RECURSIVELY and dlopen()s every
- * shared object that matches, running each one's initialisers, before any test
- * code gets a say.  That happens as a side effect of bringing a PProcess up, so
- * the first PProcess this run creates - the module's, in a healthy run - is the
- * moment of exposure.
+ * mod_h323 never touches either variable, so a suite that let a process come up would
+ * inherit whatever the invoking environment said and execute code from it.  A test
+ * binary is run by `make check' out of an environment nobody audits, which makes an
+ * inherited search path an arbitrary-code-execution seam (CWE-427, CWE-829).  Both
+ * variables are therefore pinned, unconditionally and before the first PProcess, to a
+ * fixed directory that does not exist; "/no/thanks" is the same value the sibling
+ * production module uses.
  *
- * Neither variable is sanitised for us.  mod_h323 never touches them - unlike
- * mod_opal, which sets PTLIBPLUGINDIR in its load function (mod_opal.cpp:108) -
- * so a suite that simply let a process come up would inherit whatever the
- * invoking environment happened to say and execute code from it.  A test binary
- * is run by `make check' out of an environment nobody audits, which makes an
- * inherited search path an arbitrary-code-execution seam (CWE-427, CWE-829).
+ * setenv() rather than putenv() because setenv() copies both name and value into
+ * storage the C library owns, whereas putenv() retains the caller's buffer -- which
+ * makes the common `putenv((char *) "NAME=value")` idiom leave a mutable pointer into
+ * read-only memory in the environment, and any write through it undefined behaviour.
+ * The overwrite flag is 1 because the point is to replace what the environment said,
+ * not to default an unset variable.
  *
- * So both variables are pinned, unconditionally and before the first PProcess,
- * to a fixed directory that does not exist.  Nothing can be enumerated in a
- * directory that is not there, and "/no/thanks" is deliberately the same value
- * the sibling production module already uses, so harness and module agree.
+ * The pin is applied in two places: the suite setup hook, which FCTX runs before every
+ * case body, and the acquire helper below, the only place in this file that constructs
+ * a PProcess.  Either alone would do today; both means no re-ordering and no new case
+ * can reintroduce the exposure, and it is idempotent.
  *
- * WHY setenv() AND NOT putenv()
- * ----------------------------
- * setenv() COPIES both the name and the value into storage the C library owns,
- * so nothing of ours is retained by the environment.  putenv() does the
- * opposite: it retains the caller's buffer, which makes it correct only with a
- * writable object of static storage duration and makes the common
- * `putenv((char *) "NAME=value")` idiom a const-correctness violation - the
- * environment then holds a mutable pointer into read-only memory, and anything
- * that writes through it, including a later putenv() of the same name in another
- * library, is undefined behaviour.  setenv() removes the hazard rather than
- * arguing it is unreachable, and it needs no cast at all.
- *
- * The overwrite flag is 1 because the point is to REPLACE whatever the invoking
- * environment said, not to supply a default for an unset variable.
- *
- * It is wired in two places on purpose: the suite setup hook, which FCTX runs
- * before every case body, and the acquire helper below, which is the only place
- * in this file that constructs a PProcess.  Either alone would be sufficient
- * today; having both means no future re-ordering and no new case can
- * reintroduce the exposure.  It is idempotent, so paying for it twice costs
- * nothing.
- *
- * NOTHING ABOUT THE PIN IS CACHED, AND THAT IS THE POINT.  setenv() can fail -
- * it returns -1 and sets errno on an allocation failure or an invalid name - so
- * a helper that assumed success and remembered it would report containment that
- * does not exist, and every assertion built on that memory would pass while the
- * process came up against an attacker-supplied search path.  The pin is
- * therefore re-applied and RE-VERIFIED BY READBACK on every call, and the
- * verdict is derived from the environment as it is at that instant rather than
- * from a flag.  Two setenv() calls and two getenv()/strcmp() pairs are far too
- * cheap for the saving to be worth the failure mode.
+ * Nothing about the pin is cached.  setenv() can fail -- it returns -1 on an allocation
+ * failure or an invalid name -- so a helper that assumed success and remembered it
+ * would report containment that does not exist.  The pin is re-applied and re-verified
+ * by readback on every call, and the verdict is derived from the environment as it is
+ * at that instant rather than from a flag.
  */
 #define FST_H323_PLUGIN_DIR "/no/thanks"
 
@@ -1312,128 +1054,79 @@ static void fst_h323_process_release(void)
 }
 
 /*
- * ---------------------------------------------------------------------------
  * PROCESS-ISOLATED EXECUTION, FOR THE CONFIGURATION-ABSENT CASE ONLY
- * ---------------------------------------------------------------------------
+ * -----------------------------------------------------------------
+ * Two requirements collide inside one address space.  The configuration-absent failure
+ * branch must be the first declared case, so its verdict cannot be an artefact of what
+ * ran earlier; and its subject, FSH323EndPoint::ReadConfig(), needs a live PProcess,
+ * because H323EndPoint's constructor calls PProcess::Current(), which terminates the
+ * binary outright on an uninitialised process.  Yet PProcess::~PProcess() runs
+ * PostShutdown(), which calls DestroySingletons() on every PFactory and irreversibly
+ * empties the OpalMediaFormat registry and the H323CapabilityFactory key list, so once
+ * any PProcess here has been destroyed no later load can add an audio capability --
+ * while leaving a harness-owned PProcess alive instead would make the module's own
+ * unconditional `h323_process = new FSProcess()' (mod_h323.cpp:167) a second live
+ * PProcess, which PTLib does not permit.  Running that one branch in a separate process
+ * image dissolves the collision: the helper brings up its own PProcess and exits, and
+ * the parent's first and only PProcess is still the module's.
  *
- * WHY A SEPARATE PROCESS IS NECESSARY, AND NOT MERELY CONVENIENT
- * -------------------------------------------------------------
- * Two requirements collide inside one address space, and no ordering of cases
- * inside a single process satisfies both.
+ * fork() IMMEDIATELY FOLLOWED BY exec()
+ * ------------------------------------
+ * By the time any case body runs the core is up and this process is multi-threaded.
+ * fork() duplicates the address space into a child with one thread, and every lock
+ * another thread held at that instant is duplicated held with no owner to release it --
+ * including the core's log queue, the pool allocator and PTLib's mutexes, all of which
+ * the body needs.  POSIX permits only async-signal-safe functions between fork() and
+ * exec in a multi-threaded process, and allocating, logging, parsing XML or
+ * constructing a C++ object is none of them.
  *
- *   (a) The configuration-absent failure branch must be the FIRST declared
- *       case, so it runs before any successful load has left module state
- *       behind and its verdict cannot be an artefact of what ran earlier.
+ * The forked image therefore does nothing but exec.  The block holds four call sites
+ * and no others, every one async-signal-safe: dup2(), alarm() and execve() on the path
+ * that works, and _exit() where execve fails.  The descriptor dup2() redirects onto
+ * standard output was opened by the parent before the fork, so the child needs no
+ * open().  Everything execve() needs -- path, argv, envp, the handshake pipe and its
+ * token -- is built in the parent for the same reason, and the parent releases that
+ * plan on every path including immediately after a successful fork, because the child
+ * has its own copy.  execve() then replaces the address space wholesale, discarding
+ * every inherited lock, thread state and stdio buffer.
  *
- *   (b) The subject of that branch is FSH323EndPoint::ReadConfig(), and an
- *       FSH323EndPoint cannot exist without a live PProcess: H323EndPoint's
- *       constructor calls PProcess::Current(), which on an uninitialised
- *       process prints "Catastrophic failure" and terminates the binary
- *       outright.  So the case must bring a PProcess up.
+ * HELPER SELECTION AND PROVENANCE
+ * -------------------------------
+ * The image exec'd is this same binary, re-entered from main().  Helper mode is
+ * selected by an environment marker rather than an extra argv entry, because FCTX's
+ * command-line parser reads a bare positional argument as a test-name filter and exits
+ * on an unrecognised option (switch_fct.h fctkern__cl_parse), so argv is not ours to
+ * extend.
  *
- * The collision is that PProcess::~PProcess() runs PostShutdown(), which calls
- * DestroySingletons() on every PFactory and IRREVERSIBLY empties both the
- * OpalMediaFormat registry and the H323CapabilityFactory key list.  They are
- * never repopulated.  FSH323EndPoint::AddAllCapabilities() (mod_h323.cpp:404)
- * enumerates that factory, so once ANY PProcess in the process has been
- * destroyed, no later load can add a single audio capability - and the module
- * load case's capability assertions would then be measuring the harness's own
- * ordering rather than mod_h323.  A harness-owned PProcess in the parent could
- * be left alive instead of destroyed, but then the module's own unconditional
- * `h323_process = new FSProcess()` (mod_h323.cpp:167) would be the second live
- * PProcess, which PTLib does not permit.
+ * The marker alone cannot dispatch the helper body.  An environment variable is a
+ * public channel anything in this process's ancestry can set and that persists into
+ * every descendant, and helper mode _exit()s from inside the first declared case -- so
+ * a top-level run that believed a stale marker would run one case, exit with that
+ * case's status, and be recorded as a clean pass with the later cases never run.  The
+ * marker is therefore paired with a handshake the environment cannot supply: the parent
+ * writes a one-time token into an anonymous pipe and closes the write end before
+ * forking, and the helper must read that exact record back out of the inherited
+ * descriptor before it will act.  See fst_h323_helper_provenance_ok().
  *
- * Running the configuration-absent branch in a SEPARATE PROCESS IMAGE dissolves
- * the collision instead of trading one requirement against the other: the helper
- * brings up its own PProcess in its own address space and exits, the parent's
- * PTLib factories are never touched, and the parent's first and only PProcess is
- * still the one the module creates.  The case is declared first, and the module
- * load that follows it still observes fully populated factories.
+ * alarm() is armed before the exec and a pending alarm survives an exec -- it is a
+ * per-process timer, not a signal handler -- so the helper inherits a watchdog covering
+ * its whole life including its own bootstrap.  The parent's deadline-and-kill is the
+ * independent backstop.
  *
- * HOW THE CHILD IS ISOLATED: fork() IMMEDIATELY FOLLOWED BY exec()
- * ---------------------------------------------------------------
- * By the time any case body runs, this process has already started the
- * FreeSWITCH core, so it is MULTI-THREADED.  fork() duplicates that address
- * space into a child with exactly one thread, and every lock another thread
- * happened to hold at the instant of the fork is duplicated in the HELD state
- * with no owner left to release it.  The child then deadlocks the first time it
- * needs one.  That is not hypothetical here: the core's log queue, the memory
- * pool allocator and PTLib's internal mutexes are all live, and the
- * configuration-absent body needs all three.  POSIX permits only
- * async-signal-safe functions between fork() and exec in a multi-threaded
- * process, and allocating, logging, parsing XML or constructing a C++ object is
- * none of those things.
+ * Two cores in one run do not collide: every FST core derives its log and database
+ * directories from its own pid (switch_test.h:105 and :110), and FST_CORE_BEGIN passes
+ * no SCF_USE_SQL, so neither opens a core database.  The helper's standard output is
+ * discarded because it runs the same FCTX driver and its console output would interleave
+ * with this run's; its standard error is kept, because that is where FST_CORE_BEGIN
+ * writes when a core fails to come up at all (switch_test.h:296-298).
  *
- * So the forked image DOES NOTHING BUT EXEC.  The block holds FOUR call sites and
- * no others, every one of them on POSIX's async-signal-safe list: dup2(), alarm()
- * and execve() on the path that works, and _exit() as the fourth on the single
- * path where execve fails.  Three of the four therefore execute on any successful
- * spawn.  The descriptor dup2() redirects onto standard output was opened by the
- * PARENT before the fork precisely so that the child needs no open() of its own.
- * No allocation, no logging, no XML, no PTLib, no C++ construction, no locking.
- * execve() then replaces the address space wholesale, which discards every
- * inherited lock, every inherited thread state and every inherited stdio buffer
- * in one step: there is nothing left to deadlock on.
- *
- * The image exec'd is THIS SAME BINARY, re-entered from main() and bootstrapped
- * from scratch - its own core, its own pools, its own threads, its own single
- * PProcess.  It is selected into helper mode by an ENVIRONMENT MARKER rather
- * than an extra argv entry, because FCTX's command-line parser reads a bare
- * positional argument as a test-name filter and exits on an unrecognised option
- * (switch_fct.h fctkern__cl_parse), so argv is not ours to extend.  The helper's
- * argv is therefore exactly one element, the program path, and the marker
- * travels in the environment.
- *
- * THE MARKER ALONE IS NOT ENOUGH TO DISPATCH THE HELPER BODY.  An environment
- * variable is a public channel that anything in this process's ancestry can set
- * and that persists into every later descendant, and helper mode _exit()s from
- * inside the FIRST declared case - so a top-level run that believed a stale or
- * inherited marker would run one case, exit with that case's status, and be
- * recorded by the runner as a clean pass with the six later cases never run and
- * nothing in the output saying so.  The marker is consequently paired with a
- * PROVENANCE HANDSHAKE the environment cannot supply on its own: the parent writes
- * a one-time token into an anonymous pipe and closes the write end before forking,
- * and the helper must read that exact record back out of the inherited descriptor
- * before it will act.  fst_h323_helper_provenance_ok() carries the whole argument.
- *
- * Everything execve() needs - path, argv and envp, plus the handshake pipe and its
- * token - is built in the PARENT before the fork, precisely so that the child needs
- * no allocator to reach exec.  The parent releases the plan on every path,
- * including immediately after a successful fork: the child has its own copy of that
- * memory, so freeing it in the parent cannot affect the exec.  It closes its own
- * copy of the pipe's read end at the same point, for the same reason and with the
- * same safety - the descriptor the new image will read from is the one execve
- * carried across, not this one.
- *
- * The watchdog is unchanged in spirit and stronger in reach.  alarm() is armed
- * before the exec and a pending alarm SURVIVES an exec - it is a per-process
- * timer, not a signal handler - so the helper inherits the watchdog covering its
- * whole life including its own bootstrap, without having to arm one for itself.
- * The parent's deadline-and-kill remains the independent backstop.
- *
- * TWO CORES IN ONE RUN DO NOT COLLIDE, and that is a property of the framework
- * rather than an arrangement made here.  Every FST core derives its log and
- * database directories from its own pid (switch_test.h:105 and :110), so the two
- * processes share neither, and FST_CORE_BEGIN passes no SCF_USE_SQL, so neither
- * opens a core database at all.  The helper's STANDARD OUTPUT is nonetheless
- * discarded: it runs the same FCTX driver, so its console output would interleave
- * with this run's and corrupt the collected result.  Its standard ERROR is kept,
- * because that is where FST_CORE_BEGIN writes when a core fails to come up at all
- * (switch_test.h:296-298), and losing that message would turn a diagnosable
- * failure into a bare exit code.
- *
- * WHY THE RESULT IS ENCODED AS AN EXIT CODE
- * -----------------------------------------
- * FCTX's assertion state lives in the parent, so an fst_check() evaluated in the
- * helper would be recorded in a counter that dies with it.  The helper therefore
- * makes its checks as plain comparisons and reports ONE distinguishing exit code
- * per outcome; the parent turns those codes back into assertions with messages.
- * The codes are deliberately above the range a signal or a libc failure would
- * produce, so an unexpected value is unambiguous.
- *
- * The helper still ends with _exit() rather than exit(), and still leaves its
- * PProcess standing: the address space is about to be reclaimed wholesale, and
- * running PTLib's global teardown or FCTX's would buy nothing but risk.
+ * FCTX's assertion state lives in the parent, so an fst_check() evaluated in the helper
+ * would be recorded in a counter that dies with it.  The helper makes its checks as
+ * plain comparisons and reports one distinguishing exit code per outcome, which the
+ * parent turns back into assertions with messages; the codes sit above the range a
+ * signal or a libc failure produces, so an unexpected value is unambiguous.  It ends
+ * with _exit() and leaves its PProcess standing, because the address space is about to
+ * be reclaimed wholesale.
  */
 #define FST_H323_CHILD_OK                 0	/* every child-side check held      */
 #define FST_H323_CHILD_UNPINNED          40	/* plugin path not verifiably pinned */
@@ -1443,35 +1136,24 @@ static void fst_h323_process_release(void)
 #define FST_H323_CHILD_FIRST_LISTENERS   44	/* first ReadConfig() left a listener */
 #define FST_H323_CHILD_SECOND_NOT_FALSE  45	/* repeat ReadConfig() did not fail  */
 #define FST_H323_CHILD_SECOND_LISTENERS  46	/* repeat left a listener            */
-#define FST_H323_CHILD_EXEC_FAILED       47	/* fork succeeded, execve() did not  */
-#define FST_H323_CHILD_BAD_PROVENANCE    48	/* helper marker without provenance  */
+#define FST_H323_CHILD_EXEC_FAILED       47
+#define FST_H323_CHILD_BAD_PROVENANCE    48
 
 /*
- * The environment marker that selects helper mode, and the one mode this suite
- * defines.  The name is deliberately specific enough that nothing else can
- * collide with it, and the value names what the helper is for, so a marker
- * carrying anything else is treated as NOT helper mode rather than as a request
- * this binary does not understand.
+ * The environment marker that selects helper mode, and the one mode this suite defines.
+ * A marker carrying any other value is treated as NOT helper mode rather than as a
+ * request this binary does not understand.
  *
- * THE MARKER IS NOT, BY ITSELF, AUTHORITY TO RUN AS THE HELPER.
- * ------------------------------------------------------------
- * An environment variable is a PUBLIC channel: anything in this process's
- * ancestry can set it, and anything that sets it once leaves it set for every
- * later descendant.  A marker alone therefore cannot distinguish "my parent just
- * exec'd me for this purpose" from "a wrapper script, a CI recipe or a stale
- * exported shell variable happens to carry this name".  Believing it alone is a
- * real failure mode rather than a theoretical one: helper mode _exit()s from
- * inside the FIRST declared case, so a top-level run that entered it by accident
- * would execute one case body, exit with that body's status, and be recorded by
- * the runner as a clean pass - with the six remaining cases never run and nothing
- * in the output saying so.
- *
- * The marker is consequently only ever HALF of the credential.  The other half is
- * a one-time secret the parent writes into an anonymous pipe before it forks, and
- * which therefore cannot be present in an environment this suite did not itself
- * construct.  The two names below carry the pipe's descriptor number and the
- * secret; fst_h323_helper_provenance_ok() is where they are checked, and it
- * documents the whole handshake.
+ * The marker is only half of the credential.  An environment variable is a public
+ * channel that anything in this process's ancestry can set and that persists into every
+ * descendant, so it cannot distinguish "my parent just exec'd me for this purpose" from
+ * a stale exported shell variable -- and helper mode _exit()s from inside the first
+ * declared case, so a top-level run that entered it by accident would execute one case
+ * body, exit with that body's status, and be recorded as a clean pass.  The other half
+ * is a one-time secret the parent writes into an anonymous pipe before it forks, which
+ * cannot be present in an environment this suite did not construct.  The two names
+ * below carry the pipe's descriptor number and the secret;
+ * fst_h323_helper_provenance_ok() checks them.
  */
 #define FST_H323_HELPER_ENV              "FST_MOD_H323_ISOLATED_HELPER"
 #define FST_H323_HELPER_READCONFIG       "readconfig-missing-config"
@@ -1522,17 +1204,14 @@ static void fst_h323_process_release(void)
 #define FST_H323_SELF_EXE                "/proc/self/exe"
 
 /*
- * Helper-side watchdog, and the parent's own deadline.  The parent's is the
- * longer of the two on purpose: the alarm armed before the exec is the primary
- * escape and the parent's kill is the backstop.  The backstop is not redundant -
- * an exec preserves an IGNORED signal disposition, so a SIGALRM that some other
- * part of the process had already set to be ignored would disarm the alarm
- * silently.  Two independent mechanisms mean neither has to be trusted alone.
+ * Helper-side watchdog, and the parent's own deadline.  The parent's is the longer of
+ * the two: the alarm armed before the exec is the primary escape and the parent's kill
+ * is the backstop.  The backstop is not redundant -- an exec preserves an IGNORED
+ * signal disposition, so a SIGALRM another part of the process had already set to be
+ * ignored would disarm the alarm silently.
  *
- * Both are more generous than they were when the child merely ran a short body
- * in an inherited image, because the helper now performs a FULL core bootstrap of
- * its own before it reaches the assertions.  Measured helper wall time on this
- * host is on the order of a second; sixty is the safety factor, not the
+ * Both are generous because the helper performs a full core bootstrap of its own before
+ * it reaches the assertions.  Sixty seconds is the safety factor rather than the
  * expectation, and it is only ever paid on a failure.
  */
 #define FST_H323_CHILD_ALARM_SECONDS     60
@@ -1555,24 +1234,16 @@ static int fst_h323_in_helper_mode(void)
 }
 
 /*
- * Presence of the marker WHATEVER ITS VALUE, which is a deliberately different
- * question from the one above.
+ * Presence of the marker whatever its value, which is a different question from the one
+ * above: the exact-value test decides whether this process should RUN the helper body,
+ * this one decides whether it may SPAWN one.  Keeping them separate makes recursion
+ * impossible unless both are wrong at once.
  *
- * WHY TWO PREDICATES AND NOT ONE
- * ------------------------------
- * The exact-value test decides whether this process should RUN the helper body;
- * this presence test decides whether it is allowed to SPAWN one.  Keeping them
- * separate removes a single point of failure: recursion is impossible unless
- * BOTH are wrong at once.
- *
- * If the value test alone were used for both, a marker that failed to match -
- * because the value was mistyped, because a future mode name diverged, or
- * because the comparison itself regressed - would leave a process that is a
- * helper but does not know it, and it would spawn a helper of its own, which
- * would do the same.  The recursion is self-sustaining rather than bounded,
- * because each generation arms a fresh watchdog, so it is not a hazard the
- * deadline can absorb.  The refusal below is therefore keyed on presence, which
- * holds for ANY value the parent might have written.
+ * If the value test served both, a marker that failed to match -- a mistyped value, a
+ * diverged mode name, a regressed comparison -- would leave a process that is a helper
+ * but does not know it, and it would spawn a helper of its own, which would do the same.
+ * Each generation arms a fresh watchdog, so the recursion is self-sustaining rather than
+ * something the deadline can absorb.
  */
 static int fst_h323_helper_marker_present(void)
 {
@@ -1580,55 +1251,37 @@ static int fst_h323_helper_marker_present(void)
 }
 
 /*
- * ---------------------------------------------------------------------------
  * THE HELPER-PROVENANCE HANDSHAKE
- * ---------------------------------------------------------------------------
- * Answers the question the marker cannot: was this process exec'd as the helper
- * BY THE PARENT OF THIS RUN, or does it merely happen to have inherited a name?
+ * -------------------------------
+ * Answers the question the marker cannot: was this process exec'd as the helper by the
+ * parent of THIS run, or does it merely happen to have inherited a name?
  *
- * WHAT THE PARENT DOES (fst_h323_run_readconfig_isolated, below)
- * -------------------------------------------------------------
- * Before it forks, the parent creates an anonymous pipe, mints a fresh UUID,
- * renders the one-line record "<tag> <mode> <token>", writes that record into the
- * write end, and CLOSES the write end.  It then passes the READ end's descriptor
- * number and the token through envp alongside the marker.  A pipe descriptor is
- * not close-on-exec, so the read end survives the execve untouched; the record
- * and the end-of-file are already sitting in the pipe buffer by then, so the
- * helper never waits on the parent and no ordering between the two matters.
+ * Before it forks, the parent creates an anonymous pipe, mints a fresh UUID, writes the
+ * one-line record "<tag> <mode> <token>" into the write end and closes that end, then
+ * passes the read end's descriptor number and the token through envp alongside the
+ * marker.  A pipe descriptor is not close-on-exec, so the read end survives the execve;
+ * the record and the end-of-file are already in the pipe buffer, so the helper never
+ * waits on the parent and no ordering between them matters.
  *
- * WHY THAT IS UNFORGEABLE BY AN AMBIENT ENVIRONMENT
- * ------------------------------------------------
- * An environment can be copied, exported or left stale; a live pipe carrying a
- * value generated moments ago cannot.  For a stale environment to pass this
- * check, the descriptor number it names would have to be open in THIS process AND
- * be a pipe AND contain exactly the record naming exactly that same token - and
- * the token is a fresh UUID, so a recorded one is worthless the next run.  In
- * practice a stale descriptor number is either closed, or is some unrelated file
- * or socket, and every one of those outcomes refuses.
+ * An environment can be copied, exported or left stale; a live pipe carrying a value
+ * generated moments ago cannot.  For a stale environment to pass, the descriptor number
+ * it names would have to be open in this process AND be a pipe AND contain exactly the
+ * record naming exactly that token -- and the token is a fresh UUID, so a recorded one
+ * is worthless next run.
  *
- * WHY EACH INDIVIDUAL CHECK IS HERE
- * ---------------------------------
- *   - All three variables must be present, and the marker must match the mode
- *     EXACTLY, so a partial or half-updated environment cannot half-authenticate.
- *   - The descriptor number is parsed with strtol and the ENTIRE string must be
- *     consumed, so "3x" or "3 " is rejected rather than read as 3.
- *   - It must be above STDERR_FILENO: a handshake conducted over one of the three
- *     standard descriptors would be reading the suite's own console.
- *   - fstat() must succeed and S_ISFIFO() must hold.  This is the check that turns
- *     a stale number into a refusal instead of a read against whatever that number
- *     currently names.  On this failure the descriptor is deliberately NOT closed:
- *     it is not ours, and closing a descriptor another part of the process owns
- *     would be a far worse bug than the one being guarded against.
- *   - The read is a bounded poll loop, so a pipe nobody writes to makes the helper
- *     refuse rather than hang, and EINTR is retried rather than treated as failure.
- *   - The buffer is ONE BYTE LARGER than the expected record, so a LONGER record
- *     overshoots the expected length and fails the same length test a SHORTER one
- *     fails.  One comparison covers truncation, padding and substitution alike.
- *   - The comparison is a byte-for-byte memcmp of the exact expected length, not a
- *     prefix or substring test.
+ * Each check earns its place: all three variables must be present and the marker must
+ * match the mode exactly, so a half-updated environment cannot half-authenticate; the
+ * descriptor is parsed with strtol and the entire string must be consumed, so "3x" is
+ * rejected rather than read as 3; it must be above STDERR_FILENO, or the handshake would
+ * be reading the suite's own console; fstat() must succeed and S_ISFIFO() must hold,
+ * which is what turns a stale number into a refusal, and on that failure the descriptor
+ * is deliberately NOT closed because it is not ours; the read is a bounded poll loop, so
+ * a pipe nobody writes to makes the helper refuse rather than hang, and EINTR is
+ * retried; the buffer is one byte larger than the expected record, so a longer record
+ * overshoots and fails the same length test a shorter one fails; and the comparison is a
+ * byte-for-byte memcmp of the exact expected length rather than a prefix test.
  *
  * Called exactly once, from the first declared case, because it CONSUMES the pipe.
- * Returns 1 only when every check held.
  */
 static int fst_h323_helper_provenance_ok(void)
 {
@@ -1769,7 +1422,6 @@ static void fst_h323_exec_plan_release(fst_h323_exec_plan_t * plan)
 		plan->envp = NULL;
 	}
 
-	/* The array only; argv[0] aliases path, which is freed just below. */
 	if (plan->argv) {
 		free(plan->argv);
 		plan->argv = NULL;
@@ -1806,19 +1458,15 @@ static char *fst_h323_env_entry(const char *name, const char *value)
 }
 
 /*
- * Build the plan.  Returns 1 with every member owned by *plan, or 0 with nothing
- * owned and nothing leaked.
+ * Returns 1 with every member owned by *plan, or 0 with nothing owned and nothing
+ * leaked.
  *
- * The environment is copied entry by entry, DROPPING every inherited entry whose
- * name is one of the THREE this run owns - the mode marker, the handshake
- * descriptor number and the handshake token - whatever their values, and appending
- * a freshly rendered triple in their place.  Dropping all three rather than only
- * the marker is what makes the credential atomic: a half-inherited triple, where
- * say the token survived from an earlier run while the descriptor number was
- * replaced, must not exist, because a helper that assembled its credential from
- * two different runs would be exactly the situation the handshake exists to rule
- * out.  Every allocation is checked, because this runs under the CI static
- * analyser as well as the sanitizer.
+ * The environment is copied entry by entry, dropping every inherited entry whose name is
+ * one of the three this run owns -- the mode marker, the handshake descriptor number and
+ * the handshake token -- whatever their values, and appending a freshly rendered triple
+ * in their place.  Dropping all three rather than only the marker makes the credential
+ * atomic: a helper that assembled its credential from two different runs is exactly the
+ * situation the handshake exists to rule out.
  */
 static int fst_h323_exec_plan_build(fst_h323_exec_plan_t * plan, const char *argv0, const char *mode, int handshake_fd, const char *token)
 {
@@ -1941,17 +1589,13 @@ static int fst_h323_exec_plan_build(fst_h323_exec_plan_t * plan, const char *arg
 /*
  * The whole of the configuration-absent assertion set, evaluated in the HELPER.
  *
- * Runs in a freshly exec'd process with a core of its own, returns the exit code
- * the parent will decode, and touches no state the parent can observe.  Because
- * the helper is a real bootstrap rather than a duplicated image, everything here
- * is ordinary code against a healthy process - there is no inherited-lock
- * hazard to reason about and no restriction on what it may call.
- *
- * The endpoint is deleted on every path that constructed it, so the body is
- * clean under a static analyser even though _exit() would have reclaimed it
- * anyway.  The helper's PProcess is deliberately NOT released: the address space
- * is about to be discarded wholesale, and running PTLib's global teardown would
- * buy nothing but risk.
+ * Runs in a freshly exec'd process with a core of its own, returns the exit code the
+ * parent decodes, and touches no state the parent can observe.  The helper is a real
+ * bootstrap rather than a duplicated image, so there is no inherited-lock hazard here
+ * and no restriction on what this may call.  The endpoint is deleted on every path that
+ * constructed it, so the body is clean under a static analyser even though _exit() would
+ * have reclaimed it.  The helper's PProcess is deliberately not released: the address
+ * space is about to be discarded wholesale.
  */
 static int fst_h323_readconfig_child_body(void)
 {
@@ -2034,21 +1678,18 @@ static int fst_h323_write_all(int fd, const char *data, switch_size_t len)
 }
 
 /*
- * Run fst_h323_readconfig_child_body() in a SEPARATELY BOOTSTRAPPED helper
- * process and report what happened to it.
+ * Run fst_h323_readconfig_child_body() in a separately bootstrapped helper process.
  *
- * Returns SWITCH_STATUS_SUCCESS when the helper exited normally, writing its exit
- * code to *code; SWITCH_STATUS_TIMEOUT when it had to be killed for exceeding the
- * parent's deadline; SWITCH_STATUS_FALSE when the plan could not be built, the
- * fork or the wait failed, or the helper died on a signal - in which case *sig
- * carries the terminating signal, SIGALRM being the watchdog firing.  *helper_pid
- * receives the pid whenever one was created, so the caller can identify - and on a
- * clean run remove - the helper's own pid-named log directory.
+ * Returns SWITCH_STATUS_SUCCESS when the helper exited normally, writing its exit code
+ * to *code; SWITCH_STATUS_TIMEOUT when it had to be killed for exceeding the parent's
+ * deadline; SWITCH_STATUS_FALSE when the plan could not be built, the fork or the wait
+ * failed, or the helper died on a signal, in which case *sig carries it (SIGALRM being
+ * the watchdog).  *helper_pid receives the pid whenever one was created, so the caller
+ * can identify -- and on a clean run remove -- the helper's pid-named log directory.
  *
- * The wait is a bounded poll rather than a blocking waitpid() so that no failure
- * mode of the helper can hang the suite: one that wedges before the alarm can
- * fire, or that inherited an ignored SIGALRM, is killed at the deadline and
- * reaped.
+ * The wait is a bounded poll rather than a blocking waitpid(), so a helper that wedges
+ * before the alarm can fire, or that inherited an ignored SIGALRM, is killed at the
+ * deadline and reaped instead of hanging the suite.
  */
 static switch_status_t fst_h323_run_readconfig_isolated(const char *argv0, int *code, int *sig, pid_t *helper_pid)
 {
@@ -2110,14 +1751,12 @@ static switch_status_t fst_h323_run_readconfig_isolated(const char *argv0, int *
 								 FST_H323_HELPER_RECORD_TAG, FST_H323_HELPER_READCONFIG, token);
 
 	/*
-	 * Written, and the write end CLOSED, BEFORE the fork.  Both halves of that
-	 * matter.  Writing first means the record is already in the pipe buffer when the
-	 * new image starts, so the helper never waits on this process and the two need
-	 * no ordering between them at all.  Closing the write end first means the helper
-	 * sees end-of-file the instant it has consumed the record, so its read
-	 * terminates on data rather than on a timeout, and a record longer than expected
-	 * is impossible rather than merely unlikely.  The record is under a hundred
-	 * bytes against a pipe buffer of at least 4 KiB, so this write cannot block.
+	 * Written, and the write end closed, BEFORE the fork.  Writing first puts the record
+	 * in the pipe buffer before the new image starts, so the helper never waits on this
+	 * process.  Closing the write end first means the helper sees end-of-file the instant
+	 * it has consumed the record, so its read terminates on data rather than on a
+	 * timeout.  The record is under a hundred bytes against a pipe buffer of at least
+	 * 4 KiB, so this write cannot block.
 	 */
 	if (record_len <= 0 || record_len >= (int) sizeof(record)
 		|| !fst_h323_write_all(handshake[1], record, (switch_size_t) record_len)) {
@@ -2164,27 +1803,22 @@ static switch_status_t fst_h323_run_readconfig_isolated(const char *argv0, int *
 		/*
 		 * ASYNC-SIGNAL-SAFE REGION - DO NOT ADD ANYTHING TO THIS BLOCK.
 		 *
-		 * Exactly four call sites and no others, all on POSIX's async-signal-safe
-		 * list: dup2(), alarm() and execve() on the path that works, plus _exit()
-		 * only where execve failed - so three of the four run on a successful
-		 * spawn, which is the same count the block comment above states.  Nothing here
-		 * allocates, locks, logs or constructs, which is the entire reason this
-		 * fork is safe in a process whose core threads are already running.  The
-		 * descriptor dup2() needs was opened by the parent before the fork, so the
-		 * child never calls open() either.
+		 * Exactly four call sites and no others, all on POSIX's async-signal-safe list:
+		 * dup2(), alarm() and execve() on the path that works, plus _exit() only where
+		 * execve failed.  Nothing here allocates, locks, logs or constructs, which is why
+		 * this fork is safe in a process whose core threads are already running, and the
+		 * descriptor dup2() needs was opened by the parent, so the child never calls
+		 * open() either.
 		 *
-		 * Only STANDARD OUTPUT is discarded, and only because the helper runs the
-		 * same FCTX driver, so its console output would otherwise interleave with
-		 * this run's and corrupt the collected result.  Standard error is left
-		 * alone: that is where FST_CORE_BEGIN writes when a core fails to come up at
-		 * all (switch_test.h:296-298), and losing it would turn a diagnosable
-		 * failure into a bare exit code.
+		 * Only standard output is discarded, because the helper runs the same FCTX driver
+		 * and its console output would interleave with this run's.  Standard error is left
+		 * alone: that is where FST_CORE_BEGIN writes when a core fails to come up at all
+		 * (switch_test.h:296-298).
 		 *
-		 * The alarm is armed before the exec on purpose: a pending alarm survives
-		 * an exec, so it covers the helper's own bootstrap as well as its body.
-		 *
-		 * _exit(), never exit(): if the exec fails, no inherited atexit handler
-		 * and no inherited stdio buffer may run in this duplicated image.
+		 * The alarm is armed before the exec because a pending alarm survives an exec, so
+		 * it covers the helper's own bootstrap as well as its body.  _exit() rather than
+		 * exit(), so no inherited atexit handler or stdio buffer runs in this duplicated
+		 * image.
 		 */
 		if (devnull >= 0) {
 			dup2(devnull, STDOUT_FILENO);
@@ -2276,35 +1910,28 @@ static switch_status_t fst_h323_run_readconfig_isolated(const char *argv0, int *
 /*
  * Remove the working directory the helper's own core created.
  *
- * Every FST core composes its log and database directory from its own pid under
- * the test's base directory (switch_test.h:105 and :110).  A second core in the
- * run therefore leaves a second directory behind, and cleaning that one up is
- * what keeps this design residue-neutral: the run leaves exactly the one
- * directory a single-core suite leaves, not two.
+ * Every FST core composes its log and database directory from its own pid under the
+ * test's base directory (switch_test.h:105 and :110), so a second core in the run leaves
+ * a second directory behind; removing it means the run leaves exactly the one directory
+ * a single-core suite leaves.
  *
- * Its contents are known and small.  The core opens no database here, because
- * FST_CORE_BEGIN passes no SCF_USE_SQL (switch_test.h:313-314), so the only
- * artefact is the preprocessed configuration the XML reader writes into the log
- * directory as "<conf-file>.fsxml", with a sibling ".tmp" should a write have
- * been interrupted (src/switch_xml.c:1743-1748).  Both names are removed
- * explicitly and then the directory itself, so the cleanup is bounded by name
- * rather than recursive - a test has no business deleting a tree it did not
- * enumerate, and anything unexpected keeps the directory alive and visible.
+ * The contents are known and small: FST_CORE_BEGIN passes no SCF_USE_SQL
+ * (switch_test.h:313-314), so no database is opened and the only artefact is the
+ * preprocessed configuration the XML reader writes as "<conf-file>.fsxml", with a
+ * sibling ".tmp" should a write have been interrupted (src/switch_xml.c:1743-1748).  Both
+ * names are removed explicitly and then the directory itself, so the cleanup is bounded
+ * by name rather than recursive -- anything unexpected keeps the directory alive and
+ * visible.
  *
- * It runs ONLY when the helper reported success.  On any other outcome those
- * same files are the primary evidence for what went wrong, so they are
- * deliberately preserved and the caller reports where they are.
+ * It runs only when the helper reported success; on any other outcome those files are the
+ * primary evidence for what went wrong, so they are preserved and the caller reports
+ * where they are.
  *
- * EVERY REMOVAL IS CHECKED, AND THE VERDICT IS RETURNED
- * ----------------------------------------------------
- * Discarding these results would make the residue-neutrality claim above an
- * intention rather than a property: a cleanup that silently failed would leave a
- * directory behind every run, the count would creep, and the suite would still
- * report a clean pass.  So each removal is checked, ONLY absence is tolerated -
- * ENOENT means the artefact was never written, which is a legitimate outcome for
- * the ".tmp" sibling in particular - and anything else is logged with the exact
- * path and the errno text before the aggregate verdict comes back to the caller,
- * which asserts on it.
+ * Every removal is checked and the verdict returned, because a cleanup that silently
+ * failed would leave a directory behind every run while the suite still reported a clean
+ * pass.  Only absence is tolerated -- ENOENT means the artefact was never written, a
+ * legitimate outcome for the ".tmp" sibling -- and anything else is logged with the exact
+ * path and errno text.
  */
 static int fst_h323_remove_helper_path(const char *path, int is_dir)
 {
@@ -2351,53 +1978,34 @@ static switch_status_t fst_h323_remove_helper_dir(pid_t helper_pid)
 }
 
 /*
- * Release the H323ListenerTCP objects that a direct ReadConfig() left the test
- * owning, and empty the record list.
+ * Release the H323ListenerTCP objects the test owns, and empty the record list.
  *
- * WHY THIS IS NEEDED AT ALL
- * -------------------------
  * FSH323EndPoint::ReadConfig() allocates one listener per <listener> element
- * unconditionally - `listener.listenAddress = new H323ListenerTCP(*this, ip,
- * port)` (mod_h323.cpp:583) - and stores it as a RAW pointer inside the
- * FSListener record it appends to m_listeners.  FSListener has a defaulted
- * constructor that leaves listenAddress uninitialised and NO destructor
- * (mod_h323.h:236-243), and ~FSH323EndPoint only calls StopGkClient() and
- * ClearAllCalls() (mod_h323.cpp:612-617).  So `delete endpoint` alone does not
- * free them, and a case that reads configuration without going on to
- * Initialise() is the sole owner of everything ReadConfig() constructed.
- * Freeing it here is the test cleaning up after itself - it is NOT a
- * workaround for a production defect, because in production ReadConfig() is
- * only ever reached from Initialise(), which hands each listener straight to
- * StartListener().
+ * unconditionally -- `listener.listenAddress = new H323ListenerTCP(*this, ip, port)`
+ * (mod_h323.cpp:583) -- and stores it as a raw pointer inside the FSListener record it
+ * appends to m_listeners.  FSListener has a defaulted constructor that leaves
+ * listenAddress uninitialised and no destructor (mod_h323.h:236-243), and
+ * ~FSH323EndPoint only calls StopGkClient() and ClearAllCalls()
+ * (mod_h323.cpp:612-617), so `delete endpoint` does not free them.
  *
- * WHY IT IS CALLED AFTER Initialise() TOO
- * ---------------------------------------
- * H323EndPoint::StartListener(H323Listener *) documents a conditional transfer:
- * "if this returns TRUE, then the endpoint is responsible for deleting the
- * H323Listener listener object.  If FALSE is returned then the object is not
- * deleted and it is up to the caller to release the memory" (h323ep.h:532-545).
- * That transfer never happens in this suite, because every StartListener() call
- * site is retargeted onto fst_h323_start_listener(), which records the request
- * and adopts nothing.  Ownership therefore stays in m_listeners for EVERY case,
- * Initialise() or not, and this helper is the single release path for all of
- * them.  One owner, one release, so a double free is structurally impossible -
- * which is a stronger guarantee than the split rule it replaces, where a case
- * released or did not release depending on how far into production it had run.
+ * It is called after Initialise() too.  H323EndPoint::StartListener(H323Listener *)
+ * documents a conditional transfer -- the endpoint deletes the object only if the call
+ * returns TRUE (h323ep.h:532-545) -- and that transfer never happens here, because every
+ * StartListener() call site is retargeted onto fst_h323_start_listener(), which adopts
+ * nothing.  Ownership therefore stays in m_listeners for every case and this helper is
+ * the single release path: one owner, one release, so a double free is structurally
+ * impossible.  The Initialise() cases pair the call with an assertion that the
+ * endpoint's own H323ListenerList (h323ep.h:2027, :3114) is empty, so "the endpoint owns
+ * nothing" is proven before anything is freed.
  *
- * The Initialise() cases pair the call with an assertion that the endpoint's
- * own H323ListenerList (h323ep.h:2027, :3114) is EMPTY, so "the endpoint owns
- * nothing" is proven rather than assumed before this helper frees anything.
+ * The returned count is the ownership verdict: a case asserts the number released equals
+ * the number its document declared, which fails if production dropped a record, if a
+ * listener was never constructed, or if something else had already taken it.
  *
- * The returned count is the ownership verdict itself: a case asserts the number
- * released equals the number its document declared, which fails if production
- * dropped a record, if a listener was never constructed, or if something else
- * had already taken it.
- *
- * FSH323EndPoint is taken rather than the test subclass because m_listeners is
- * public on the production class (mod_h323.h:270): that lets the module-load
- * case drain the endpoint the MODULE built, reached through the public
- * FSProcess::GetH323EndPoint() (mod_h323.h:230-232), with the same helper the
- * direct-object cases use.
+ * FSH323EndPoint is taken rather than the test subclass because m_listeners is public on
+ * the production class (mod_h323.h:270), which lets the module-load case drain the
+ * endpoint the MODULE built -- reached through FSProcess::GetH323EndPoint() -- with the
+ * same helper the direct-object cases use.
  */
 static int fst_h323_release_listeners(FSH323EndPoint * endpoint)
 {
@@ -2483,57 +2091,40 @@ static void fst_h323_module_pool_destroy(void)
 }
 
 /*
- * Total, idempotent reclamation of everything this suite can retain BETWEEN
- * cases: the registered h323.conf provider, the loaded module's own state, any
- * harness-owned fallback PProcess, and the module-lifetime pool.
+ * Total, idempotent reclamation of everything this suite can retain between cases: the
+ * registered h323.conf provider, the loaded module's own state, any harness-owned
+ * fallback PProcess, and the module-lifetime pool.
  *
- * WHY EVERY STEP IS IDEMPOTENT
- * ---------------------------
- * switch_xml_unbind_search_function_ptr() reports SWITCH_STATUS_FALSE when no
- * binding carries the pointer and changes nothing (src/switch_xml.c:315-338).
- * mod_h323_shutdown() frees its four globals through switch_safe_free(), which
- * NULLs each pointer after freeing it (src/include/switch_utils.h:881), then
- * deletes the process and NULLs that too (mod_h323.cpp:188-199) - so it is
- * safe whether the module was loaded, never loaded, or already shut down.  The
- * process release and the pool destroy are both guarded on their own handles.
- * The sweep can therefore be called at any point, any number of times.
+ * Every step is idempotent.  switch_xml_unbind_search_function_ptr() reports
+ * SWITCH_STATUS_FALSE when no binding carries the pointer and changes nothing.
+ * mod_h323_shutdown() frees its four globals through switch_safe_free(), which NULLs
+ * each pointer after freeing it, then deletes the process and NULLs that too
+ * (mod_h323.cpp:188-199), so it is safe whether the module was loaded, never loaded or
+ * already shut down.  The process release and the pool destroy are guarded on their own
+ * handles.
  *
- * WHY IT IS NOT INVOKED FROM FST_TEARDOWN
- * --------------------------------------
- * FST_TEARDOWN runs after EVERY case, and this suite deliberately hands state
- * from one case to those after it: the module-load case leaves the
- * module loaded, its PProcess alive and its pool alive ON PURPOSE, because the
- * cases that follow are meant to observe a loaded module and the last of them
- * exists to assert that shutting it down works.  An unconditional per-case
- * teardown would demolish exactly the state those cases must observe.
- * Reclamation is anchored instead where it is both unconditional and correct: a
- * single cleanup tail in every case that retains anything, plus this total sweep
- * in the last declared case.
+ * It is not invoked from FST_TEARDOWN, which runs after every case, because this suite
+ * hands state forward on purpose: the module-load case leaves the module loaded, its
+ * PProcess alive and its pool alive, because the cases that follow observe a loaded
+ * module and the last of them asserts that shutting it down works.  Reclamation is
+ * anchored instead in a cleanup tail in every case that retains anything, plus this
+ * total sweep in the last declared case.
  *
- * Two framework facts make that placement sound.  A fatal check merely breaks
- * out of the enclosing test body - fct_req expands to `if (!ok) { break; }`
- * (switch_fct.h:3668-3669) - and FCTX re-enters the whole fixture-suite body
- * once per declared case, running only the case whose number matches
- * (switch_fct.h:3507-3516).  So a fatal check in one case can skip that case's
- * own tail but never a later case, which is why the last case is a dependable
- * safety net; and why no case below may make a fatal check after mutating state
+ * Two framework facts make that sound: a fatal check merely breaks out of the enclosing
+ * test body (fct_req expands to `if (!ok) { break; }`, switch_fct.h:3668-3669), and FCTX
+ * re-enters the whole fixture-suite body once per declared case, running only the case
+ * whose number matches (switch_fct.h:3507-3516).  So a fatal check in one case can skip
+ * that case's own tail but never a later case -- which is why the last case is a
+ * dependable safety net, and why no case may make a fatal check after mutating state
  * that outlives it.
  *
- * ORDER IS LOAD-BEARING
- * ---------------------
- *   1. unbind the provider first, so nothing that follows can trigger a
- *      configuration lookup that re-enters it;
- *   2. shut the module down next - that is the last thing which reads the
- *      module state carved out of the pool, and the only thing that destroys
- *      the PProcess the module created;
- *   3. release a harness-owned fallback process should one exist, AFTER
- *      shutdown, so the one-live-PProcess invariant is never breached.  In a
- *      healthy run this is a no-op, because the harness owns no process;
- *   4. destroy the module-lifetime pool once nothing points into it;
- *   5. release any root pool the module abandoned, last.  Ordered last purely
- *      so that it also covers anything the four steps above could themselves
- *      have caused to be recorded; in a healthy run the per-case teardown has
- *      already emptied the list and this releases nothing.
+ * Order is load-bearing: unbind the provider first, so nothing that follows can trigger
+ * a configuration lookup that re-enters it; shut the module down next, since that is the
+ * last thing to read module state carved out of the pool and the only thing that
+ * destroys the PProcess the module created; release a harness-owned fallback process
+ * AFTER shutdown, so the one-live-PProcess invariant is never breached; destroy the
+ * module-lifetime pool once nothing points into it; and release any abandoned root pool
+ * last, so it also covers anything the earlier steps caused to be recorded.
  */
 static void fst_h323_suite_state_cleanup(void)
 {
@@ -2552,108 +2143,67 @@ static void fst_h323_suite_state_cleanup(void)
 
 
 /*
- * ---------------------------------------------------------------------------
  * THE SUITE
- * ---------------------------------------------------------------------------
+ * ---------
+ * "conf_h323" names this module's own fixture root.  The core bootstrap builds the
+ * configuration directory as SWITCH_TEST_BASE_DIR_FOR_CONF, a path separator, then that
+ * name (switch_test.h:92-93), so the target must define -DSWITCH_TEST_BASE_DIR_FOR_CONF
+ * and -DSWITCH_TEST_BASE_DIR_OVERRIDE to ${abs_builddir}/test.  Without those defines the
+ * bootstrap falls back to "./conf_h323" (switch_test.h:94-99), which resolves against the
+ * working directory, so the suite would only find its fixtures when run from inside test/.
  *
- * "conf_h323" names this module's own fixture root.  The core bootstrap builds
- * the configuration directory as SWITCH_TEST_BASE_DIR_FOR_CONF, a path
- * separator, then that name (switch_test.h:92-93), so the target's Makefile.am
- * declaration must define -DSWITCH_TEST_BASE_DIR_FOR_CONF and
- * -DSWITCH_TEST_BASE_DIR_OVERRIDE to ${abs_builddir}/test - the same pair
- * carried by, for example, src/mod/applications/mod_commands/Makefile.am:15 -
- * for the name to resolve to src/mod/endpoints/mod_h323/test/conf_h323.
- * Without those defines the bootstrap falls back to "./conf_h323"
- * (switch_test.h:94-99), which resolves against the working directory instead,
- * so the suite would only find its fixtures when run from inside test/.  See
- * the build-wiring note in the file header for the rest of that declaration.
+ * Case order is load-bearing, because FCTX runs cases in declaration order:
  *
- * CASE ORDER IS LOAD-BEARING.  FCTX runs cases in declaration order, and the
- * order below is the only one that satisfies every constraint at once:
+ *   1. readconfig_without_configuration_fails -- first, so the configuration-absent
+ *      verdict cannot be an artefact of anything earlier; run in an exec'd helper.
+ *   2. module_load_registers_endpoint_interface -- the full load, and the first case to
+ *      bring a PProcess up here; leaves the module loaded for everything that follows.
+ *   3. gatekeeper_registration_disabled_when_gk_address_empty -- runs Initialise().
+ *   4. gatekeeper_lan_search_address_preserved_verbatim -- drives StartGkClient().
+ *   5. listeners_parsed_from_configuration -- ReadConfig() only; parsing a listener does
+ *      not start one.
+ *   6. codec_prefs_negotiation_order -- the last case to run Initialise().
+ *   7. module_shutdown_releases_resources -- last; reclaims what case 2 allocated.
  *
- *   1. readconfig_without_configuration_fails ....... FIRST: the
- *      configuration-absent branch, so its verdict cannot be an artefact of
- *      anything that ran before it.  Executed in a SEPARATELY EXEC'D HELPER
- *      PROCESS, which is what lets it be first without disturbing this process -
- *      see below.
- *   2. module_load_registers_endpoint_interface ..... the full module load, and
- *      the first case to bring a PProcess up in THIS address space, so the
- *      H323CapabilityFactory and the OpalMediaFormat registry are still
- *      populated and the module is observed fully initialised rather than
- *      degraded.  It leaves the module loaded for everything that follows.
- *   3. gatekeeper_registration_disabled_when_gk_address_empty ... runs the real
- *      Initialise() so the no-registration guard is executed, then asserts the
- *      toolkit was never asked for a gatekeeper.
- *   4. gatekeeper_lan_search_address_preserved_verbatim ... drives
- *      StartGkClient() directly and asserts the "*" LAN-search request reached
- *      the toolkit.
- *   5. listeners_parsed_from_configuration ........... ReadConfig() only, and
- *      the counterpart to cases 3 and 6: it asserts that parsing a listener
- *      does NOT start one.
- *   6. codec_prefs_negotiation_order ................. the second and last case
- *      to run Initialise() on an endpoint of its own.
- *   7. module_shutdown_releases_resources ............ LAST: observes the module
- *      case 2 loaded and reclaims everything it allocated.
+ * Case 1 needs a process of its own rather than merely being declared first, because
+ * PProcess::~PProcess() irreversibly empties both PTLib factories.  It cannot avoid
+ * bringing a PProcess up -- H323EndPoint's constructor calls PProcess::Current() and
+ * terminates the binary when none exists -- and it cannot leave one alive either, because
+ * the module's own load unconditionally constructs a second, which PTLib does not permit.
+ * That image is a freshly exec'd one rather than a fork, for the async-signal-safety
+ * reason set out at fst_h323_run_readconfig_isolated(), and case 1 asserts the property
+ * by checking the parent still owns no PProcess afterwards.
  *
- * WHY CASE 1 RUNS IN A PROCESS OF ITS OWN RATHER THAN SIMPLY BEING DECLARED FIRST
- * ------------------------------------------------------------------------------
- * PProcess::~PProcess() irreversibly empties both PTLib factories, so whichever
- * capability-building code runs after a PProcess has been destroyed sees nothing
- * to build from.  Case 1 cannot avoid bringing a PProcess up - H323EndPoint's
- * constructor calls PProcess::Current() and terminates the binary when no
- * process exists - and it cannot leave one alive either, because the module's
- * own load unconditionally constructs a second, which PTLib does not permit.
- * Both requirements are satisfied by giving case 1 its own address space: the
- * helper's process comes and goes without touching the parent's factories, and
- * the parent's first and only PProcess is still the module's.  That address
- * space is a freshly exec'd image of this binary rather than a fork of it, for
- * the async-signal-safety reason set out at fst_h323_run_readconfig_isolated();
- * case 1 asserts the property as well as relying on it, checking that the parent
- * still owns no PProcess afterwards.
- *
- * The alternative - accepting the reverse order, with a direct-object case's
- * process destroyed before the load - makes the module load add no audio
- * capability at all, which is an artefact of harness ordering rather than a
- * property of mod_h323 and is precisely what this arrangement exists to avoid.
- *
- * Cases 3-6 construct endpoints of their own but never a second process: they
- * adopt the live one through fst_h323_process_acquire().  Two H323EndPoint
- * objects may coexist - the class is not a singleton and its constructor binds
- * nothing - and no port is contended for because no port is ever bound: every
- * listener hand-off is intercepted.  The distinct port per document is there so
- * each case can assert the address ITS document configured, not to keep two
- * binds apart.  At no instant are two PProcess-derived objects alive.
+ * Cases 3-6 construct endpoints of their own but never a second process: they adopt the
+ * live one through fst_h323_process_acquire().  Two H323EndPoint objects may coexist --
+ * the class is not a singleton and its constructor binds nothing -- and no port is
+ * contended for because none is ever bound.  The distinct port per document lets each
+ * case assert the address its own document configured.
  */
 FST_CORE_BEGIN("conf_h323")
 {
 	FST_SUITE_BEGIN(mod_h323)
 	{
 		/*
-		 * This hook must be PRESENT.  FST_CORE_BEGIN sets fst_core == 2, and
-		 * every FST_TEST_BEGIN then fatally requires both fst_pool and a started
-		 * fst_timer (switch_test.h:451-453).  FST_SETUP_BEGIN is the only thing
-		 * that creates them (switch_test.h:407-412), so omitting it would make
-		 * every case below fail fatally.
+		 * This hook must be PRESENT.  FST_CORE_BEGIN sets fst_core == 2, and every
+		 * FST_TEST_BEGIN then fatally requires both fst_pool and a started fst_timer
+		 * (switch_test.h:451-453), which only FST_SETUP_BEGIN creates
+		 * (switch_test.h:407-412).
 		 *
-		 * Its body pins PTLib's plugin search path.  This is the earliest point
-		 * guaranteed to run before ANY case body, which is what makes it the
-		 * right place: PTLib enumerates and dlopen()s that directory while a
-		 * PProcess comes up, so the containment has to be installed before the
-		 * first construction, whichever case happens to cause it.  See
-		 * fst_h323_pin_plugin_path() for the full argument.
+		 * Its body pins PTLib's plugin search path, and this is the earliest point
+		 * guaranteed to run before any case body: PTLib enumerates and dlopen()s that
+		 * directory while a PProcess comes up, so the containment must be installed
+		 * before the first construction, whichever case causes it.
 		 *
-		 * The result is deliberately discarded HERE and only here: a setup hook
-		 * has no assertion vocabulary - FST_SETUP_BEGIN runs outside any test
-		 * body, so a failed check would have nothing to attribute itself to - so
-		 * this call is the early installation, not the guarantee.  The guarantee
-		 * is enforced where it matters: fst_h323_process_acquire() re-verifies
-		 * and returns NULL if it cannot, and every case reaches it through
-		 * fst_requires().
+		 * The result is discarded here and only here, because a setup hook runs outside
+		 * any test body and a failed check would have nothing to attribute itself to.
+		 * The guarantee is enforced where it is attributable:
+		 * fst_h323_process_acquire() re-verifies and returns NULL if it cannot, and
+		 * every case reaches it through fst_requires().
 		 *
-		 * It also zeroes the toolkit observation record, so every case sees only
-		 * the calls IT caused.  Doing it here rather than per case makes the
-		 * isolation unconditional: a case cannot forget, and cannot inherit a
-		 * count from a case that broke out early on a fatal check.
+		 * It also zeroes the toolkit observation record, so every case sees only the
+		 * calls it caused, and doing it here means a case cannot forget or inherit a
+		 * count from one that broke out early.
 		 */
 		FST_SETUP_BEGIN()
 		{
@@ -2663,66 +2213,43 @@ FST_CORE_BEGIN("conf_h323")
 		FST_SETUP_END()
 
 		/*
-		 * Reclaims exactly one thing, and deliberately nothing else.
+		 * Reclaims exactly one thing: every root pool the module abandoned IN THIS
+		 * PROCESS during the case that just ran.  FSH323EndPoint::ReadConfig() allocates
+		 * one on entry and never destroys or uses it (mod_h323.cpp:469).
 		 *
-		 * WHAT IT RECLAIMS
-		 * ----------------
-		 * Every root pool the module abandoned IN THIS PROCESS during the case that
-		 * just ran.  FSH323EndPoint::ReadConfig() allocates one on entry and never
-		 * destroys or uses it (mod_h323.cpp:469), so every call to it strands one.
+		 * Six of the seven cases call it, but only five of those calls happen in this
+		 * process and reach this hook: cases 2 through 6 read configuration here, while
+		 * case 1 reads it twice inside the exec'd helper image, whose pools live and die
+		 * in an address space this hook cannot see and that _exit() discards wholesale.
+		 * That is why the accounting line logged at the end of a run reports five.
 		 *
-		 * Six of the seven cases below call it, but only FIVE of those calls happen
-		 * in this process, and only those five ever reach this hook: cases 2 through
-		 * 6 read configuration here - directly, or through the module load - while
-		 * case 1 reads it TWICE inside the exec'd helper image, whose pools live and
-		 * die in an address space this hook cannot see and that _exit() discards
-		 * wholesale.  That is why the accounting line this suite logs at the end of a
-		 * run reports five, not six or seven, and why a change to the isolated case
-		 * would change that number without any pool having leaked.  The recording
-		 * seam above captures the five; this is where they are released.
-		 *
-		 * This hook is the right anchor for that and only that, because a
-		 * recorded pool is the one resource in this suite that no case owns and
-		 * no later case reads: nothing in mod_h323.cpp holds a pointer derived
-		 * from it, and nothing in this file does either.  Releasing it after
-		 * every case is therefore unconditional and cannot demolish anything -
-		 * and being here rather than in the case bodies means it happens even
-		 * when a fatal precondition breaks a case out early, which is precisely
+		 * A recorded pool is the one resource here that no case owns and no later case
+		 * reads -- nothing in mod_h323.cpp or in this file holds a pointer derived from
+		 * it -- so releasing it after every case is unconditional and cannot demolish
+		 * anything.  Being in this hook rather than in the case bodies means it also
+		 * happens when a fatal precondition breaks a case out early, which is exactly
 		 * when a case's own tail would be skipped.
 		 *
-		 * WHAT IT DELIBERATELY DOES NOT RECLAIM
-		 * -------------------------------------
-		 * Everything else.  There is nothing here to unload: the harness never
-		 * dlopens or dlcloses mod_h323, it calls the module's own entry points by
-		 * name.  And no module state may be reclaimed here, because this hook
-		 * runs after EVERY case while the suite deliberately hands the loaded
-		 * module from the second case to every case after it - see
-		 * fst_h323_suite_state_cleanup() for that argument in full.  Note also
-		 * that FST_TEARDOWN_BEGIN destroys fst_pool before this body is entered
-		 * (switch_test.h:425-432), so nothing backed by fst_pool could be
-		 * released here in any case.
+		 * Nothing else is reclaimed here.  There is nothing to unload -- the harness
+		 * calls the module's entry points by name and never dlopens it -- and no module
+		 * state may be released, because this hook runs after every case while the suite
+		 * hands the loaded module from the second case to every case after it.
+		 * FST_TEARDOWN_BEGIN also destroys fst_pool before this body is entered
+		 * (switch_test.h:425-432).
 		 *
-		 * What makes that safe is a structural rule the cases below keep, stated
-		 * exactly.  NO case makes a fatal check after registering the
-		 * configuration provider or after creating the module-lifetime pool -
-		 * those are the two resources nothing else would reclaim, so every check
-		 * that follows either of them is non-fatal and control always reaches
-		 * that case's single cleanup tail instead of breaking out to this hook.
+		 * What makes that safe is a rule the cases keep: no case makes a fatal check
+		 * after registering the configuration provider or after creating the
+		 * module-lifetime pool, so control always reaches that case's cleanup tail
+		 * instead of breaking out to this hook.  A fatal check can still strand a
+		 * harness-owned fallback PProcess, which only exists when the module load did
+		 * not happen and which the last case's sweep releases, and anything allocated
+		 * from fst_pool, which FST_TEARDOWN_BEGIN destroys on the way in.
 		 *
-		 * Two things a fatal check can still strand, and why neither matters.  A
-		 * harness-owned fallback PProcess, which only exists at all when the
-		 * module load did not happen: the direct-object cases acquire before
-		 * checking that PTLib came up, so a break there retains it - and the last
-		 * case's sweep releases it.  And anything allocated from fst_pool, which
-		 * FST_TEARDOWN_BEGIN destroys on the way in.
-		 *
-		 * The release count is discarded HERE and only here, for the same reason
-		 * the setup hook discards its result: a teardown body runs outside any
-		 * test's assertion scope, so a check made here would have no case to
-		 * attribute itself to.  The property is asserted where it is genuinely
-		 * attributable instead - the case that reads configuration checks that
-		 * the seam recorded a pool, and the last declared case checks that none
-		 * survives and that the recorder never overflowed.
+		 * The release count is discarded here and only here, because a teardown body
+		 * runs outside any test's assertion scope.  The property is asserted where it is
+		 * attributable: the case that reads configuration checks the seam recorded a
+		 * pool, and the last declared case checks that none survives and that the
+		 * recorder never overflowed.
 		 */
 		FST_TEARDOWN_BEGIN()
 		{
@@ -2731,53 +2258,40 @@ FST_CORE_BEGIN("conf_h323")
 		FST_TEARDOWN_END()
 
 		/*
-		 * CASE 1 - the configuration-absent failure branch.  DECLARED FIRST, and
-		 * RUN IN A PROCESS OF ITS OWN.
+		 * CASE 1 - the configuration-absent failure branch, declared first and run in a
+		 * process of its own.
 		 *
-		 * Asserted on ReadConfig() directly, and deliberately NOT on
-		 * mod_h323_load(): FSH323EndPoint::Initialise() discards ReadConfig()'s
-		 * status (mod_h323.cpp:381) and returns TRUE unconditionally
-		 * (mod_h323.cpp:457), so mod_h323_load() can never report a
-		 * configuration failure and an assertion on it would prove nothing.
+		 * Asserted on ReadConfig() directly and not on mod_h323_load():
+		 * FSH323EndPoint::Initialise() discards ReadConfig()'s status
+		 * (mod_h323.cpp:381) and returns TRUE unconditionally (mod_h323.cpp:457), so
+		 * mod_h323_load() can never report a configuration failure.
 		 *
-		 * DECLARED FIRST so its verdict cannot be an artefact of anything that ran
-		 * before it: no module has been loaded, no configuration provider has ever
-		 * been registered, and the parent process has never brought a PProcess up.
+		 * Declared first so the verdict cannot be an artefact of anything else: no
+		 * module is loaded, no configuration provider has been registered, and the
+		 * parent has never brought a PProcess up.  Being first and bringing a PProcess
+		 * up are mutually exclusive inside one address space, because ~PProcess() would
+		 * irreversibly empty the two PTLib factories the module-load case depends on -
+		 * see fst_h323_run_readconfig_isolated().  The helper makes the assertions; this
+		 * body asserts on the helper's outcome and on the parent state the isolation
+		 * protects.
 		 *
-		 * ISOLATED because being first and bringing a PProcess up are mutually
-		 * exclusive inside one address space - see
-		 * fst_h323_run_readconfig_isolated() for the full argument, in short that
-		 * ~PProcess() would irreversibly empty the two PTLib factories the module
-		 * load case depends on.  The helper makes the assertions; this body asserts
-		 * on the helper's outcome AND on the parent state the isolation is there to
-		 * protect.
+		 * The subject is an endpoint the helper constructs itself, no provider is
+		 * registered, and mod_h323 registers no XML search function, so the lookup
+		 * misses in both the binding list and the static root whether or not a module
+		 * is loaded - which is what makes the failure branch deterministic.
 		 *
-		 * INDEPENDENT OF THE LOADED MODULE, deliberately.  The subject is an
-		 * endpoint the helper constructs itself, no provider is registered, and
-		 * mod_h323 registers no XML search function of its own - so the lookup
-		 * misses in both the binding list and the static root regardless of
-		 * whether a module is loaded, which is what makes the failure branch
-		 * deterministic.
+		 * Socket-free: ReadConfig() only constructs H323ListenerTCP objects
+		 * (mod_h323.cpp:583) and OpenH323 binds in H323ListenerTCP::Open(), reached
+		 * from H323EndPoint::StartListener(), which ReadConfig() never calls.  On this
+		 * path nothing is even constructed.
 		 *
-		 * Socket-free: ReadConfig() only CONSTRUCTS H323ListenerTCP objects
-		 * (mod_h323.cpp:583); OpenH323 binds in H323ListenerTCP::Open(), which
-		 * is reached from H323EndPoint::StartListener() and which ReadConfig()
-		 * never calls.  On this path nothing is even constructed.
-		 *
-		 * m_pi, m_ai and m_endpointname are deliberately NOT asserted on this
-		 * path: their defaults are applied at mod_h323.cpp:490-493, AFTER the
-		 * failure return, and the constructor (mod_h323.cpp:599-610) leaves the two
-		 * ints uninitialised.  The context and dialplan defaults applied at
-		 * mod_h323.cpp:474-475 are likewise NOT asserted: they live in
-		 * mod_h323_globals, a .cpp-file static (mod_h323.cpp:42) whose only setters
-		 * are the file-static SWITCH_DECLARE_GLOBAL_STRING_FUNC wrappers
-		 * (mod_h323.cpp:44-47), so no public seam exposes them.  An assertion on
-		 * them would rest purely on this suite's internal linkage to the module
-		 * translation unit, and asserting through internal linkage is what makes a
-		 * harness brittle: it breaks on a refactor that changes nothing observable.
-		 * The stronger property is asserted on the public seams instead - the
-		 * failure branch is deterministic and leaves no residue, so the helper
-		 * repeats it and requires the identical observable result.
+		 * m_pi, m_ai and m_endpointname are not asserted here: their defaults are
+		 * applied at mod_h323.cpp:490-493, after the failure return, and the
+		 * constructor (mod_h323.cpp:599-610) leaves the two ints uninitialised.  The
+		 * context and dialplan defaults at mod_h323.cpp:474-475 are not asserted
+		 * either: they live in mod_h323_globals, a .cpp-file static (mod_h323.cpp:42)
+		 * whose only setters are file-static (mod_h323.cpp:44-47), so no public seam
+		 * exposes them and an assertion would rest on internal linkage alone.
 		 */
 		FST_TEST_BEGIN(readconfig_without_configuration_fails)
 		{
@@ -2788,55 +2302,37 @@ FST_CORE_BEGIN("conf_h323")
 			pid_t helper_pid = -1;
 
 			/*
-			 * ---------------------------------------------------------------
-			 * THE HELPER'S OWN ENTRY POINT.
-			 * ---------------------------------------------------------------
-			 *
-			 * When this process IS the exec'd helper, the whole of its work is
-			 * the body below and its whole result is an exit code.  It is placed
-			 * in the FIRST declared case because FCTX runs cases in declaration
-			 * order, so _exit()ing here guarantees no later case ever runs in the
-			 * helper: the helper cannot load the module, cannot construct a
-			 * second PProcess, and cannot report a verdict of its own into the
+			 * The helper's own entry point.  When this process is the exec'd helper, its
+			 * whole work is the body below and its whole result is an exit code.  It sits
+			 * in the first declared case because FCTX runs cases in declaration order, so
+			 * _exit()ing here guarantees no later case runs in the helper: it cannot load
+			 * the module, construct a second PProcess, or report a verdict into the
 			 * parent's tally.
 			 *
-			 * _exit() rather than return, deliberately: returning would run
-			 * FST_CORE_END's switch_core_destroy() and then FCTX's final report,
-			 * and the helper has no business tearing a core down or printing a
-			 * summary that the parent will print properly a moment later.  It
-			 * also means no atexit handler and no leak-sanitizer at-exit check
-			 * fires in a process that is mid-suite by construction.
+			 * _exit() rather than return, so the helper neither tears a core down through
+			 * FST_CORE_END nor prints a summary the parent prints a moment later, and no
+			 * atexit or leak-sanitizer at-exit check fires in a process that is mid-suite
+			 * by construction.  No alarm is armed here because the parent armed one
+			 * immediately before the exec and a pending alarm survives an exec, which
+			 * covers this image through its own core bootstrap too.
 			 *
-			 * This is reached AFTER the setup hook, so fst_pool and the plugin
-			 * pin are already in place exactly as they are for any other case.
+			 * Two credentials are required, not one: the marker names the mode and the
+			 * provenance handshake proves it came from the parent of this run.  Helper
+			 * mode _exit()s from inside this first case, so a top-level run that entered
+			 * it on an inherited or stale marker alone would run one case, exit with that
+			 * case's status, and be recorded as a clean pass with the six later cases
+			 * never run.
 			 *
-			 * No alarm is armed here: the parent armed one immediately before the
-			 * exec and a pending alarm survives an exec, so this image is already
-			 * covered - including through its own core bootstrap, which happened
-			 * before this line was reached.
+			 * A marker without valid provenance is therefore a hard refusal rather than a
+			 * fallback to an ordinary run: the marker's presence also disarms the spawn
+			 * below, since fst_h323_run_readconfig_isolated() refuses to nest on presence
+			 * alone, so this case could not do its work either way.  A distinct non-zero
+			 * code makes the misconfiguration unmistakable; 48 is outside the range a
+			 * signal or libc failure produces and is neither of automake's reserved 77
+			 * (skip) or 99 (framework error).
 			 *
-			 * TWO CREDENTIALS ARE REQUIRED, NOT ONE.  The marker names the mode; the
-			 * provenance handshake proves the marker came from the parent of THIS
-			 * run.  Only both together dispatch the helper body, because helper mode
-			 * _exit()s from inside this first case: a top-level run that entered it on
-			 * the strength of an inherited or stale marker alone would run one case,
-			 * exit with that case's status, and be recorded as a clean pass with the
-			 * six later cases silently never run.
-			 *
-			 * A MARKER WITHOUT VALID PROVENANCE IS THEREFORE A HARD REFUSAL, not a
-			 * fallback to an ordinary run.  Continuing as an ordinary run would be the
-			 * friendlier-looking choice and the wrong one: the marker's presence also
-			 * disarms the spawn below (fst_h323_run_readconfig_isolated refuses to
-			 * nest on presence alone), so this case could not do its work anyway, and
-			 * the environment it found itself in is one nothing should silently
-			 * tolerate.  Exiting with a DISTINCT NON-ZERO code makes the
-			 * misconfiguration impossible to miss and impossible to mistake for any
-			 * other outcome; 48 is outside the range a signal or a libc failure
-			 * produces and is neither of automake's reserved 77 (skip) or 99
-			 * (framework error).
-			 *
-			 * The diagnostic goes to STANDARD ERROR rather than through the core
-			 * logger, for the same reason FST_CORE_BEGIN reports a failed core there
+			 * The diagnostic goes to standard error rather than the core logger, for the
+			 * same reason FST_CORE_BEGIN reports a failed core there
 			 * (switch_test.h:296-298): the process is about to _exit(), so a message
 			 * queued for the logging thread might never be written, whereas stderr is
 			 * flushed here and is the one stream the helper path never redirects.
@@ -2911,10 +2407,9 @@ FST_CORE_BEGIN("conf_h323")
 			fst_xcheck(child_code == FST_H323_CHILD_OK,
 					   "ReadConfig() must report SWITCH_STATUS_FALSE and leave m_listeners empty when no h323.conf can be located");
 
-			/* RESIDUE NEUTRALITY, asserted rather than assumed.  A clean helper run
-			 * must leave this suite with exactly the one pid-named working directory a
-			 * single-core suite leaves; fst_h323_remove_helper_dir() has already
-			 * logged the offending path and errno for anything it could not remove. */
+			/* A clean helper run must leave this suite with exactly the one pid-named
+			 * working directory a single-core suite leaves; fst_h323_remove_helper_dir()
+			 * has already logged the path and errno for anything it could not remove. */
 			fst_xcheck(cleaned == SWITCH_STATUS_SUCCESS,
 					   "the helper's pid-named working directory must be removed in full after a clean isolated run");
 
@@ -2929,31 +2424,27 @@ FST_CORE_BEGIN("conf_h323")
 		FST_TEST_END()
 
 		/*
-		 * CASE 2 - a configuration-present module load registers the endpoint
-		 * interface.
+		 * CASE 2 - a configuration-present module load registers the endpoint interface.
 		 *
-		 * mod_h323_load() is the module's own entry point, reached by name
-		 * rather than through a dlopen: SWITCH_MODULE_LOAD_FUNCTION expands to
-		 * a plain definition with no storage class and mod_h323.cpp declares it
-		 * inside SWITCH_BEGIN_EXTERN_C, so it has C linkage and external
-		 * visibility.
+		 * mod_h323_load() is reached by name rather than through a dlopen:
+		 * SWITCH_MODULE_LOAD_FUNCTION expands to a plain definition with no storage
+		 * class and mod_h323.cpp declares it inside SWITCH_BEGIN_EXTERN_C, so it has C
+		 * linkage and external visibility.
 		 *
-		 * THE FIRST CASE TO BRING A PProcess UP, AND THAT IS WHY THE MODULE IS
-		 * OBSERVED FULLY INITIALISED.  Case 1 ran its own process in a separately
-		 * exec'd helper precisely so that this remains true: no PProcess has ever been
-		 * constructed or destroyed in THIS address space, so the
-		 * H323CapabilityFactory and the OpalMediaFormat registry are still fully
-		 * populated and the Initialise() inside the load builds a real capability
-		 * table, which this case then asserts.  Had any PProcess been created and
-		 * destroyed here beforehand, PostShutdown() would have emptied both
-		 * factories for good and the load could have added no audio capability at
-		 * all: an artefact of harness ordering, and an intentionally degraded
-		 * subject to assert against.  See the case-order note above the suite.
+		 * This is the first case to bring a PProcess up in this address space, which is
+		 * why the module is observed fully initialised: no PProcess has been constructed
+		 * or destroyed here, so the H323CapabilityFactory and the OpalMediaFormat
+		 * registry are still fully populated and the Initialise() inside the load builds
+		 * a real capability table.  Had one been created and destroyed beforehand,
+		 * PostShutdown() would have emptied both factories for good and the load could
+		 * have added no audio capability at all - a degraded subject produced purely by
+		 * harness ordering.  Case 1 runs in a separately exec'd helper so that this
+		 * stays true.
 		 *
-		 * The binding must be registered BEFORE the call, because the load
-		 * path reads the configuration itself.  This case leaves the module
-		 * loaded on purpose: every case after it observes a loaded module, and
-		 * the last asserts that shutting it down works.
+		 * The binding must be registered before the call, because the load path reads
+		 * the configuration itself.  The module is left loaded on purpose: every later
+		 * case observes a loaded module, and the last asserts that shutting it down
+		 * works.
 		 */
 		FST_TEST_BEGIN(module_load_registers_endpoint_interface)
 		{
@@ -2964,10 +2455,6 @@ FST_CORE_BEGIN("conf_h323")
 			FSProcess *process = NULL;
 			char capabilities[2048];
 
-			/* Defensive: release a harness-owned fallback process should one
-			 * somehow exist.  A no-op in a healthy run - case 1 runs its process
-			 * in a separately exec'd helper and the parent harness owns none - and it keeps
-			 * this case from ever asking PTLib for a second live PProcess. */
 			fst_h323_process_release();
 
 			/* This is where the run's first PProcess in this address space comes
@@ -2977,16 +2464,9 @@ FST_CORE_BEGIN("conf_h323")
 			 * directory must not run at all. */
 			fst_requires(fst_h323_plugin_path_is_pinned());
 
-			/* THE LAST FATAL CHECK IN THIS CASE, and it is made before anything
-			 * has been registered or allocated, so breaking out here leaves
-			 * nothing behind - the defensive release above has just run.  It
-			 * stays fatal on purpose: a second live PProcess would make PTLib
-			 * abort inside the load below, so refusing to continue is the only
-			 * safe response.  It is also the strongest available statement that no
-			 * factory has been torn down yet - no PProcess has ever existed in
-			 * this process image - and it holds despite case 1 running earlier
-			 * precisely because case 1 ran its process in a separately exec'd
-			 * helper. */
+			/* Fatal, and the last fatal check in this case: a second live PProcess would
+			 * make PTLib abort inside the load below.  Nothing has been registered or
+			 * allocated yet, so breaking out here strands nothing. */
 			fst_requires(!PProcess::IsInitialised());
 
 			/* From here on every check is NON-FATAL, so the cleanup tail at the
@@ -3088,16 +2568,6 @@ FST_CORE_BEGIN("conf_h323")
 					fst_check_string_equals(registered->interface_name, "h323");
 				}
 
-				/*
-				 * LISTENER START AND OWNERSHIP VERDICT FOR THE LOADED MODULE.
-				 *
-				 * The injected loopback listener was the one handed over, so the
-				 * wildcard fallback on 0.0.0.0:1720 was not taken, and the
-				 * address production asked to listen on is the one THIS
-				 * document configured.  The module's own endpoint then holds no
-				 * toolkit listener, which is the positive proof that loading the
-				 * module bound no port at all.
-				 */
 				fst_check_int_equals((int) endpoint.m_listeners.size(), 1);
 				fst_check_int_equals(fst_h323_toolkit.listener_calls, 1);
 				fst_check_int_equals(fst_h323_toolkit.listener_nulls, 0);
@@ -3106,8 +2576,6 @@ FST_CORE_BEGIN("conf_h323")
 				fst_check_string_has(fst_h323_toolkit.listener_address[0], FST_H323_PORT_MODULE_LOAD);
 				fst_check_int_equals((int) endpoint.GetListeners().GetSize(), 0);
 
-				/* This document leaves gk-address empty, so loading the module
-				 * asked the toolkit for no gatekeeper either. */
 				fst_check_int_equals(fst_h323_toolkit.gk_calls, 0);
 
 				/* THE MODULE WAS LOADED AGAINST POPULATED REGISTRIES, and that
@@ -3143,28 +2611,22 @@ FST_CORE_BEGIN("conf_h323")
 						  > fst_h323_name_position(capabilities, "G.711-ALaw-64k"));
 
 				/*
-				 * The module's listener is released HERE, by the case that
-				 * caused it to be constructed, and the count is its ownership
-				 * verdict.  It cannot be left to shutdown: mod_h323_shutdown()
-				 * deletes the FSProcess (mod_h323.cpp:195), whose destructor
-				 * deletes the endpoint (mod_h323.cpp:366-368), and
-				 * ~FSH323EndPoint touches only StopGkClient() and
-				 * ClearAllCalls() (mod_h323.cpp:612-617) - it never walks
-				 * m_listeners.  With the hand-off intercepted, the base
-				 * endpoint's list is empty too (asserted above), so nothing
-				 * downstream would ever free it.
+				 * The module's listener is released here, by the case that caused it to be
+				 * constructed, because nothing downstream would ever free it:
+				 * mod_h323_shutdown() deletes the FSProcess (mod_h323.cpp:195), whose
+				 * destructor deletes the endpoint (mod_h323.cpp:366-368), and
+				 * ~FSH323EndPoint touches only StopGkClient() and ClearAllCalls()
+				 * (mod_h323.cpp:612-617) without ever walking m_listeners.  With the
+				 * hand-off intercepted the base endpoint's list is empty too, so draining
+				 * now is safe for every later case: they read the module's interfaces,
+				 * capabilities and process, never its listener records.
 				 *
-				 * Draining it now is safe for every case that follows: they read
-				 * the module's interfaces, capabilities and process, never its
-				 * listener records.
-				 *
-				 * The count is hoisted into a local before it is asserted, and
-				 * that is MANDATORY rather than tidy: fst_check_int_equals
-				 * expands its first argument twice (switch_fct.h:3845-3851), so
-				 * calling a releasing function inside it would release once,
-				 * report zero on the second evaluation, and fail an assertion
-				 * that is actually true.  No side-effecting expression appears
-				 * as an argument to any check macro in this file.
+				 * The count is hoisted into a local before it is asserted because
+				 * fst_check_int_equals expands its first argument twice
+				 * (switch_fct.h:3845-3851); a releasing call inside it would release once,
+				 * report zero on the second evaluation and fail an assertion that holds.
+				 * No side-effecting expression appears as an argument to a check macro in
+				 * this file.
 				 */
 				released = fst_h323_release_listeners(&endpoint);
 				fst_check_int_equals(released, 1);
@@ -3199,14 +2661,12 @@ FST_CORE_BEGIN("conf_h323")
 		FST_TEST_END()
 
 		/*
-		 * CASE 3 - an empty gk-address leaves gatekeeper registration
-		 * disabled.
+		 * CASE 3 - an empty gk-address leaves gatekeeper registration disabled.
 		 *
-		 * Runs the real Initialise(), so the production guard at
-		 * mod_h323.cpp:451 is EXECUTED rather than reasoned about, and both of
-		 * its observable consequences - no registration thread and no toolkit
-		 * gatekeeper call - are asserted.  Socket-free all the same: the
-		 * listener hand-off is intercepted by the double, so nothing is opened.
+		 * Runs the real Initialise(), so the production guard at mod_h323.cpp:451 is
+		 * executed rather than reasoned about, and both observable consequences - no
+		 * registration thread and no toolkit gatekeeper call - are asserted.  Socket-free
+		 * all the same, because the listener hand-off is intercepted by the double.
 		 */
 		FST_TEST_BEGIN(gatekeeper_registration_disabled_when_gk_address_empty)
 		{
@@ -3217,9 +2677,6 @@ FST_CORE_BEGIN("conf_h323")
 
 			fst_requires(fst_h323_process_acquire() != NULL);
 
-			/* Initialise() registers an endpoint interface
-			 * (mod_h323.cpp:388-391), so it needs a real module interface out of
-			 * a real pool. */
 			module_interface = switch_loadable_module_create_module_interface(fst_pool, "mod_h323_test_gk_disabled");
 			fst_requires(module_interface != NULL);
 
@@ -3230,15 +2687,10 @@ FST_CORE_BEGIN("conf_h323")
 			fst_check(endpoint != NULL);
 
 			/*
-			 * THE DECISION IS EXECUTED, NOT INFERRED.
-			 *
-			 * Initialise() reads the configuration itself (mod_h323.cpp:381) and
-			 * then evaluates the gatekeeper guard at mod_h323.cpp:451.  Stopping
-			 * at ReadConfig() would leave m_thread NULL whether or not that
-			 * guard works - a pre-initialisation NULL is NULL for the trivial
-			 * reason that nothing has run yet - so it would assert nothing about
-			 * the guard.  Running Initialise() is what makes the NULL below
-			 * evidence.
+			 * Initialise() reads the configuration itself (mod_h323.cpp:381) and then
+			 * evaluates the gatekeeper guard at mod_h323.cpp:451.  Stopping at
+			 * ReadConfig() would leave m_thread NULL whether or not that guard works, so
+			 * running Initialise() is what makes the NULL below evidence.
 			 */
 			initialised = endpoint->Initialise(module_interface);
 
@@ -3251,17 +2703,11 @@ FST_CORE_BEGIN("conf_h323")
 			fst_check(endpoint->TestGetGkIdentifer().IsEmpty());
 			fst_check(endpoint->TestGetGkInterface().IsEmpty());
 
-			/* ... and registration is therefore never initiated.  The
-			 * !m_gkAddress.IsEmpty() guard at mod_h323.cpp:451 short-circuited
-			 * during the call above, so no FSGkRegThread was constructed or
-			 * resumed - which is what makes this case free of network side
-			 * effects even though it now runs the real decision. */
+			/* The !m_gkAddress.IsEmpty() guard at mod_h323.cpp:451 short-circuited during
+			 * the call above, so no FSGkRegThread was constructed or resumed - which is
+			 * what keeps this case free of network side effects. */
 			fst_check(endpoint->TestGetGkRegistrationThread() == NULL);
 
-			/* THE POSITIVE PROOF.  The toolkit was never asked to register with,
-			 * or search for, a gatekeeper.  A NULL thread pointer alone cannot
-			 * establish that; this can, because the sole UseGatekeeper() call
-			 * site (mod_h323.cpp:663) records every invocation. */
 			fst_check_int_equals(fst_h323_toolkit.gk_calls, 0);
 			fst_check_string_equals(fst_h323_toolkit.gk_address, "");
 
@@ -3269,19 +2715,8 @@ FST_CORE_BEGIN("conf_h323")
 			 * default at mod_h323.cpp:492 stands */
 			fst_check_string_equals((const char *) endpoint->TestGetEndpointName(), "FreeSwitch");
 
-			/* the interface was registered on the way through Initialise() */
 			fst_check(endpoint->GetSwitchInterface() != NULL);
 
-			/*
-			 * LISTENER START AND OWNERSHIP VERDICT.
-			 *
-			 * The document's single listener stanza was parsed, was handed to
-			 * StartListener() exactly once carrying the address and port THIS
-			 * document configured, and the empty-list default-interface fallback
-			 * was not taken.  The endpoint's own listener list is then empty,
-			 * which is the positive proof that no socket was opened and that the
-			 * endpoint owns nothing.
-			 */
 			fst_check_int_equals((int) endpoint->m_listeners.size(), 1);
 			fst_check_int_equals(fst_h323_toolkit.listener_calls, 1);
 			fst_check_int_equals(fst_h323_toolkit.listener_nulls, 0);
@@ -3290,9 +2725,7 @@ FST_CORE_BEGIN("conf_h323")
 			fst_check_string_has(fst_h323_toolkit.listener_address[0], FST_H323_PORT_GK_DISABLED);
 			fst_check_int_equals((int) endpoint->GetListeners().GetSize(), 0);
 
-			/* Ownership never transferred, so this case releases it, and the
-			 * returned count is the verdict that exactly the one declared
-			 * listener was accounted for. */
+			/* Ownership never transferred, so this case releases it. */
 			released = fst_h323_release_listeners(endpoint);
 			fst_check_int_equals(released, 1);
 			fst_check(endpoint->m_listeners.empty());
@@ -3307,40 +2740,30 @@ FST_CORE_BEGIN("conf_h323")
 		FST_TEST_END()
 
 		/*
-		 * CASE 4 - gk-address "*" REQUESTS A LAN GATEKEEPER SEARCH, the sentinel
-		 * documented at h323.conf.xml:10 ("empty to disable, \"*\" to search
-		 * LAN").
+		 * CASE 4 - gk-address "*" requests a LAN gatekeeper search, the sentinel
+		 * documented at h323.conf.xml:10 ("empty to disable, \"*\" to search LAN").
 		 *
-		 * The stored value is asserted, and then so is the decision it drives:
-		 * StartGkClient() is executed and the toolkit request it makes is
-		 * observed through the double.  Storage alone would not distinguish a
-		 * working sentinel from a string that is copied and then ignored.
+		 * The stored value is asserted, and so is the decision it drives: StartGkClient()
+		 * is executed and the toolkit request it makes is observed through the double,
+		 * because storage alone cannot distinguish a working sentinel from a string that
+		 * is copied and then ignored.
 		 *
-		 * WHY StartGkClient() IS CALLED DIRECTLY RATHER THAN THROUGH Initialise()
-		 * ---------------------------------------------------------------------
-		 * Not for convenience - Initialise() is unusable here, for two
-		 * independent production reasons.
+		 * StartGkClient() is called directly rather than through Initialise() because
+		 * Initialise() is unusable here for two production reasons.  A non-empty
+		 * gk-address makes it construct an FSGkRegThread, SetAutoDelete() it and Resume()
+		 * it (mod_h323.cpp:451-455), so the subject would be a self-deleting thread that
+		 * cannot be joined and every assertion about it would be a race.  Decisively,
+		 * StartGkClient()'s early return clears m_stop_gk but not m_thread
+		 * (mod_h323.cpp:671-674; only the normal exit at :686 nulls it), so once that
+		 * thread has deleted itself m_thread points at freed memory and
+		 * ~FSH323EndPoint -> StopGkClient() sees it non-NULL, sets m_stop_gk and spins in
+		 * `while (m_stop_gk) { h_timer(2); }` (mod_h323.cpp:693-701) waiting for a thread
+		 * that no longer exists - an unbounded hang.  No case in this file calls
+		 * Initialise() with a non-empty gk-address, so m_thread is NULL at every
+		 * destruction here.
 		 *
-		 * First, a non-empty gk-address makes Initialise() construct an
-		 * FSGkRegThread, SetAutoDelete() it and Resume() it (mod_h323.cpp:451-455).
-		 * The suite would then be observing a self-deleting thread it cannot
-		 * join, and every assertion about it would be a race.
-		 *
-		 * Second, and decisively: StartGkClient()'s early return clears
-		 * m_stop_gk but does NOT clear m_thread (mod_h323.cpp:670-673 - only the
-		 * normal exit at :686 nulls it).  So after that thread has run and
-		 * deleted itself, m_thread still points at freed memory, and
-		 * ~FSH323EndPoint -> StopGkClient() sees a non-NULL m_thread, sets
-		 * m_stop_gk and spins in `while (m_stop_gk) { h_timer(2); }`
-		 * (mod_h323.cpp:693-701) waiting for a thread that no longer exists.
-		 * That is an UNBOUNDED HANG.  It is a pre-existing production defect,
-		 * outside this engagement's remit to change, and this suite is careful
-		 * not to trigger it: no case ever calls Initialise() with a non-empty
-		 * gk-address, so m_thread is NULL at every destruction in this file.
-		 *
-		 * Calling StartGkClient() directly reaches the same UseGatekeeper()
-		 * invocation with none of that: one call, no thread, no sleep, no RAS
-		 * I/O, and a fully deterministic result.
+		 * Calling StartGkClient() directly reaches the same UseGatekeeper() invocation
+		 * with one call, no thread, no sleep and no RAS I/O.
 		 */
 		FST_TEST_BEGIN(gatekeeper_lan_search_address_preserved_verbatim)
 		{
@@ -3386,51 +2809,42 @@ FST_CORE_BEGIN("conf_h323")
 			 * call it - see the rationale above. */
 			fst_check(endpoint->TestGetGkRegistrationThread() == NULL);
 
-			/* No listener was handed over, because Initialise() never ran */
 			fst_check_int_equals(fst_h323_toolkit.listener_calls, 0);
 			fst_check_int_equals(fst_h323_toolkit.listener_default_calls, 0);
 
-			/* Nothing has asked the toolkit for a gatekeeper yet.  Asserted
-			 * BEFORE the call so that the invocation counted afterwards can only
-			 * have come from the StartGkClient() below. */
+			/* Asserted before the call, so the invocation counted afterwards can only have
+			 * come from the StartGkClient() below. */
 			fst_check_int_equals(fst_h323_toolkit.gk_calls, 0);
 
 			/*
-			 * ARM THE PRODUCTION ABORT, THEN RUN THE DECISION.
-			 *
 			 * The double reports failure - it must, because the normal loop exit
-			 * dereferences a NULL GetGatekeeper() (mod_h323.cpp:684-685) - so
-			 * production enters its retry loop.  m_stop_gk set beforehand means
-			 * the FIRST check inside that loop (mod_h323.cpp:670-673) returns,
-			 * before h_timer() sleeps for gk-retry seconds and before
-			 * RemoveGatekeeper() is reached.  One invocation, no sleep, no I/O.
+			 * dereferences a NULL GetGatekeeper() (mod_h323.cpp:684-685) - so production
+			 * enters its retry loop.  m_stop_gk set beforehand means the first check
+			 * inside that loop (mod_h323.cpp:671-674) returns, before h_timer() sleeps for
+			 * gk-retry seconds and before RemoveGatekeeper() is reached: one invocation,
+			 * no sleep, no I/O.
 			 *
-			 * The retry argument must be > 0 or the loop is never entered at
-			 * all, so the configured gk-retry is passed - the same value
-			 * Initialise() would have passed (mod_h323.cpp:452).  The three
-			 * PString pointers are the ones production passes; StartGkClient()
-			 * ignores them and reads the members directly (mod_h323.cpp:663).
+			 * The retry argument must be > 0 or the loop is never entered, so the
+			 * configured gk-retry is passed - the value Initialise() would have passed
+			 * (mod_h323.cpp:452).  The three PString pointers are the ones production
+			 * passes; StartGkClient() ignores them and reads the members directly
+			 * (mod_h323.cpp:664).
 			 */
 			endpoint->TestSetStopGk(true);
 			fst_check(endpoint->TestGetStopGk() == true);
 
 			endpoint->StartGkClient(endpoint->TestGetGkRetry(), NULL, NULL, NULL);
 
-			/* THE LAN-SEARCH REQUEST ITSELF: the toolkit was asked exactly once,
-			 * and the address it was asked with is the "*" sentinel verbatim -
-			 * not expanded to a host, not normalised away, not dropped. */
 			fst_check_int_equals(fst_h323_toolkit.gk_calls, 1);
 			fst_check_string_equals(fst_h323_toolkit.gk_address, "*");
 			fst_check_int_equals((int) strlen(fst_h323_toolkit.gk_address), 1);
 
-			/* and it carried the rest of the configured registration identity */
 			fst_check_string_equals(fst_h323_toolkit.gk_identifier, "fst-gatekeeper");
 			fst_check_string_equals(fst_h323_toolkit.gk_interface, "");
 
-			/* Production consumed the abort flag on its way out, which is the
-			 * observable proving the early-return branch at mod_h323.cpp:670-673
-			 * is the one that ran - the normal exit at :686 would have left
-			 * m_stop_gk set and nulled m_thread instead. */
+			/* Production consumed the abort flag on its way out, which is the observable
+			 * proving the early-return branch at mod_h323.cpp:671-674 is the one that ran;
+			 * the normal exit at :686 would have left m_stop_gk set and nulled m_thread. */
 			fst_check(endpoint->TestGetStopGk() == false);
 			fst_check(endpoint->TestGetGkRegistrationThread() == NULL);
 
@@ -3503,9 +2917,6 @@ FST_CORE_BEGIN("conf_h323")
 
 			fst_check(status == SWITCH_STATUS_SUCCESS);
 
-			/* ReadConfig() allocates exactly one root pool on entry
-			 * (mod_h323.cpp:469) and abandons it, so exactly one was recorded and
-			 * is still held pending the teardown release. */
 			fst_check_int_equals(pools_after - pools_before, 1);
 			fst_check(fst_h323_recorded_pool_count > 0);
 			fst_check_int_equals(fst_h323_recorded_pool_overflow, 0);
@@ -3554,24 +2965,15 @@ FST_CORE_BEGIN("conf_h323")
 			fst_check(endpoint->TestGetFastStart() == false);
 			fst_check(endpoint->TestGetH245Tunneling() == false);
 
-			/* still no gatekeeper activity: gk-address is empty here too, and
-			 * nothing in this case asks the toolkit for one */
 			fst_check(endpoint->TestGetGkAddress().IsEmpty());
 			fst_check(endpoint->TestGetGkRegistrationThread() == NULL);
 			fst_check_int_equals(fst_h323_toolkit.gk_calls, 0);
 
-			/* ReadConfig() alone hands nothing to StartListener(): the two
-			 * listeners exist as constructed, unopened objects and no start was
-			 * ever attempted.  This is what separates "parsed" from "started",
-			 * and it is asserted rather than left implicit. */
+			/* ReadConfig() alone hands nothing to StartListener(), so nothing is opened. */
 			fst_check_int_equals(fst_h323_toolkit.listener_calls, 0);
 			fst_check_int_equals(fst_h323_toolkit.listener_default_calls, 0);
 			fst_check_int_equals((int) endpoint->GetListeners().GetSize(), 0);
 
-			/* This case constructs the most listeners of any, and owns every one
-			 * of them: the released count must equal the two it declared.
-			 * Hoisted because fst_check_int_equals expands its argument twice
-			 * (switch_fct.h:3845-3851). */
 			released = fst_h323_release_listeners(endpoint);
 			fst_check_int_equals(released, 2);
 			fst_check(endpoint->m_listeners.empty());
@@ -3586,38 +2988,31 @@ FST_CORE_BEGIN("conf_h323")
 		FST_TEST_END()
 
 		/*
-		 * CASE 6 - the codec preference string "PCMA,PCMU,GSM,G729" is
-		 * honoured in order.
+		 * CASE 6 - the codec preference string "PCMA,PCMU,GSM,G729" is honoured in order.
 		 *
-		 * This case calls Initialise() on an endpoint of its own, because the
-		 * capability table is built there (mod_h323.cpp:393-421); ReadConfig()
-		 * only stores the preference string.  Its document pins the listener to
-		 * 127.0.0.1 on FST_H323_PORT_CODEC_PREFS and leaves gk-address empty, so
-		 * that the address the listener hand-off is asserted against is this
-		 * case's own and not another's.  No socket is opened: the hand-off is
-		 * intercepted by the double.
+		 * Initialise() is called on an endpoint of this case's own, because the capability
+		 * table is built there (mod_h323.cpp:393-421) while ReadConfig() only stores the
+		 * preference string.  The document pins the listener to loopback on
+		 * FST_H323_PORT_CODEC_PREFS and leaves gk-address empty, so the address the
+		 * hand-off is asserted against is this case's own; the hand-off is intercepted by
+		 * the double, so no socket is opened.  It needs the one PProcess the module-load
+		 * case created to still be alive, because once any PProcess has been destroyed
+		 * both PTLib factories are empty for good and AddAllCapabilities() has nothing to
+		 * add - which is what the declaration order protects.
 		 *
-		 * It works because the module-load case created the one PProcess of this
-		 * process and nothing has destroyed it, so both PTLib
-		 * factories are still populated and AddAllCapabilities() has something
-		 * to add.  That is the whole point of the declaration order.
-		 *
-		 * The mechanism, so that this case is not mis-modelled: the loop at
+		 * The mechanism, so that the case is not mis-modelled: the loop at
 		 * mod_h323.cpp:397-421 walks the module's own h323_formats table
-		 * (mod_h323.cpp:58-72) in TABLE order and, for each entry, asks whether
-		 * the entry's short token occurs as a SUBSTRING of the configured
-		 * string (mod_h323.cpp:400).  Capabilities are therefore appended in
-		 * table order, filtered by presence in the configuration - the
-		 * resulting order only coincidentally equals the order the operator
-		 * wrote.  For "PCMA,PCMU,GSM,G729" the table entries that match are
-		 * PCMA, PCMU, GSM and G729, in that table order.
+		 * (mod_h323.cpp:58-72) in table order and asks, for each entry, whether the
+		 * entry's short token occurs as a substring of the configured string
+		 * (mod_h323.cpp:400).  Capabilities are appended in table order filtered by
+		 * presence in the configuration, so the resulting order only coincidentally equals
+		 * the order the operator wrote.
 		 *
-		 * Assertions are PRESENCE plus RELATIVE ORDER plus MONOTONIC GROWTH.
-		 * An absolute capability count is deliberately never asserted: each
-		 * AddAllCapabilities() call (mod_h323.cpp:404) adds every factory entry
-		 * matching a "<name>*{sw}" wildcard, so "G.729*{sw}" alone can match
-		 * the G.729, G.729A, G.729B and G.729A/B registrars that mod_h323.h
-		 * installs (mod_h323.h:620-628).
+		 * Presence, relative order and monotonic growth are asserted, never an absolute
+		 * count: each AddAllCapabilities() call (mod_h323.cpp:404) adds every factory
+		 * entry matching a "<name>*{sw}" wildcard, so "G.729*{sw}" alone can match the
+		 * G.729, G.729A, G.729B and G.729A/B registrars mod_h323.h installs
+		 * (mod_h323.h:620-628).
 		 */
 		FST_TEST_BEGIN(codec_prefs_negotiation_order)
 		{
@@ -3663,7 +3058,6 @@ FST_CORE_BEGIN("conf_h323")
 
 			after = (int) endpoint->GetCapabilities().GetSize();
 
-			/* Initialise() returns TRUE unconditionally (mod_h323.cpp:457) */
 			fst_check(initialised == true);
 
 			/* The preference string must have GROWN the capability table.  Only
@@ -3711,16 +3105,10 @@ FST_CORE_BEGIN("conf_h323")
 			 * (mod_h323.cpp:388-391) */
 			fst_check(endpoint->GetSwitchInterface() != NULL);
 
-			/* the configured loopback listener was the one started, so the
-			 * empty-list wildcard fallback at mod_h323.cpp:441-442 was not
-			 * taken, and gk-address is empty so no RAS thread exists and the
-			 * toolkit was never asked for a gatekeeper */
 			fst_check_int_equals((int) endpoint->m_listeners.size(), 1);
 			fst_check(endpoint->TestGetGkRegistrationThread() == NULL);
 			fst_check_int_equals(fst_h323_toolkit.gk_calls, 0);
 
-			/* LISTENER START AND OWNERSHIP VERDICT, on the address THIS
-			 * document configured rather than any other case's */
 			fst_check_int_equals(fst_h323_toolkit.listener_calls, 1);
 			fst_check_int_equals(fst_h323_toolkit.listener_nulls, 0);
 			fst_check_int_equals(fst_h323_toolkit.listener_default_calls, 0);
@@ -3862,21 +3250,14 @@ FST_CORE_BEGIN("conf_h323")
 			fst_check(fst_h323_module_pool == NULL);
 			fst_check(!PProcess::IsInitialised());
 
-			/* The closing statement on the root-pool recording seam, made here
-			 * because this is the last declared case and therefore the only point
-			 * from which the whole run can be characterised.
-			 *
-			 * Three properties, each of which would be a real defect if it failed.
-			 * The seam recorded something, so it was genuinely in force for the
-			 * five cases that read configuration rather than silently bypassed.
-			 * Nothing it recorded survives, so every pool the module abandoned was
-			 * released and the process the sanitizer examines at exit is balanced.
-			 * And the recorder never overflowed its fixed table, which is the one
-			 * way a pool could have escaped the sweep unnoticed.
-			 *
-			 * The total is also logged, in the same spirit as the capability table
-			 * the codec case logs: an assertion says only that the property held,
-			 * whereas the number makes the run's own accounting readable in CI
+			/* Three properties of the root-pool recording seam, asserted from the last
+			 * declared case because only here can the whole run be characterised: the
+			 * seam recorded something, so it was in force for the five cases that read
+			 * configuration rather than silently bypassed; nothing it recorded survives,
+			 * so every pool the module abandoned was released and the image the sanitizer
+			 * examines at exit is balanced; and the recorder never overflowed its fixed
+			 * table, which is the one way a pool could escape the sweep unnoticed.  The
+			 * total is logged as well, so the run's own accounting is readable in CI
 			 * output without a debugger. */
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
 							  "mod_h323 abandoned %d root memory pool(s) during this run; %d still held, %d recorder overflow(s)\n",

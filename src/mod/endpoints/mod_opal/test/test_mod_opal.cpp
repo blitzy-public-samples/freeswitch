@@ -70,172 +70,114 @@
  * Suite design notes
  * ---------------------------------------------------------------------------
  *
- * This is a white-box-free harness: it includes only "../mod_opal.h" and reaches
- * its subjects exclusively through legitimate C++ access.  Nothing is
- * de-staticised, no symbol is re-exported, no `friend' declaration is added and
- * not one line of mod_opal.cpp / mod_opal.h is modified.
+ * This harness includes only "../mod_opal.h" and reaches its subjects through
+ * legitimate C++ access.  Nothing is de-staticised, no symbol is re-exported, no
+ * `friend' declaration is added and not one line of mod_opal.cpp / mod_opal.h is
+ * modified.
  *
- * Link shape.  Because the suite includes the header alone, the module's own
- * translation unit reaches the link through the libmodopal.la convenience library
- * that src/mod/endpoints/mod_opal/Makefile.am declares, following the tree's C++
+ * Link shape.  Because the suite includes the header alone, the module's translation
+ * unit reaches the link through the libmodopal.la convenience library that
+ * src/mod/endpoints/mod_opal/Makefile.am declares, following the tree's C++
  * module-test precedent (src/mod/codecs/mod_openh264/Makefile.am).  That target
  * carries the production module's own compile flags, because a binary built with
  * different flags is not testing the same code.
  *
- * Entry points.  SWITCH_MODULE_LOAD_FUNCTION / SWITCH_MODULE_SHUTDOWN_FUNCTION
- * expand to plain definitions with no storage class, so mod_opal_load() and
- * mod_opal_shutdown() have external linkage and are called directly here -
- * their switch_status_t results become genuine assertions rather than the
- * unasserted load and unload that the framework's module-scoped suite
- * bootstrap would perform on the suite's behalf.  Because mod_opal.cpp wraps
- * them in SWITCH_BEGIN_EXTERN_C, the declarations below must carry C linkage
- * or this C++ unit would fail to link against the mangled names.  The
- * module-interface definition macro is deliberately not invoked either: the
- * module's own translation unit already emits mod_opal_module_interface, and a
- * second definition would be a duplicate symbol.
+ * Entry points.  The module load and shutdown macros expand to plain definitions with
+ * no storage class, so mod_opal_load() and mod_opal_shutdown() have external linkage
+ * and are called directly here, which makes their switch_status_t results genuine
+ * assertions rather than the unasserted load and unload a module-scoped bootstrap
+ * performs.  mod_opal.cpp wraps them in SWITCH_BEGIN_EXTERN_C, so the declarations
+ * below must carry C linkage or this C++ unit would not resolve them.  The
+ * module-interface definition macro is deliberately not invoked: the module's own
+ * translation unit already emits mod_opal_module_interface.
  *
  * Configuration injection.  switch_xml_open_cfg() resolves "opal.conf" through
- * switch_xml_locate(), which consults the registered XML search bindings before
- * falling back to the static configuration root.  A binding cannot suppress a
- * static-root hit, so the two configuration outcomes are produced as follows:
+ * switch_xml_locate(), which consults the registered XML search bindings before the
+ * static configuration root, and a binding cannot suppress a static-root hit.  The
+ * failure outcome is therefore produced by the fixture root
+ * (test/conf_opal/freeswitch.xml) deliberately carrying no
+ * <configuration name="opal.conf"> child: with no binding registered both the binding
+ * list and the static root miss, switch_xml_open_cfg() returns NULL and
+ * FSManager::ReadConfig() takes its error branch.  The success outcome comes from a
+ * binding, registered for the duration of the case, that returns a freshly parsed copy
+ * of TEST_OPAL_CONFIG_XML below.
  *
- *   failure - the suite's own fixture root (test/conf_opal/freeswitch.xml)
- *             deliberately contains no <configuration name="opal.conf"> child.
- *             With no binding registered both the binding list and the static
- *             root miss, switch_xml_open_cfg() returns NULL and
- *             FSManager::ReadConfig() takes its documented error branch.
+ * PTLib process singleton.  OpalManager's constructor reads PProcess::Current(), which
+ * terminates the process outright when no PProcess-derived object exists.  Every
+ * FSManager therefore needs a live PProcess while PTLib permits at most one, so the
+ * suite keeps a single suite-local FSProcess for the cases that build managers
+ * directly and releases it before mod_opal_load() creates its own.
  *
- *   success - a binding is registered for the duration of the case and returns
- *             a freshly parsed copy of TEST_OPAL_CONFIG_XML below.
+ * Determinism.  No case dlopens or dlcloses a module, talks to a third party, opens a
+ * random port or depends on the wall clock.
  *
- * PTLib process singleton.  OpalManager's constructor reads
- * PProcess::Current(), which terminates the process outright when no
- * PProcess-derived object exists.  Every FSManager therefore needs a live
- * PProcess, while PTLib permits at most one at a time.  The suite keeps a
- * single suite-local FSProcess for the cases that build managers directly and
- * releases it before mod_opal_load() creates its own, so exactly one
- * PProcess-derived object is alive at any instant.
+ * Threads.  mod_opal declares no FreeSWITCH runtime entry point - the module
+ * definition macro takes (name, load, shutdown, runtime) (switch_types.h:2650) and
+ * mod_opal.cpp:100 passes NULL for runtime - so no case here can start a module
+ * runtime thread.  The OPAL toolkit does start threads of its own: IAX2EndPoint's
+ * constructor calls Initialise(), which on a successful wildcard listen starts an
+ * IAX2Transmit and an IAX2Receiver thread, and FSManager::Initialise() hands every
+ * configured listener to H323EndPoint::StartListener() (mod_opal.cpp:284-292) where an
+ * OpalListener owns a PThread for as long as it is open (opal/transports.h:491).
+ * Case 7 is the only case that reaches Initialise(), and it does so twice - a scoped
+ * local FSManager, then mod_opal_load() - so it accounts for up to two listener
+ * threads over its lifetime, one at a time, both on 127.0.0.1:21720 TCP.
  *
- * Determinism.  No case dlopens or dlcloses a module, talks to a third party,
- * opens a random port or depends on the wall clock.
+ * Those listener threads are reclaimed by ownership.  The scoped manager is destroyed
+ * at the end of its own block, before mod_opal_load() runs, so its listener closes
+ * before the module's own opens on the same address.  The module's listener is left
+ * alive on purpose, so that case 8 has a loaded module to assert a shutdown status
+ * against, and goes away when mod_opal_shutdown() deletes opal_process: FSProcess's
+ * destructor deletes the manager (mod_opal.cpp:244-246), ~OpalManager() deletes every
+ * endpoint still attached after ShutDown() has been called on each
+ * (opal/manager.h:163-167, opal/endpoint.h:92-96) - the ownership mod_opal itself
+ * relies on (mod_opal.cpp:266) - and closing an OpalListener joins its thread
+ * (opal/transports.h:469-474).  The sweep calls mod_opal_shutdown() unconditionally,
+ * so that reclamation does not depend on case 8 reaching its assertions.
  *
- * Threads, stated as two separate facts because they are two separate things.
- * mod_opal declares no FreeSWITCH runtime entry point - SWITCH_MODULE_DEFINITION
- * takes (name, load, shutdown, runtime) (switch_types.h:2650) and
- * mod_opal.cpp:100 passes NULL as that fourth (runtime) argument - so no case
- * here can start a module runtime thread, because there is none to start.  The
- * OPAL toolkit is a separate matter, and it does start threads of its own:
- *
- *   - IAX2EndPoint's constructor calls Initialise(), which on a successful
- *     wildcard listen starts an IAX2Transmit and an IAX2Receiver thread.  Left
- *     to itself, constructing an FSManager therefore starts two.  Neither ever
- *     runs here, but that is an outcome of the containment described next
- *     rather than something the module does for us, and case 2 asserts it
- *     instead of assuming it.
- *
- *   - FSManager::Initialise() hands every configured listener to
- *     H323EndPoint::StartListener() (mod_opal.cpp:284-292), and an OpalListener
- *     owns a PThread for as long as it is open (opal/transports.h:491), so a
- *     listener that binds IS a live toolkit thread.  Case 7 is the only case
- *     that reaches Initialise(), and it reaches it twice - once for a scoped
- *     local FSManager and once inside mod_opal_load() - so that case accounts
- *     for up to two listener threads over its lifetime, one at a time.  Both
- *     are confined to 127.0.0.1:21720 TCP, the only listener either manager is
- *     ever told about.
- *
- * Those listener threads are reclaimed by ownership rather than by hope.  The
- * scoped manager is destroyed at the end of its own block, before
- * mod_opal_load() runs, so its listener is closed before the module's own opens
- * on the same address.  The module's listener is then left alive on purpose, so
- * that case 8 has a loaded module to assert a shutdown status against, and it
- * goes away when mod_opal_shutdown() deletes opal_process: FSProcess's
- * destructor deletes the manager (mod_opal.cpp:244-246), ~OpalManager() deletes
- * every endpoint still attached to it after ShutDown() has been called on each
- * (opal/manager.h:163-167, opal/endpoint.h:92-96) - which is exactly the
- * ownership mod_opal itself relies on (mod_opal.cpp:266) - and closing an
- * OpalListener joins its thread (opal/transports.h:469-474).  The suite's sweep
- * calls mod_opal_shutdown() unconditionally, so that reclamation does not depend
- * on case 8 reaching its own assertions.
- *
- * Socket footprint, stated so that nobody has to rediscover it.  Every socket
- * this suite is responsible for is bound to loopback:
+ * Socket footprint.  Every socket this suite is responsible for is bound to loopback:
  *
  *   127.0.0.1:21720 TCP - the H.323 call-signalling listener the injected
- *             configuration declares, held only for as long as the FSManager
- *             that read that configuration lives.
+ *             configuration declares, held only while the FSManager that read that
+ *             configuration lives.
  *
- *   127.0.0.1:4569 UDP - the suite's own guard on the IAX2 default port.  It
- *             exists to make a socket NOT happen.  FSManager's constructor
- *             allocates an IAX2EndPoint unconditionally (mod_opal.cpp:262-270)
- *             and IAX2EndPoint's constructor calls Initialise(), which listens
- *             on the WILDCARD address on this port and, if that succeeds, starts
- *             an IAX2Transmit and an IAX2Receiver thread.  Nothing mod_opal
- *             reads narrows the address, and the harness must not change the
- *             module, so instead the suite makes the port unavailable before any
- *             manager exists - normally by taking it on loopback itself.  A
- *             loopback holder is enough to refuse a wildcard bind, so the listen
- *             fails and Initialise() returns before creating either thread.
+ *   127.0.0.1:4569 UDP - the suite's own guard on the IAX2 default port, which exists
+ *             to make a socket NOT happen.  FSManager's constructor allocates an
+ *             IAX2EndPoint unconditionally (mod_opal.cpp:262-270) and that constructor
+ *             calls Initialise(), which listens on the WILDCARD address on this port
+ *             and, on success, starts the two IAX2 threads.  Nothing mod_opal reads
+ *             narrows the address and the harness must not change the module, so the
+ *             suite takes the port on loopback itself before any manager exists; a
+ *             loopback holder is enough to refuse a wildcard bind.
  *
- *             The guard is NOT one socket held continuously from the first case
- *             to the last.  The suite's sweep releases it, deliberately last so
- *             that it outlives every manager the suite built, and the setup hook
- *             re-acquires it ahead of the next case body.  What is guaranteed is
- *             that it is in force whenever a case body runs - the only window in
- *             which a manager can exist - not that a single socket persists for
- *             the whole run.
+ *             The guard is not one socket held from the first case to the last: the
+ *             sweep releases it, deliberately last so that it outlives every manager
+ *             the suite built, and the setup hook re-acquires it ahead of the next case
+ *             body.  It is in force whenever a case body runs, which is the only window
+ *             in which a manager can exist.  Only a socket the constructing process
+ *             holds ITSELF counts as containment, and the one place ownership moves is
+ *             case 1's isolated helper.  The measured bind semantics and the full
+ *             ownership argument are recorded at the containment helpers below.
  *
- *             EXACTLY ONE STATE COUNTS AS CONTAINED: the process about to
- *             construct a manager holds this port itself.  A port that some
- *             other holder already owns does NOT count, even though the guard's
- *             own bind is refused with EADDRINUSE and even though a wildcard
- *             bind would be refused too for as long as that holder lasts - and
- *             "for as long as that holder lasts" is the entire problem.  The
- *             holder is another process and may close its socket at any instant,
- *             including between the check and the construction a few statements
- *             later, after which OPAL's wildcard listen succeeds and starts the
- *             very two threads the guard exists to prevent while the case
- *             carries on believing it could not.  So every bind refusal, that
- *             one included, is a hard containment failure: it is logged with the
- *             reason and the manager-constructing cases refuse to run rather
- *             than proceed on an exclusion they do not own.
+ *             The containment is observable: the IAX2 endpoint stays UNINITIALISED for
+ *             the whole of its manager's life, and case 2 asserts that from inside the
+ *             process and from outside it.  OPAL reports the refused listen through
+ *             PTRACE and propagates no status, so FSManager construction still runs to
+ *             completion and the endpoint is still allocated and attached - case 3
+ *             finds it there.
  *
- *             Ownership moves in exactly one place, and it moves rather than
- *             being shared: the isolated helper of case 1 is the process that
- *             constructs the manager there, so the parent releases the port
- *             before spawning it, the helper takes it as its own fatal
- *             precondition, and the parent takes it back - and asserts that it
- *             did - once the helper has been reaped.  No manager exists anywhere
- *             during that window.
+ *   0.0.0.0:4569 UDP - what the containment prevents, and what must never appear.  An
+ *             IAX2 listener on the wildcard address would be reachable from off-box for
+ *             as long as the process lived (CWE-668).  No case constructs an FSManager
+ *             without first fatally requiring that the port is already unavailable to a
+ *             wildcard bind, so a run in which containment could not be established
+ *             aborts rather than exposing the socket.
  *
- *             What the containment changes is one thing, and it is observable:
- *             the IAX2 endpoint stays UNINITIALISED.  InitialisedOK() is false
- *             for it for the whole of its manager's life, and case 2 asserts
- *             exactly that rather than assuming it, from inside the process and
- *             from outside it.  OPAL reports the refused listen through PTRACE
- *             and propagates no status, so FSManager construction still runs to
- *             completion and the endpoint is still allocated and still attached
- *             to the manager - case 3 finds it there.  Nothing in this suite
- *             treats an uninitialised IAX2 endpoint as equivalent to an
- *             initialised one; it is not, and the suite asserts the difference
- *             instead of papering over it.  See the containment section further
- *             down for the measured bind semantics all of this relies on.
- *
- *   0.0.0.0:4569 UDP - what the containment prevents, and what must never
- *             appear.  An IAX2 listener on the wildcard address would be
- *             reachable from off-box for as long as the process lived
- *             (CWE-668).  It is not prevented by hope: no case in this suite
- *             constructs an FSManager without first fatally requiring that the
- *             port is already unavailable to a wildcard bind, so a run in which
- *             neither containment state could be established aborts rather than
- *             exposing the socket, and case 2 is what fails if a wildcard owner
- *             ever does appear.
- *
- * What the listener cases assert.  FSManager::Initialise() reports a
- * StartListener() failure only through PTRACE and propagates no status
- * (mod_opal.cpp:287-291), so a listener that cannot bind leaves neither a
- * FreeSWITCH log line nor a failed return behind.  The cases below therefore
- * observe the listener *configuration* that reached ReadConfig() - its name,
- * address and port - and not a socket proven to be bound.
+ * What the listener cases assert.  FSManager::Initialise() reports a StartListener()
+ * failure only through PTRACE and propagates no status (mod_opal.cpp:287-291), so a
+ * listener that cannot bind leaves neither a FreeSWITCH log line nor a failed return
+ * behind.  The cases below therefore observe the listener *configuration* that reached
+ * ReadConfig() - its name, address and port - and not a socket proven to be bound.
  */
 
 SWITCH_BEGIN_EXTERN_C
@@ -372,18 +314,15 @@ static const char TEST_OPAL_CONFIG_XML_SETTINGS[] =
 	"</document>";
 
 /*
- * A third configuration document whose single <listener> element carries NO
- * name attribute.  This is the input that drives FSManager::ReadConfig() down
- * its listener-name default branch (mod_opal.cpp:418-419): switch_xml_attr_soft()
- * yields "" for an absent attribute, PString::IsEmpty() is therefore true, and
- * the name becomes the literal "unnamed".
+ * A third configuration document whose single <listener> element carries no name
+ * attribute, which drives FSManager::ReadConfig() down its listener-name default
+ * branch (mod_opal.cpp:418-419): switch_xml_attr_soft() yields "" for an absent
+ * attribute, PString::IsEmpty() is therefore true, and the name becomes "unnamed".
  *
- * Identical to the default document in every other respect - same recognised
- * keys, same loopback address, same high port - so the only
- * difference the assertion can be responding to is the missing attribute.  It
- * declares the port explicitly rather than relying on FSListener's constructor
- * default, because case 4 already covers that default and mixing the two would
- * blur which property failed.
+ * Identical to the default document in every other respect, so the missing attribute
+ * is the only difference an assertion can be responding to.  The port is declared
+ * explicitly rather than left to FSListener's constructor default, which case 4
+ * already covers.
  */
 static const char TEST_OPAL_CONFIG_XML_UNNAMED_LISTENER[] =
 	"<document type=\"freeswitch/xml\">"
@@ -411,72 +350,57 @@ static const char TEST_OPAL_CONFIG_XML_UNNAMED_LISTENER[] =
  * LISTENER-NAME OBSERVATION BY LOG CAPTURE
  * ---------------------------------------------------------------------------
  *
- * FSManager::m_listeners is PRIVATE (mod_opal.h, last member of the private
- * section), and no accessor exposes it or any element of it - FSManager's public
- * surface is GetSwitchInterface / GetContext / GetDialPlan / GetCodecPrefs /
- * GetDisableTranscoding only.  Constructing an FSListener directly, as case 4
- * does, cannot reach the default either: "unnamed" is applied by ReadConfig(),
+ * FSManager::m_listeners is private and no accessor exposes it or any element of it;
+ * FSManager's public surface is GetSwitchInterface / GetContext / GetDialPlan /
+ * GetCodecPrefs / GetDisableTranscoding only.  Constructing an FSListener directly, as
+ * case 4 does, cannot reach the default either: "unnamed" is applied by ReadConfig(),
  * not by the constructor, which initialises only m_port.
  *
- * The one thing ReadConfig() makes publicly observable about a listener it
- * stored is the line it emits for each one at mod_opal.cpp:431:
+ * The one thing ReadConfig() makes publicly observable about a listener it stored is
+ * the SWITCH_LOG_DEBUG line it emits for each one at mod_opal.cpp:431, carrying
+ * listener.m_name.  Capturing that through switch_log_bind_logger() is therefore the
+ * only legitimate seam, and it needs no private access, no friend declaration, no
+ * de-staticising and no production edit.  The technique is sanctioned in-tree:
+ * tests/unit/switch_log.c binds a logger and waits for a matching line under a mutex
+ * and condition variable, which is the shape reproduced below.
  *
- *     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG,
- *                       "Created Listener '%s'\n", (const char *) listener.m_name);
+ * DELIVERY IS ASYNCHRONOUS, and the consequence is a cross-case hazard rather than a
+ * mere need to wait.  switch_log_printf() only enqueues the node
+ * (switch_queue_trypush(LOG_QUEUE, node), src/switch_log.c:732); bound loggers are
+ * invoked later from log_thread(), which pops the queue and calls each binding whose
+ * level admits the node (src/switch_log.c:501-518).  Reading the captured value
+ * straight after ReadConfig() returned would race that thread, and a listener line
+ * produced by an earlier case can still be sitting in LOG_QUEUE when this case binds
+ * its logger and would then be handed to it as though this case had produced it.
  *
- * Capturing that through switch_log_bind_logger() is therefore the only
- * legitimate seam, and it needs no private access, no friend declaration, no
- * de-staticising and no production edit - rule R2-1 and rule R2-2 both hold.
- * The technique is sanctioned in-tree: tests/unit/switch_log.c binds a logger
- * and waits for a matching line under a mutex and condition variable, which is
- * the shape reproduced below.
+ * Two independent mechanisms make the observation exact, and neither consults the
+ * clock:
  *
- * DELIVERY IS ASYNCHRONOUS, and the consequence is a cross-case hazard rather
- * than a mere need to wait.  switch_log_printf() only enqueues the node
- * (switch_queue_trypush(LOG_QUEUE, node), src/switch_log.c:732); bound loggers
- * are invoked later, from log_thread(), which pops the queue and calls each
- * binding whose level admits the node (src/switch_log.c:501-518).  So a test
- * that read the captured value straight after ReadConfig() returned would be
- * racing that thread - and, worse, a listener line produced by an EARLIER case
- * can still be sitting in LOG_QUEUE when this case binds its logger, and would
- * then be handed to this logger as though this case had produced it.
+ *   1. A QUEUE BARRIER.  Arming binds the logger, emits a sentinel line carrying a
+ *      token unique to that arming, and refuses any listener line until the logger has
+ *      seen that sentinel come back.  LOG_QUEUE is one FIFO (src/switch_log.c:61,
+ *      created at :755) drained by exactly one consumer (log_thread's blocking
+ *      switch_queue_pop at :501), so once the sentinel has been dispatched every node
+ *      enqueued before it necessarily has been too.  Anything pending from an earlier
+ *      case therefore arrives strictly before the barrier opens and is discarded, and
+ *      everything this case produces is enqueued strictly after the sentinel and is
+ *      admitted.  That is a proof about queue order rather than an estimate.
  *
- * TWO INDEPENDENT MECHANISMS make the observation exact, and neither consults
- * the clock:
- *
- *   1. A QUEUE BARRIER.  Arming binds the logger and then emits a sentinel line
- *      of its own, carrying a token unique to that arming, and refuses to accept
- *      any listener line until the logger has SEEN that sentinel come back.
- *      LOG_QUEUE is one FIFO (src/switch_log.c:61, created at :755) drained by
- *      exactly one consumer (log_thread's blocking switch_queue_pop at :501), so
- *      once the sentinel has been dispatched every node enqueued before it has
- *      necessarily been dispatched already.  Anything left pending from an
- *      earlier case therefore arrives strictly BEFORE the barrier opens and is
- *      discarded, and everything this case goes on to produce is enqueued
- *      strictly AFTER the sentinel and is admitted.  That is a proof about queue
- *      order, not an estimate: it replaces the timestamp look-back an earlier
- *      revision used, which could only ever guess how much wall time separates
- *      two cases and gave no protection at all against a node that was still
- *      queued when the logger bound.
- *
- *   2. AN EXPECTED-NAME FILTER.  Arming also states the listener name the case
- *      is about to provoke, and only that name satisfies the wait.  A
- *      post-barrier line naming anything else is recorded separately as foreign,
- *      so the case can assert that no other listener line appeared inside its
- *      window rather than silently accepting the first marker it sees.  Together
- *      with the deliberately distinct name the settings case announces
- *      (TEST_OPAL_SETTINGS_LISTEN_NAME), a leaked line can therefore neither be
- *      mistaken for this case's line nor vacuously satisfy it.
+ *   2. AN EXPECTED-NAME FILTER.  Arming also states the listener name the case is about
+ *      to provoke, and only that name satisfies the wait.  A post-barrier line naming
+ *      anything else is recorded separately as foreign, so the case can assert that no
+ *      other listener line appeared inside its window.  Together with the deliberately
+ *      distinct name the settings case announces (TEST_OPAL_SETTINGS_LISTEN_NAME), a
+ *      leaked line can neither be mistaken for this case's line nor vacuously satisfy
+ *      it.
  *
  * The binding level is SWITCH_LOG_DEBUG because the dispatch test is
- * "binding->level >= node->level" and DEBUG is the highest-numbered real level,
- * so a lower binding level would filter this line out.  Binding at DEBUG also
- * raises the core's MAX_LEVEL (src/switch_log.c:461-463), which is the gate that
- * decides whether a node is enqueued for bound loggers at all
- * (src/switch_log.c:706); and FST_TEST_BEGIN independently raises the core log
- * level to SWITCH_LOG_DEBUG for the duration of each case, clearing the earlier
- * limit_level gate.  All three conditions therefore hold by construction rather
- * than by luck.
+ * "binding->level >= node->level" and DEBUG is the highest-numbered real level, so a
+ * lower binding level would filter this line out.  Binding at DEBUG also raises the
+ * core's MAX_LEVEL (src/switch_log.c:461-463), which gates whether a node is enqueued
+ * for bound loggers at all (src/switch_log.c:706); and FST_TEST_BEGIN independently
+ * raises the core log level to SWITCH_LOG_DEBUG for the duration of each case.  All
+ * three conditions therefore hold by construction.
  */
 #define TEST_OPAL_LISTENER_LOG_MARKER "Created Listener '"
 #define TEST_OPAL_LOG_TIMEOUT_MS 5000
@@ -714,7 +638,6 @@ static switch_status_t test_opal_log_await_sentinel(const char *sentinel, int *s
 	return seen ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
 }
 
-/* The OPENING barrier: everything queued before this arming is drained away. */
 static switch_status_t test_opal_log_barrier(void)
 {
 	return test_opal_log_await_sentinel(test_opal_log_sentinel, &test_opal_log_barrier_seen);
@@ -723,24 +646,20 @@ static switch_status_t test_opal_log_barrier(void)
 /*
  * The CLOSING barrier: everything the action queued has been dispatched.
  *
- * WHY THIS IS REQUIRED AND WHAT IT BUYS
- * -------------------------------------
- * Waiting for the AWAITED listener line proves that line arrived; it proves
- * nothing about lines queued after it.  The log queue has a single consumer
- * thread, so it is strictly FIFO: once a sentinel enqueued after the action has
- * been handed to this logger, every node the action enqueued before it has
- * already been handed over too.  Only then is "no OTHER listener was announced"
- * a decidable question - read any earlier and a foreign line still sitting in the
- * queue would be silently missed, which is an observation race rather than a
+ * Waiting for the awaited listener line proves that line arrived and nothing about
+ * lines queued after it.  The log queue has a single consumer thread, so it is strictly
+ * FIFO: once a sentinel enqueued after the action has been handed to this logger, every
+ * node the action enqueued before it has been handed over too.  Only then is "no OTHER
+ * listener was announced" decidable - read any earlier and a foreign line still sitting
+ * in the queue would be silently missed, which is an observation race rather than a
  * genuine absence (CWE-362).
  *
- * A FRESH sentinel is minted per close, under the mutex the logger holds while it
- * reads it, so the write is synchronised against that read.  Minting rather than
- * reusing matters: the wait loop re-emits once per slice, so a surplus copy of an
- * earlier sentinel may still be in the queue, and reusing a string would let the
- * barrier open on a stale node that predates the action.  The epoch counter is
- * shared with the opening barrier so no two sentinels of either kind can ever
- * collide.
+ * A fresh sentinel is minted per close, under the mutex the logger holds while reading
+ * it, so the write is synchronised against that read.  Minting rather than reusing
+ * matters because the wait loop re-emits once per slice, so a surplus copy of an earlier
+ * sentinel may still be queued and reuse would let the barrier open on a stale node that
+ * predates the action.  The epoch counter is shared with the opening barrier so no two
+ * sentinels of either kind can collide.
  */
 static switch_status_t test_opal_log_barrier_close(void)
 {
@@ -852,8 +771,6 @@ static switch_status_t test_opal_log_capture_start(const char *expected_name)
 	test_opal_log_captured = 0;
 	test_opal_log_foreign = 0;
 	test_opal_log_barrier_seen = 0;
-	/* Disarm any closing barrier from a previous arming, so this arming's window
-	 * cannot be closed by a sentinel that predates it. */
 	test_opal_log_close_sentinel[0] = '\0';
 	test_opal_log_close_seen = 0;
 	switch_copy_string(test_opal_log_expected_name, expected_name, sizeof(test_opal_log_expected_name));
@@ -1064,64 +981,47 @@ static switch_status_t test_opal_unbind_config(void)
  * Containment of the toolkit's own side effects
  * ---------------------------------------------------------------------------
  *
- * Two side effects are not the suite's to want: PTLib's plugin search path and
- * OPAL's IAX2 listener.  Both are established by constructors this suite has to
- * call, so both have to be contained BEFORE the first of those constructors
- * runs.  Neither is contained by mod_opal for us in the cases that build objects
- * directly.
+ * Two side effects have to be contained before the first constructor this suite calls
+ * runs, because mod_opal contains neither of them for the cases that build objects
+ * directly: PTLib's plugin search path, and OPAL's IAX2 listener.
  *
  *
  * (1) PLUGIN SEARCH PATH
  *
- * Constructing any PProcess makes PTLib enumerate its plugin directory and
- * dlopen what it finds there.  The directory comes from the environment:
- * PTLIBPLUGINDIR is the current name and PWLIBPLUGINDIR the legacy one, and both
- * strings are present in the libpt this module links against, so both are live
- * inputs.  A test binary is run by `make check' out of an environment nobody
- * audits, which turns an inherited value into an arbitrary-code-execution seam
- * (CWE-427, CWE-829).
+ * Constructing any PProcess makes PTLib enumerate its plugin directory and dlopen what
+ * it finds there.  The directory comes from the environment: PTLIBPLUGINDIR is the
+ * current name and PWLIBPLUGINDIR the legacy one, and both strings are present in the
+ * libpt this module links against, so both are live inputs.  A test binary is run by
+ * `make check' out of an environment nobody audits, which turns an inherited value into
+ * an arbitrary-code-execution seam (CWE-427, CWE-829).
  *
- * mod_opal does set PTLIBPLUGINDIR to "/no/thanks" - but it does so inside
- * mod_opal_load() (mod_opal.cpp:108), which runs in exactly one case near the
- * end of this suite, and it never touches the legacy name at all.  Every case
- * that constructs an FSProcess directly - which is every case before the load
- * case - therefore ran unprotected.
+ * mod_opal sets PTLIBPLUGINDIR to "/no/thanks" inside mod_opal_load()
+ * (mod_opal.cpp:108), which runs in exactly one case near the end of this suite, and it
+ * never touches the legacy name.  Both variables are therefore pinned here,
+ * unconditionally and before the first PProcess, to a fixed directory that does not
+ * exist, since nothing can be enumerated in a directory that is not there.
+ * "/no/thanks" is deliberately the value the production module uses, so harness and
+ * module agree.
  *
- * So both variables are pinned here, unconditionally and before the first
- * PProcess, to a fixed directory that does not exist: nothing can be enumerated
- * in a directory that is not there.  "/no/thanks" is deliberately the same value
- * the production module already uses, so harness and module agree.
+ * setenv() rather than putenv(): setenv() copies both name and value into storage the C
+ * library owns, whereas putenv() retains the caller's buffer, which is what makes the
+ * common `putenv((char *) "NAME=value")' idiom a const-correctness violation - it casts
+ * away const from a string literal and hands the result to an interface entitled to
+ * write through it, so any later write is undefined behaviour (CWE-758).  The overwrite
+ * flag is 1 because this must replace an inherited value, not supply a default for an
+ * unset one.
  *
- * WHY setenv() AND NOT putenv()
- * -----------------------------
- * setenv() COPIES both the name and the value into storage the C library owns,
- * so nothing belonging to this file is retained by the environment.  putenv()
- * instead RETAINS the caller's buffer, which is what makes the common
- * `putenv((char *) "NAME=value")` idiom a const-correctness violation: it casts
- * away const from a string literal and hands the result to an interface that is
- * entitled to write through it, so any later write - including a putenv() of the
- * same name from another library - is undefined behaviour (CWE-758).  setenv()
- * removes the hazard rather than reasoning about why it might not bite.
+ * It is wired in two places on purpose - the suite setup hook, which FCTX runs before
+ * every case body, and the acquire helper below, the only place in the suite that
+ * constructs a PProcess - so that no re-ordering and no new case can reintroduce the
+ * exposure.  It is idempotent, so paying twice costs nothing.
  *
- * The overwrite flag is 1 deliberately: this must REPLACE an inherited value,
- * not merely supply a default for an unset one, which is the whole point of
- * pinning against a hostile or stale environment.
- *
- * It is wired in two places on purpose - the suite setup hook, which FCTX runs
- * before every case body, and the acquire helper below, which is the only place
- * in the suite that constructs a PProcess.  Either alone suffices today; both
- * means no re-ordering and no new case can reintroduce the exposure.  It is
- * idempotent, so paying twice costs nothing.
- *
- * NOTHING ABOUT THE PIN IS CACHED, AND THAT IS THE POINT.  setenv() can fail -
- * it returns non-zero and sets errno on an allocation failure - so a helper that
- * assumed success and remembered it would report containment that does not
- * exist, and every assertion resting on that memory would pass while the process
- * came up against an unaudited search path.  The pin is therefore re-applied and
- * RE-VERIFIED BY READBACK on every call, and the verdict is derived from the
- * environment as it is at that instant rather than from a flag.  Two setenv()
- * calls and two getenv()/strcmp() pairs are far too cheap for the saving to be
- * worth the failure mode.
+ * Nothing about the pin is cached.  setenv() can fail, returning non-zero on an
+ * allocation failure, so a helper that assumed success and remembered it would report
+ * containment that does not exist while the process came up against an unaudited search
+ * path.  The pin is re-applied and re-verified by readback on every call, and the
+ * verdict is derived from the environment as it is at that instant rather than from a
+ * flag.
  */
 #define TEST_OPAL_PLUGIN_DIR "/no/thanks"
 
@@ -1210,19 +1110,17 @@ static switch_socket_t *test_opal_iax2_guard = NULL;
  * True for a bind status that means "already in use".
  *
  * switch_socket_bind() is a thin wrapper over fspr_socket_bind()
- * (src/switch_apr.c:744), and the Unix implementation returns the platform's own
- * error code unchanged - `if (bind(...) == -1) return errno;'
- * (libs/apr/network_io/unix/sockets.c:160).  fspr defines canonical predicates
- * for a handful of codes (APR_STATUS_IS_EACCES, _EAGAIN, _EINTR) but NONE for
- * address-in-use, so there is no portable macro to defer to and the comparison
- * is made against the platform's EADDRINUSE directly.  <errno.h> arrives through
- * switch.h, and the value compared is the one the kernel gave the failing bind.
- * The cast is needed only because switch_status_t is an enum.
+ * (src/switch_apr.c:744) and the Unix implementation returns the platform's own error
+ * code unchanged - `if (bind(...) == -1) return errno;'
+ * (libs/apr/network_io/unix/sockets.c:160).  fspr defines canonical predicates for a
+ * handful of codes but none for address-in-use, so the comparison is made against the
+ * platform's EADDRINUSE directly; <errno.h> arrives through switch.h and the cast is
+ * needed only because switch_status_t is an enum.
  *
- * Used for DIAGNOSIS ONLY.  A port some other holder already owns is NOT a
- * substitute for holding the guard - see test_opal_iax2_containment_in_effect() -
- * so this predicate decides which of two error messages explains a refusal, never
- * whether the refusal is tolerable.
+ * Diagnosis only.  A port some other holder already owns is not a substitute for
+ * holding the guard - see test_opal_iax2_containment_in_effect() - so this predicate
+ * decides which of two error messages explains a refusal, never whether the refusal is
+ * tolerable.
  */
 static int test_opal_status_is_addr_in_use(switch_status_t status)
 {
@@ -1268,21 +1166,17 @@ static switch_status_t test_opal_iax2_guard_acquire(void)
 		test_opal_iax2_guard = NULL;
 
 		/*
-		 * EVERY refusal is a containment failure, including address-in-use, and the
-		 * two are separated here only so the log says which one happened.
+		 * Every refusal is a containment failure, including address-in-use; the two are
+		 * separated only so the log says which one happened.
 		 *
-		 * Address-in-use is the tempting one to tolerate: it proves the port is
-		 * taken right now, and a wildcard bind would be refused for as long as that
-		 * lasts.  But "for as long as that lasts" is not a property this suite
+		 * Address-in-use proves the port is taken right now, and a wildcard bind would be
+		 * refused for as long as that lasts - but that is not a property this suite
 		 * controls.  The holder is another process, free to close its socket at any
-		 * instant - including between this bind being refused and an FSManager
-		 * being constructed a few statements later - and the moment it does, the
-		 * port is free and IAX2EndPoint::Initialise() binds the WILDCARD address
-		 * and starts its transmitter and receiver, while the case that checked
-		 * carries on believing it cannot.  A borrowed exclusion is therefore not an
-		 * exclusion at all, and treating it as one is exactly the check-then-use
-		 * gap this guard exists to close.  Only a socket THIS process holds can be
-		 * relied upon, because only that one cannot be released behind its back.
+		 * instant, including between this refusal and an FSManager being constructed a few
+		 * statements later, after which IAX2EndPoint::Initialise() binds the WILDCARD
+		 * address and starts its transmitter and receiver while the case that checked
+		 * carries on believing it cannot.  That is the check-then-use gap this guard
+		 * exists to close, so only a socket THIS process holds counts.
 		 */
 		if (test_opal_status_is_addr_in_use(bound)) {
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
@@ -1322,26 +1216,20 @@ static void test_opal_iax2_guard_release(void)
 }
 
 /*
- * True when THIS PROCESS holds the IAX2 default port, and therefore when a
- * wildcard bind of that port is guaranteed to be refused for as long as the
- * caller keeps running.
+ * True when THIS PROCESS holds the IAX2 default port, and therefore when a wildcard bind
+ * of that port is guaranteed to be refused for as long as the caller keeps running.
  *
- * A LIVE CHECK OF OWNED STATE, which is the whole of the contract.  A guard
- * already held answers immediately; otherwise one is taken NOW and the answer is
- * whether that succeeded.  There is no third answer: a port held by somebody else
- * does not qualify, however certain the observation was at the instant it was
- * made, because the observation expires the moment the other holder closes its
- * socket and nothing informs the caller when it does.  Every case that
- * constructs an FSManager requires this fatally beforehand, so the exclusion each
- * one relies on is one this process owns and cannot lose behind its back rather
- * than one it merely witnessed.
+ * A live check of owned state, which is the whole of the contract: a guard already held
+ * answers immediately, otherwise one is taken now and the answer is whether that
+ * succeeded.  There is no third answer, because a port held by somebody else stops
+ * qualifying the moment that holder closes its socket and nothing informs the caller
+ * when it does.  Every case that constructs an FSManager requires this fatally
+ * beforehand.
  *
- * The one place ownership legitimately moves is the isolated helper: the parent
- * releases the guard before spawning it, the helper takes it for itself as its
- * own fatal precondition, and the parent takes it back after reaping.  No
- * FSManager is constructed anywhere in that window - see the handover in the
- * configuration-absent case - so at every instant at which a manager exists, the
- * process that built it is the process holding the port.
+ * The one place ownership legitimately moves is the isolated helper: the parent releases
+ * the guard before spawning it, the helper takes it as its own fatal precondition, and
+ * the parent takes it back after reaping.  No FSManager exists anywhere in that window,
+ * so whenever a manager exists the process that built it is the one holding the port.
  */
 static int test_opal_iax2_containment_in_effect(void)
 {
@@ -1429,77 +1317,59 @@ static void test_opal_release_process(void)
  * ISOLATING THE CONFIGURATION-ABSENT BRANCH IN ITS OWN PROCESS
  * ---------------------------------------------------------------------------
  *
- * WHY THIS EXISTS
- * ---------------
- * FSManager::ReadConfig() creates an event with switch_event_create() and, on the
- * path where switch_xml_open_cfg() cannot locate the module's configuration,
- * returns without ever destroying it (mod_opal.cpp:347-357).  That is a
- * deterministic leak in PRODUCTION code, and production code is immutable for
- * this engagement (AAP 0.8.1), so it cannot be fixed at its source and it cannot
- * be avoided while still asserting the branch - which is a required behaviour.
+ * FSManager::ReadConfig() creates an event with switch_event_create() and, on the path
+ * where switch_xml_open_cfg() cannot locate the module's configuration, returns without
+ * ever destroying it (mod_opal.cpp:347-357).  That is a deterministic leak in production
+ * code, which this suite must not modify, so it can neither be fixed at its source nor
+ * avoided while still asserting the branch.  Executing it in the principal suite process
+ * would fail the address sanitizer the CI unit-test arm always enables (ci.sh:76-79).
+ * Running it in a process of its own traverses and asserts the branch while confining the
+ * leak to a short-lived process that exits through _exit() and never reaches a leak
+ * check; the principal process never constructs the FSManager that would leak.
  *
- * Executing it in the principal suite process would therefore make this binary
- * fail the address sanitizer that the CI unit-test arm always enables
- * (ci.sh:76-79), turning a required assertion into a red build.  Running it in a
- * process of its own resolves the conflict exactly: the branch is genuinely
- * traversed and genuinely asserted, while the leak is confined to a short-lived
- * process that exits through _exit() and so never reaches a leak check at all.
- * The principal process stays sanitizer-clean because it never constructs the
- * FSManager that would leak.
+ * fork() IMMEDIATELY FOLLOWED BY exec()
+ * ------------------------------------
+ * By the time any case body runs, FST_CORE_BEGIN has brought a multithreaded core up.
+ * fork() duplicates only the calling thread, so every mutex the other threads happened
+ * to hold is duplicated locked and can never be released in the child - the classic
+ * inherited-lock deadlock (CWE-667).  The core allocator, the logging queue and PTLib's
+ * factory registries are all lock-protected, so any allocator, logger, XML or PTLib call
+ * in such a child can block forever.
  *
- * HOW THE CHILD IS ISOLATED: fork() IMMEDIATELY FOLLOWED BY exec()
- * ---------------------------------------------------------------
- * By the time any case body runs, FST_CORE_BEGIN has brought a multithreaded
- * FreeSWITCH core up.  fork() duplicates only the calling thread, so every mutex
- * the other threads happened to hold is duplicated LOCKED and can never be
- * released in the child - the classic inherited-lock deadlock (CWE-667).  Any
- * allocator, logger, XML or PTLib call in a forked child of such a process can
- * therefore block forever, because all three of the core allocator, the logging
- * queue and PTLib's factory registries are lock-protected.
- *
- * The child consequently does NOT do the work.  It reaches execve() immediately,
- * touching nothing but async-signal-safe calls on the way, and the assertions run
- * in the fresh image AFTER that exec has replaced the address space - a process
- * with one thread, its own core, its own allocator and no inherited lock state at
- * all.  The helper is selected by an environment variable, and it announces itself
- * by exit code.
+ * The child therefore does not do the work.  It reaches execve() immediately, touching
+ * nothing but async-signal-safe calls on the way, and the assertions run in the fresh
+ * image after that exec has replaced the address space - one thread, its own core, its
+ * own allocator and no inherited lock state.  The helper is selected by an environment
+ * marker and announces itself by exit code.
  */
 
-/* Exit codes the helper returns.  Distinct values so an unexpected outcome names
- * its own failure mode in the parent's diagnostic rather than merely being
- * "non-zero". */
-#define TEST_OPAL_CHILD_OK              0	/* ReadConfig() reported SWITCH_STATUS_FALSE */
-#define TEST_OPAL_CHILD_UNPINNED        50	/* the plugin search path was not verifiably pinned */
-#define TEST_OPAL_CHILD_NO_CONTAINMENT  51	/* the IAX2 wildcard listener was not contained */
-#define TEST_OPAL_CHILD_NO_PROCESS      52	/* no PTLib process could be acquired */
-#define TEST_OPAL_CHILD_NOT_FALSE       53	/* ReadConfig() did NOT report failure */
-#define TEST_OPAL_CHILD_NOT_FALSE_AGAIN 54	/* the repeated ReadConfig() did NOT report failure */
-#define TEST_OPAL_CHILD_EXEC_FAILED     57	/* fork() succeeded, execve() did not */
-#define TEST_OPAL_CHILD_BAD_PROVENANCE  58	/* helper marker without parent provenance   */
+/* Exit codes the helper returns.  Distinct values so an unexpected outcome names its own
+ * failure mode in the parent's diagnostic rather than merely being "non-zero". */
+#define TEST_OPAL_CHILD_OK              0
+#define TEST_OPAL_CHILD_UNPINNED        50
+#define TEST_OPAL_CHILD_NO_CONTAINMENT  51
+#define TEST_OPAL_CHILD_NO_PROCESS      52
+#define TEST_OPAL_CHILD_NOT_FALSE       53
+#define TEST_OPAL_CHILD_NOT_FALSE_AGAIN 54
+#define TEST_OPAL_CHILD_EXEC_FAILED     57
+#define TEST_OPAL_CHILD_BAD_PROVENANCE  58
 
 /*
- * THE MARKER IS NOT, BY ITSELF, AUTHORITY TO RUN AS THE HELPER
- * -----------------------------------------------------------
- * The marker below names the mode, and nothing more.  It is an ordinary
- * environment variable, so it is inherited by anything this binary is run under
- * and it survives in any shell that exported it once.  A process that dispatched
- * the helper body on the marker alone would therefore run exactly one case and
- * exit with that case's status - and because that status is zero when the case
- * passes, the run would be recorded as a clean pass with every later case
- * silently never executed.  A test suite that can be reduced to one case by a
- * stale environment variable, without saying so, is not a safe suite.
+ * The marker is not, by itself, authority to run as the helper.  It is an ordinary
+ * environment variable, so it is inherited by anything this binary is run under and
+ * survives in any shell that exported it once.  Dispatching the helper body on the
+ * marker alone would run exactly one case and exit with that case's status - zero when
+ * the case passes - so the run would be recorded as a clean pass with every later case
+ * silently never executed.
  *
- * So the marker is paired with a SECOND credential that cannot be inherited
- * usefully: a one-time record the parent writes into an anonymous pipe before it
- * forks.  The descriptor number and a freshly generated token travel in the
- * child's environment, and the helper insists that the descriptor really is a
- * pipe and that the record on it matches the token exactly.  A token from another
- * run does not match; a marker with no pipe behind it has nothing to match
- * against.  Both credentials together mean the parent of THIS run asked for a
- * helper; anything less is refused outright with TEST_OPAL_CHILD_BAD_PROVENANCE.
+ * The marker is therefore paired with a second credential that cannot be inherited
+ * usefully: a one-time record the parent writes into an anonymous pipe before it forks.
+ * The descriptor number and a freshly generated token travel in the child's environment,
+ * and the helper insists that the descriptor really is a pipe and that the record on it
+ * matches the token exactly.  A token from another run does not match, and a marker with
+ * no pipe behind it has nothing to match against.  Anything less than both credentials is
+ * refused outright with TEST_OPAL_CHILD_BAD_PROVENANCE.
  */
-
-/* The marker that turns an ordinary run of this binary into the helper. */
 #define TEST_OPAL_HELPER_ENV            "FST_MOD_OPAL_ISOLATED_HELPER"
 #define TEST_OPAL_HELPER_READCONFIG     "readconfig-missing-config"
 
@@ -1525,18 +1395,14 @@ static void test_opal_release_process(void)
  * is rejected by arithmetic before it ever reaches fstat(). */
 #define TEST_OPAL_HELPER_MAX_FD         (1 << 20)
 
-/* Preferred image path; argv[0] is the fallback when /proc is not mounted. */
 #define TEST_OPAL_SELF_EXE              "/proc/self/exe"
 
 /*
- * The helper's own watchdog, and the parent's independent bound on it.
- *
- * The alarm is armed BEFORE the exec because a pending alarm survives exec, so it
- * covers the helper's own bootstrap as well as its body.  The parent's deadline is
- * deliberately longer, so the helper's self-watchdog normally fires first and the
- * parent reports a signal rather than a timeout - the more precise diagnosis.
- * The measured helper runtime is about a second, so both bounds carry a very large
- * safety factor and neither can be reached by ordinary slowness.
+ * The helper's own watchdog, and the parent's independent bound on it.  The alarm is
+ * armed before the exec because a pending alarm survives exec, so it covers the helper's
+ * bootstrap as well as its body.  The parent's deadline is deliberately longer, so the
+ * self-watchdog normally fires first and the parent reports a signal rather than a
+ * timeout, which is the more precise diagnosis.
  */
 #define TEST_OPAL_CHILD_ALARM_SECONDS   60
 #define TEST_OPAL_CHILD_DEADLINE_MS     90000
@@ -1557,23 +1423,16 @@ static int test_opal_in_helper_mode(void)
 }
 
 /*
- * Presence of the marker WHATEVER ITS VALUE, which is a deliberately different
- * question from the one above.
+ * Presence of the marker whatever its value, which is a deliberately different question
+ * from the exact-value test above: that one decides whether this process should RUN the
+ * helper body, this one decides whether it may SPAWN one.  Recursion is then impossible
+ * unless both are wrong at once.
  *
- * WHY TWO PREDICATES AND NOT ONE
- * ------------------------------
- * The exact-value test decides whether this process should RUN the helper body;
- * this presence test decides whether it is allowed to SPAWN one.  Keeping them
- * separate removes a single point of failure: recursion is impossible unless BOTH
- * are wrong at once.
- *
- * If the value test alone governed both, a marker that failed to match - a
- * mistyped value, a future mode name that diverged, or a regression in the
- * comparison itself - would leave a process that is a helper but does not know
- * it, and it would spawn a helper of its own, which would do the same.  Each
- * generation arms a fresh watchdog, so the recursion sustains itself instead of
- * expiring at any deadline.  The refusal is therefore keyed on presence, which
- * holds for any value the parent might have written.
+ * Were the value test to govern both, a marker that failed to match - a mistyped value,
+ * a diverged mode name, a regression in the comparison - would leave a process that is a
+ * helper but does not know it, and it would spawn a helper of its own, which would do
+ * the same.  Each generation arms a fresh watchdog, so the recursion would sustain itself
+ * instead of expiring at any deadline.
  */
 static int test_opal_helper_marker_present(void)
 {
@@ -1581,35 +1440,31 @@ static int test_opal_helper_marker_present(void)
 }
 
 /*
- * The SECOND credential: proof that the marker was written by the parent of this
- * very run, and not inherited, exported by hand or left behind by another tool.
+ * The second credential: proof that the marker was written by the parent of this run and
+ * not inherited, exported by hand or left behind by another tool.  Each step is load
+ * bearing.
  *
- * WHAT IS CHECKED, AND WHY EACH STEP IS THERE
- * -------------------------------------------
- * All three names must be present and non-empty, and the mode must match exactly,
- * so a partial or mistyped environment is refused rather than half-believed.
+ * All three names must be present and non-empty and the mode must match exactly, so a
+ * partial or mistyped environment is refused rather than half-believed.
  *
- * The descriptor number is parsed with strtol() and the WHOLE string must be
- * consumed, so "9x" and " 9" are rejected rather than silently read as 9.  It
- * must also be above standard error and below a plausible ceiling: a handshake
- * conducted over one of the three standard descriptors would be reading the
- * suite's own console, and a wild value has no business reaching fstat().
+ * The descriptor number is parsed with strtol() and the whole string must be consumed, so
+ * "9x" and " 9" are rejected rather than read as 9.  It must also be above standard error
+ * and below a plausible ceiling: a handshake over one of the three standard descriptors
+ * would be reading the suite's own console, and a wild value has no business reaching
+ * fstat().
  *
- * fstat() plus S_ISFIFO() then establishes that the number really names a pipe.
- * A regular file, a socket or a terminal that merely happens to be open at that
- * number is refused.  Note that this path does NOT close the descriptor: a
- * descriptor that is not the pipe this suite created is not this suite's to close.
+ * fstat() plus S_ISFIFO() establishes that the number really names a pipe, so a regular
+ * file, socket or terminal that merely happens to be open at that number is refused.
+ * This path deliberately does NOT close the descriptor: one that is not the pipe this
+ * suite created is not this suite's to close.
  *
- * Finally the record itself is read and compared BYTE FOR BYTE against the tag,
- * the mode and the token rendered in the same order the parent renders them.  The
- * read is bounded by poll() so a pipe that carries nothing cannot wedge the helper,
- * and it asks for one byte MORE than the expected record: a longer record fails
- * the exact-length test instead of matching on its prefix.  Because the parent
- * closes the write end before forking, end-of-file arrives as soon as the record
- * has been consumed, so the normal case terminates on data rather than on time.
- *
- * A token from a different run does not match.  A marker with no pipe behind it
- * has nothing to match against.  That is the whole property being bought.
+ * The record itself is then read and compared byte for byte against the tag, the mode and
+ * the token rendered in the order the parent renders them.  The read is bounded by poll()
+ * so a pipe carrying nothing cannot wedge the helper, and it asks for one byte more than
+ * the expected record, so a longer record fails the exact-length test instead of matching
+ * on its prefix.  Because the parent closes the write end before forking, end-of-file
+ * arrives as soon as the record has been consumed, so the normal case terminates on data
+ * rather than on time.
  */
 static int test_opal_helper_provenance_ok(void)
 {
@@ -1799,7 +1654,6 @@ static void test_opal_exec_plan_release(test_opal_exec_plan_t * plan)
 		plan->envp = NULL;
 	}
 
-	/* The array only; argv[0] aliases path, which is freed just below. */
 	if (plan->argv) {
 		free(plan->argv);
 		plan->argv = NULL;
@@ -1809,16 +1663,13 @@ static void test_opal_exec_plan_release(test_opal_exec_plan_t * plan)
 }
 
 /*
- * Build the plan.  Returns 1 with every member owned by *plan, or 0 with nothing
- * owned and nothing leaked.
+ * Build the plan.  Returns 1 with every member owned by *plan, or 0 with nothing owned
+ * and nothing leaked.
  *
- * The environment is copied entry by entry, DROPPING every one of the three names
- * this suite owns whatever its value, so neither the marker nor either half of the
- * provenance credential can be inherited by accident or be stale, and this run's
- * own triple is appended last.  Dropping all three rather than only the marker
- * matters: a descriptor number and a token surviving from two different runs would
- * be exactly the situation the handshake exists to rule out.  Every allocation is
- * checked, because this runs under the CI static analyser as well as the sanitizer.
+ * The environment is copied entry by entry, dropping all three of the names this suite
+ * owns whatever their values, and this run's own triple is appended last.  Dropping all
+ * three rather than only the marker matters, because a descriptor number and a token
+ * surviving from two different runs are exactly what the handshake exists to rule out.
  */
 static int test_opal_exec_plan_build(test_opal_exec_plan_t * plan, const char *argv0, const char *mode, int handshake_fd, const char *token)
 {
@@ -1941,37 +1792,31 @@ static int test_opal_exec_plan_build(test_opal_exec_plan_t * plan, const char *a
 /*
  * The whole of the configuration-absent assertion set, evaluated in the HELPER.
  *
- * Runs in a freshly exec'd process with a core of its own, returns the exit code
- * the parent will decode, and touches no state the parent can observe.  Because
- * the helper is a real bootstrap rather than a duplicated image, everything here
- * is ordinary code against a healthy process - there is no inherited-lock hazard
- * to reason about and no restriction on what it may call.
+ * Runs in a freshly exec'd process with a core of its own, returns the exit code the
+ * parent decodes, and touches no state the parent can observe.  The helper is a real
+ * bootstrap rather than a duplicated image, so there is no inherited-lock hazard here and
+ * no restriction on what this may call.  Each of the three preconditions carries its own
+ * exit code, so a precondition failure cannot be mistaken for the substantive assertion
+ * failing.
  *
- * The three preconditions are the same ones the in-process version asserted, in
- * the same order, each with its own exit code so a precondition failure cannot be
- * mistaken for the substantive assertion failing.
+ * The containment precondition is load-bearing here in a way it is not in the parent:
+ * this is the process that constructs the manager, so this is the process that must own
+ * the IAX2 port.  Its own setup hook has already taken the port - the parent released it
+ * before the spawn so that this could succeed - and the check below confirms the socket is
+ * held by THIS process rather than inferring an exclusion from somebody else's.  A helper
+ * that could not take the port builds nothing and reports
+ * TEST_OPAL_CHILD_NO_CONTAINMENT, which the parent surfaces as a failed case.
  *
- * The containment precondition is load-bearing HERE in a way it is not in the
- * parent: this is the process that constructs the manager, so this is the process
- * that must own the IAX2 port.  Its own setup hook has already taken the port -
- * the parent released it before the spawn precisely so that this could succeed -
- * and the check below confirms the socket is held by THIS process rather than
- * inferring an exclusion from somebody else's.  A helper that could not take the
- * port therefore builds nothing and reports TEST_OPAL_CHILD_NO_CONTAINMENT, which
- * the parent surfaces as a failed case.
+ * The branch is driven twice over the same manager, which makes the repeatability of the
+ * failure path the property under observation and is the cheapest proof that nothing on
+ * that path is consumed on first use.  The two verdicts carry distinct exit codes so the
+ * parent's log names which of them diverged.
  *
- * The branch is driven TWICE over the same manager.  Once would only show that the
- * status is reported; twice makes the repeatability of the failure path the property
- * under observation, and it is the cheapest proof that nothing on that path is
- * consumed on first use.  The two verdicts carry distinct exit codes so the parent's
- * log names which of the two diverged.
- *
- * The FSManager is scoped so it is destroyed before the status is judged, exactly
- * as before.  The PProcess is deliberately NOT released: the address space is
- * about to be discarded wholesale, and running PTLib's global teardown here would
- * add risk without adding information.  The event that production leaks on this
- * branch is likewise left alone - confining it is the entire purpose of this
- * process.
+ * The FSManager is scoped so it is destroyed before the status is judged.  The PProcess is
+ * deliberately not released, because the address space is about to be discarded wholesale
+ * and PTLib's global teardown would add risk without adding information.  The event
+ * production leaks on this branch is likewise left alone - confining it is the entire
+ * purpose of this process.
  */
 static int test_opal_readconfig_child_body(void)
 {
@@ -1995,10 +1840,6 @@ static int test_opal_readconfig_child_body(void)
 
 		status = manager.ReadConfig(false);
 
-		/* Same manager, same absent configuration: the branch is driven a SECOND time
-		 * so the failure path is exercised as a repeatable property rather than once.
-		 * Nothing is set before the failure return, so the call is idempotent by
-		 * construction, and a second identical verdict is what proves it. */
 		repeated = manager.ReadConfig(false);
 	}
 
@@ -2010,22 +1851,20 @@ static int test_opal_readconfig_child_body(void)
 }
 
 /*
- * Spawn the helper, wait for it under a bounded deadline, and report how it ended.
+ * Spawn the helper, wait for it under a bounded deadline, and report how it ended:
+ * SWITCH_STATUS_SUCCESS with *code set when it exited normally, SWITCH_STATUS_TIMEOUT
+ * when it had to be killed at the deadline, and SWITCH_STATUS_FALSE when the fork or the
+ * wait failed or it died on a signal, in which case *sig names the signal.
  *
- * Returns SWITCH_STATUS_SUCCESS with *code set when the helper exited normally,
- * SWITCH_STATUS_TIMEOUT when it had to be killed at the deadline, and
- * SWITCH_STATUS_FALSE when the fork or the wait failed or the helper died on a
- * signal - in which case *sig names the signal.
+ * *helper_pid is reported so the caller can address the working directory the helper's
+ * own core created for itself, which is named after that pid.  It is set as soon as the
+ * fork succeeds, so it is available on the failure paths too - which are precisely the
+ * paths on which that directory must be preserved rather than removed, because it holds
+ * the helper's own account of what went wrong.
  *
- * *helper_pid is reported so the caller can address the working directory the
- * helper's own core created for itself, which is named after that pid.  It is set
- * as soon as the fork succeeds, so it is available on the failure paths too - and
- * those are precisely the paths on which that directory must be PRESERVED rather
- * than removed, because it holds the helper's own account of what went wrong.
- *
- * The deadline exists so that no failure mode of the helper can hang the suite:
- * one that wedges before its alarm can fire, or that inherited an ignored
- * SIGALRM, is killed and reaped here.
+ * The deadline exists so that no failure mode of the helper can hang the suite: one that
+ * wedges before its alarm can fire, or that inherited an ignored SIGALRM, is killed and
+ * reaped here.
  */
 static switch_status_t test_opal_run_readconfig_isolated(const char *argv0, int *code, int *sig, pid_t *helper_pid)
 {
@@ -2085,14 +1924,12 @@ static switch_status_t test_opal_run_readconfig_isolated(const char *argv0, int 
 								 TEST_OPAL_HELPER_RECORD_TAG, TEST_OPAL_HELPER_READCONFIG, token);
 
 	/*
-	 * Written, and the write end CLOSED, BEFORE the fork.  Both halves of that
-	 * matter.  Writing first means the record is already in the pipe buffer when the
-	 * new image starts, so the helper never waits on this process and the two need
-	 * no ordering between them at all.  Closing the write end first means the helper
-	 * sees end-of-file the instant it has consumed the record, so its read
-	 * terminates on data rather than on a timeout, and a record longer than expected
-	 * is impossible rather than merely unlikely.  The record is under a hundred
-	 * bytes against a pipe buffer of at least 4 KiB, so this write cannot block.
+	 * Written, and the write end closed, before the fork; both halves matter.  Writing
+	 * first means the record is already in the pipe buffer when the new image starts, so
+	 * the helper never waits on this process.  Closing the write end first means the helper
+	 * sees end-of-file the instant it has consumed the record, so its read terminates on
+	 * data rather than on a timeout and a longer record is impossible.  The record is under
+	 * a hundred bytes against a pipe buffer of at least 4 KiB, so this write cannot block.
 	 */
 	if (record_len <= 0 || record_len >= (int) sizeof(record)
 		|| !test_opal_write_all(handshake[1], record, (switch_size_t) record_len)) {
@@ -2104,7 +1941,6 @@ static switch_status_t test_opal_run_readconfig_isolated(const char *argv0, int 
 	close(handshake[1]);
 	handshake[1] = -1;
 
-	/* Built BEFORE the fork: the child must not need the allocator. */
 	if (!test_opal_exec_plan_build(&plan, argv0, TEST_OPAL_HELPER_READCONFIG, handshake[0], token)) {
 		close(handshake[0]);
 		return SWITCH_STATUS_FALSE;
@@ -2139,27 +1975,20 @@ static switch_status_t test_opal_run_readconfig_isolated(const char *argv0, int 
 		/*
 		 * ASYNC-SIGNAL-SAFE REGION - DO NOT ADD ANYTHING TO THIS BLOCK.
 		 *
-		 * Exactly four call sites and no others, all on POSIX's async-signal-safe
-		 * list: dup2(), alarm() and execve() on the path that works, plus _exit()
-		 * only where execve failed - so three of the four run on a successful spawn.
-		 * Nothing here allocates, locks, logs or constructs, which is the entire
-		 * reason this fork is safe in a process whose core threads are already
-		 * running.  The descriptor dup2() needs was opened by the parent before the
-		 * fork, so the child never calls open() either.
+		 * Exactly four call sites and no others, all on POSIX's async-signal-safe list:
+		 * dup2(), alarm() and execve() on the path that works, plus _exit() only where
+		 * execve failed.  Nothing here allocates, locks, logs or constructs, which is why
+		 * this fork is safe in a process whose core threads are already running, and the
+		 * descriptor dup2() needs was opened by the parent so the child never calls open().
 		 *
-		 * Only STANDARD OUTPUT is discarded, and only because the helper runs the
-		 * same FCTX driver, so its console output would otherwise interleave with
-		 * this run's and corrupt the collected result - concretely, the helper would
-		 * print this very case's name a second time.  Standard error is left alone:
-		 * that is where FST_CORE_BEGIN writes when a core fails to come up at all
-		 * (switch_test.h:296-298), and losing it would turn a diagnosable failure
-		 * into a bare exit code.
+		 * Only standard output is discarded, because the helper runs the same FCTX driver
+		 * and its console output would otherwise interleave with this run's and corrupt the
+		 * collected result.  Standard error is left alone: that is where FST_CORE_BEGIN
+		 * writes when a core fails to come up at all (switch_test.h:296-298).
 		 *
-		 * The alarm is armed before the exec on purpose: a pending alarm survives an
-		 * exec, so it covers the helper's own bootstrap as well as its body.
-		 *
-		 * _exit(), never exit(): if the exec fails, no inherited atexit handler
-		 * and no inherited stdio buffer may run in this duplicated image.
+		 * The alarm is armed before the exec because a pending alarm survives an exec, so
+		 * it covers the helper's own bootstrap.  _exit() and never exit(), so that no
+		 * inherited atexit handler or stdio buffer runs in this duplicated image.
 		 */
 		if (devnull >= 0) {
 			dup2(devnull, STDOUT_FILENO);
@@ -2216,7 +2045,6 @@ static switch_status_t test_opal_run_readconfig_isolated(const char *argv0, int 
 	}
 
 	if (reaped != pid) {
-		/* Backstop: kill and reap, so no zombie and no orphan survive the case. */
 		kill(pid, SIGKILL);
 
 		while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
@@ -2240,41 +2068,27 @@ static switch_status_t test_opal_run_readconfig_isolated(const char *argv0, int 
 /*
  * Remove the working directory the HELPER's own core created for itself.
  *
- * WHY THERE IS ANYTHING TO REMOVE
- * ------------------------------
- * FST_CORE_BEGIN derives its log and database directories from the test base
- * directory plus the running process's pid (switch_test.h:98-104), so every core
- * bootstrap makes a directory named after its own pid.  The helper is a real
- * bootstrap in a real process, so it makes one too - a SECOND directory alongside
- * the one this run already owns, named after a pid that will never recur.
+ * FST_CORE_BEGIN derives its log and database directories from the test base directory
+ * plus the running process's pid (switch_test.h:98-104), so every core bootstrap makes a
+ * directory named after its own pid.  The helper is a real bootstrap in a real process, so
+ * it makes a second one alongside the one this run owns, named after a pid that will never
+ * recur - one directory of residue per run in a source tree, for a process that exited
+ * before the case finished asserting.
  *
- * Left alone, that is one directory of residue per run, accumulating forever in a
- * source tree, for a process that exited before the case even finished asserting.
- * The suite that caused it is the only party that knows it is disposable, so the
- * suite removes it.
+ * Only the named artefacts the core writes there are removed, and then the directory
+ * itself.  rmdir() refuses a non-empty directory, so anything this cleanup does not
+ * enumerate keeps the directory alive and visible rather than being deleted unseen.
  *
- * WHAT IS REMOVED, AND ONLY THAT
- * ------------------------------
- * The named artefacts the core writes there, and then the directory itself.
- * rmdir() refuses a non-empty directory, so anything this cleanup does not
- * enumerate keeps the directory alive and VISIBLE rather than being deleted
- * unseen - which is the right behaviour towards a tree the test did not author.
+ * Every removal is checked and the aggregate verdict is returned, because a cleanup that
+ * silently failed would leave a directory behind every run while the suite still reported
+ * a clean pass.  Only absence is tolerated - ENOENT means the artefact was never written,
+ * which is legitimate for the ".tmp" sibling in particular - and anything else is logged
+ * with the exact path and the errno text before the verdict reaches the caller, which
+ * asserts on it.
  *
- * EVERY REMOVAL IS CHECKED, AND THE VERDICT IS RETURNED
- * ----------------------------------------------------
- * Discarding these results would make the residue claim above an intention rather
- * than a property: a cleanup that silently failed would leave a directory behind
- * every run, the count would creep, and the suite would still report a clean pass.
- * So each removal is checked, ONLY absence is tolerated - ENOENT means the
- * artefact was never written, which is a legitimate outcome for the ".tmp" sibling
- * in particular - and anything else is logged with the exact path and the errno
- * text before the aggregate verdict comes back to the caller, which asserts on it.
- *
- * ONLY AFTER A CLEAN HELPER RUN
- * -----------------------------
- * The caller removes nothing when the helper failed, timed out or died on a
- * signal.  On those paths the directory is the helper's own account of what
- * happened, and it is named in the diagnostic instead of being deleted.
+ * The caller removes nothing when the helper failed, timed out or died on a signal.  On
+ * those paths the directory is the helper's own account of what happened and is named in
+ * the diagnostic instead of being deleted.
  */
 static int test_opal_remove_helper_path(const char *path, int is_dir)
 {
@@ -2311,7 +2125,6 @@ static switch_status_t test_opal_remove_helper_dir(pid_t helper_pid)
 	switch_snprintf(path, sizeof(path), "%s%s%s", dir, SWITCH_PATH_SEPARATOR, "freeswitch.xml.fsxml.tmp");
 	ok &= test_opal_remove_helper_path(path, 0);
 
-	/* The directory itself last, for the reason given above. */
 	ok &= test_opal_remove_helper_path(dir, 1);
 
 	return ok ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
@@ -2476,57 +2289,50 @@ static void test_opal_suite_state_cleanup(void)
  * The suite
  * ---------------------------------------------------------------------------
  *
- * A real core is required: switch_xml_open_cfg() asserts that the main XML root
- * exists, which only the full bootstrap provides.  "conf_opal" names this
- * module's own fixture root: the bootstrap builds the configuration directory as
- * SWITCH_TEST_BASE_DIR_FOR_CONF, a path separator, then that name
- * (switch_test.h:92-93), so the target's Makefile.am declaration must define
- * -DSWITCH_TEST_BASE_DIR_FOR_CONF and -DSWITCH_TEST_BASE_DIR_OVERRIDE to
- * ${abs_builddir}/test for it to resolve to
- * src/mod/endpoints/mod_opal/test/conf_opal.  Without those defines the
- * bootstrap falls back to "./conf_opal" (switch_test.h:94-99), which resolves
- * against the working directory, so the suite would only find its fixtures when
- * run from inside test/.  See the build-wiring note in the file header.
+ * A real core is required: switch_xml_open_cfg() asserts that the main XML root exists,
+ * which only the full bootstrap provides.  "conf_opal" names this module's own fixture
+ * root: the bootstrap builds the configuration directory as
+ * SWITCH_TEST_BASE_DIR_FOR_CONF, a path separator, then that name (switch_test.h:92-93),
+ * so the target must define -DSWITCH_TEST_BASE_DIR_FOR_CONF and
+ * -DSWITCH_TEST_BASE_DIR_OVERRIDE to ${abs_builddir}/test.  Without those defines the
+ * bootstrap falls back to "./conf_opal" (switch_test.h:94-99), which resolves against the
+ * working directory, so the suite would only find its fixtures when run from inside test/.
  *
- * FCTX runs cases in declaration order within a single process, and that order
- * is load bearing.  All eight, in the order they are declared:
+ * FCTX runs cases in declaration order within a single process, and that order is load
+ * bearing:
  *
- *   1. config_absent_read_config_fails - runs first, so its verdict cannot be an
- *      artefact of a successful parse or load having left module state behind.
- *      It stands alone in the ordering: the containment it needs is installed by
- *      the setup hook, which runs ahead of every case body, and it asserts both
+ *   1. config_absent_read_config_fails - first, so its verdict cannot be an artefact of a
+ *      successful parse or load having left module state behind.  It asserts both
  *      containment properties itself as fatal preconditions;
- *   2. toolkit_side_effects_are_contained - follows immediately and examines
- *      those same properties in detail, ahead of every other case, so the IAX2
- *      endpoint is observed at the earliest moment it could matter;
- *   3. dual_endpoint_construction - constructs a manager and looks its H.323 and
- *      IAX2 endpoints up through the inherited public accessor.  It calls
- *      neither ReadConfig() nor Initialise();
- *   4. listener_default_signalling_port - the only case needing no manager and
- *      no PProcess at all: it constructs a bare FSListener and reads back the
- *      port its constructor supplied;
- *   5. settings_from_injected_configuration - constructs a manager and calls
- *      ReadConfig() once against the registered provider, then reads the four
- *      public settings accessors back;
- *   6. listener_name_defaults_to_unnamed - constructs one manager per
- *      configuration document, two documents in all, calls ReadConfig() once on
- *      each, and observes both stored listener names through captured log output;
+ *   2. toolkit_side_effects_are_contained - examines those same properties in detail ahead
+ *      of every other case, so the IAX2 endpoint is observed at the earliest moment it
+ *      could matter;
+ *   3. dual_endpoint_construction - constructs a manager and looks its H.323 and IAX2
+ *      endpoints up through the inherited public accessor, calling neither ReadConfig()
+ *      nor Initialise();
+ *   4. listener_default_signalling_port - the only case needing no manager and no
+ *      PProcess: it constructs a bare FSListener and reads back the port its constructor
+ *      supplied;
+ *   5. settings_from_injected_configuration - ReadConfig() once against the registered
+ *      provider, then the four public settings accessors;
+ *   6. listener_name_defaults_to_unnamed - one manager per configuration document, two
+ *      documents, ReadConfig() once on each, both stored listener names observed through
+ *      captured log output.
  *
- *      cases 3 to 6 all precede the load case, and none of them calls
- *      FSManager::Initialise().  So every case up to this point observes an OPAL
- *      media-format registry that no Initialise() has mutated - that registry is
- *      process global and Initialise() adds to it - even though cases 5 and 6 do
- *      each drive ReadConfig(), which is socket free and touches no registry;
+ *      Cases 3 to 6 all precede the load case and none calls FSManager::Initialise(), so
+ *      every case up to this point observes an OPAL media-format registry that no
+ *      Initialise() has mutated - that registry is process global and Initialise() adds to
+ *      it - even though cases 5 and 6 do drive ReadConfig(), which is socket free and
+ *      touches no registry;
  *
  *   7. module_load_and_endpoint_interface - the first and only case that calls
- *      Initialise(), and therefore the only case with a listener thread.  It
- *      takes the PTLib process singleton over from the suite and deliberately
- *      leaves the module loaded;
- *   8. module_shutdown_succeeds - declared last so it observes a fully
- *      initialised module and its result is asserted rather than discarded, and
- *      so that its two extra duties come last: proving the case before it
- *      orphaned no configuration provider, and running the suite's unconditional
- *      sweep.
+ *      Initialise(), and therefore the only case with a listener thread.  It takes the
+ *      PTLib process singleton over from the suite and deliberately leaves the module
+ *      loaded;
+ *   8. module_shutdown_succeeds - last, so it observes a fully initialised module and its
+ *      result is asserted rather than discarded, and so that its two extra duties come
+ *      last: proving the case before it orphaned no configuration provider, and running
+ *      the suite's unconditional sweep.
  */
 FST_CORE_BEGIN("conf_opal")
 {
@@ -2587,49 +2393,40 @@ FST_CORE_BEGIN("conf_opal")
 		FST_TEARDOWN_END()
 
 		/*
-		 * Case 1 - configuration absent.  DECLARED FIRST.
+		 * Case 1 - configuration absent, declared first and run in a process of its own.
 		 *
-		 * ReadConfig() is asserted directly rather than through
-		 * mod_opal_load(), because FSManager::Initialise() discards
-		 * ReadConfig()'s status: a load would still report success and the
-		 * error branch would go unobserved.  No binding is registered, so the
-		 * fixture root's deliberate omission of the module's configuration
-		 * section is what makes the miss deterministic.
+		 * ReadConfig() is asserted directly rather than through mod_opal_load(), because
+		 * FSManager::Initialise() discards ReadConfig()'s status, so a load would still
+		 * report success and the error branch would go unobserved.  No binding is
+		 * registered, so the fixture root's deliberate omission of the module's
+		 * configuration section is what makes the miss deterministic.
 		 *
-		 * DECLARED FIRST so its verdict cannot be an artefact of anything that
-		 * ran before it: no configuration has been injected, no successful parse
-		 * has happened and no module has been loaded.  It is self-sufficient in
-		 * the ordering as well - both containment properties are established by
-		 * the setup hook, which FCTX runs ahead of every case body, and both are
-		 * asserted here as fatal preconditions rather than inherited from the
-		 * case that examines them in detail.
+		 * Declared first so its verdict cannot be an artefact of anything else: no
+		 * configuration has been injected, no successful parse has happened and no module
+		 * has been loaded.  Both containment properties are established by the setup hook,
+		 * which FCTX runs ahead of every case body, and both are asserted here as fatal
+		 * preconditions rather than inherited from the case that examines them in detail.
 		 *
-		 * THIS IS THE ONE CASE THAT CANNOT RUN IN THE PRINCIPAL PROCESS, and the
-		 * reason is a defect in production this harness deliberately does not
-		 * repair: FSManager::ReadConfig() creates a request-parameters event
-		 * unconditionally and destroys it only on the success path, so every time
-		 * this branch runs it orphans one malloc-backed switch_event_t.  The module
-		 * source, its header and its shipped configuration are frozen - the plan
-		 * lists mod_opal.cpp under "Source that must not change" and puts the
-		 * engagement's production-edit budget at zero - and the leak cannot be
-		 * closed from the harness either, because this target links a separate
-		 * compilation of the module (libmodopal.la, see Makefile.am) rather than
-		 * including it, so no preprocessor seam declared here reaches that
+		 * This is the one case that cannot run in the principal process.
+		 * FSManager::ReadConfig() creates a request-parameters event unconditionally and
+		 * destroys it only on the success path, so every traversal of this branch orphans
+		 * one malloc-backed switch_event_t.  The module source, its header and its shipped
+		 * configuration must not change, and the harness cannot close the leak either,
+		 * because this target links a separate compilation of the module (libmodopal.la)
+		 * rather than including it, so no preprocessor seam declared here reaches that
 		 * translation unit.
 		 *
-		 * The defect is therefore CONTAINED rather than corrected.  The whole
-		 * assertion set runs in a freshly exec'd image of this same binary, which
-		 * _exit()s: the address space that made the allocation is discarded without
-		 * an at-exit leak check, so the principal process - the one the CI job
-		 * observes under the address sanitizer - never traverses the branch at all.
-		 * No suppression file, no detect_leaks=0 and no ASAN_OPTIONS edit is
-		 * involved, and the leak is still fully visible to anyone who runs the
-		 * helper directly.
+		 * The allocation is therefore CONTAINED.  The whole assertion set runs in a freshly
+		 * exec'd image of this same binary, which _exit()s, so the address space that made
+		 * the allocation is discarded without an at-exit leak check and the principal
+		 * process - the one CI observes under the address sanitizer - never traverses the
+		 * branch.  No suppression file, no detect_leaks=0 and no ASAN_OPTIONS edit is
+		 * involved, and the allocation stays fully visible to anyone who runs the helper
+		 * directly.
 		 *
-		 * Inside that helper the branch is driven TWICE over the same manager, so
-		 * the repeatability of the failure verdict is the property under
-		 * observation rather than a single sample.  Nothing is set before the
-		 * failure return, so the call is idempotent by construction.
+		 * Inside that helper the branch is driven twice over the same manager, so the
+		 * repeatability of the failure verdict is the property under observation rather
+		 * than a single sample.
 		 */
 		FST_TEST_BEGIN(config_absent_read_config_fails)
 		{
@@ -2641,55 +2438,40 @@ FST_CORE_BEGIN("conf_opal")
 			int guard_regained = 0;
 
 			/*
-			 * ---------------------------------------------------------------
-			 * THE HELPER'S OWN ENTRY POINT.
-			 * ---------------------------------------------------------------
+			 * The helper's own entry point.  When this process is the exec'd helper, its
+			 * whole work is the body below and its whole result is an exit code.  It sits in
+			 * the first declared case because FCTX runs cases in declaration order, so
+			 * _exit()ing here guarantees no later case runs in the helper: it cannot load
+			 * the module, take over the PTLib process singleton, or report a verdict into
+			 * the parent's tally.
 			 *
-			 * When this process IS the exec'd helper, the whole of its work is the
-			 * body below and its whole result is an exit code.  It is placed in the
-			 * FIRST declared case because FCTX runs cases in declaration order, so
-			 * _exit()ing here guarantees no later case ever runs in the helper: the
-			 * helper cannot load the module, cannot take over the PTLib process
-			 * singleton, and cannot report a verdict of its own into the parent's
-			 * tally.
+			 * _exit() rather than return, so the helper neither tears a core down through
+			 * FST_CORE_END nor prints a summary the parent prints a moment later.  It is
+			 * also what keeps the confinement total: no atexit handler and no
+			 * leak-sanitizer at-exit check fires in the one process that deliberately
+			 * traverses the leaking branch.  This is reached after the setup hook, so the
+			 * plugin pin and the IAX2 containment are already installed as they are for any
+			 * other case, and the body re-verifies both before relying on them.
 			 *
-			 * _exit() rather than return, deliberately: returning would run
-			 * FST_CORE_END's switch_core_destroy() and then FCTX's final report, and
-			 * the helper has no business tearing a core down or printing a summary
-			 * the parent will print properly a moment later.  It is also what keeps
-			 * the confinement total - no atexit handler and no leak-sanitizer
-			 * at-exit check fires in the one process that deliberately traverses
-			 * production's leaking branch.
+			 * Two credentials are required, not one: the marker names the mode and the
+			 * provenance handshake proves it came from the parent of this run.  Helper mode
+			 * _exit()s from inside this first case, so a top-level run that entered it on an
+			 * inherited or stale marker alone would run one case, exit with that case's
+			 * status, and be recorded as a clean pass with the seven later cases never run.
 			 *
-			 * This is reached AFTER the setup hook, so the plugin pin and the IAX2
-			 * containment are already installed exactly as they are for any other
-			 * case, and the body re-verifies both before relying on them.
-			 *
-			 * TWO CREDENTIALS ARE REQUIRED, NOT ONE.  The marker names the mode; the
-			 * provenance handshake proves the marker came from the parent of THIS
-			 * run.  Only both together dispatch the helper body, because helper mode
-			 * _exit()s from inside this first case: a top-level run that entered it on
-			 * the strength of an inherited or stale marker alone would run one case,
-			 * exit with that case's status, and be recorded as a clean pass with the
-			 * seven later cases silently never run.
-			 *
-			 * A MARKER WITHOUT VALID PROVENANCE IS THEREFORE A HARD REFUSAL, not a
-			 * fallback to an ordinary run.  Continuing as an ordinary run would be the
-			 * friendlier-looking choice and the wrong one: the marker's presence also
-			 * disarms the spawn below (test_opal_run_readconfig_isolated refuses to
-			 * nest on presence alone), so this case could not do its work anyway, and
-			 * the environment it found itself in is one nothing should silently
-			 * tolerate.  Exiting with a DISTINCT NON-ZERO code makes the
-			 * misconfiguration impossible to miss and impossible to mistake for any
-			 * other outcome; 58 is outside the range a signal or a libc failure
-			 * produces and is neither of automake's reserved 77 (skip) or 99
+			 * A marker without valid provenance is therefore a hard refusal rather than a
+			 * fallback to an ordinary run: the marker's presence also disarms the spawn
+			 * below, since test_opal_run_readconfig_isolated() refuses to nest on presence
+			 * alone, so this case could not do its work either way.  A distinct non-zero
+			 * code makes the misconfiguration unmistakable; 58 is outside the range a signal
+			 * or libc failure produces and is neither of automake's reserved 77 (skip) or 99
 			 * (framework error).
 			 *
-			 * The diagnostic goes to STANDARD ERROR rather than through the core
-			 * logger, for the same reason FST_CORE_BEGIN reports a failed core there
-			 * (switch_test.h:296-298): the process is about to _exit(), so a message
-			 * queued for the logging thread might never be written, whereas stderr is
-			 * flushed here and is the one stream the helper path never redirects.
+			 * The diagnostic goes to standard error rather than the core logger, for the
+			 * same reason FST_CORE_BEGIN reports a failed core there
+			 * (switch_test.h:296-298): the process is about to _exit(), so a message queued
+			 * for the logging thread might never be written, whereas stderr is flushed here
+			 * and is the one stream the helper path never redirects.
 			 */
 			if (test_opal_helper_marker_present()) {
 				if (test_opal_in_helper_mode() && test_opal_helper_provenance_ok()) {
@@ -2734,31 +2516,25 @@ FST_CORE_BEGIN("conf_opal")
 			 */
 
 			/*
-			 * THE GUARD HANDOVER, and the reason it is a handover rather than an
-			 * inheritance.
-			 *
-			 * The helper is the process that constructs the manager, so the helper is
-			 * the process that has to own the exclusion.  It cannot be handed a
-			 * bound socket: it is a freshly EXEC'd image, and the containment it
-			 * needs is a socket of its own in its own address space.  Nor can the
-			 * parent simply keep holding the port while the helper runs - that would
-			 * put the helper in exactly the position this fix exists to abolish,
-			 * asserting containment it does not own on the strength of an
+			 * The guard is handed over rather than inherited.  The helper is the process
+			 * that constructs the manager, so it is the process that must own the
+			 * exclusion, and it cannot be handed a bound socket because it is a freshly
+			 * exec'd image needing a socket of its own in its own address space.  Nor can
+			 * the parent keep holding the port while the helper runs, because the helper
+			 * would then be asserting containment it does not own on the strength of an
 			 * address-in-use refusal it cannot renew.
 			 *
-			 * So ownership moves.  The parent has already proved above that the port
-			 * is takeable by this suite, and it releases it here; the helper's setup
-			 * hook takes it, and the helper's body requires it fatally before it
-			 * acquires a PProcess or constructs anything - so a helper that failed to
-			 * take it reports TEST_OPAL_CHILD_NO_CONTAINMENT and builds no manager.
+			 * So ownership moves.  The parent has already proved the port is takeable by
+			 * this suite and releases it here; the helper's setup hook takes it, and the
+			 * helper's body requires it fatally before acquiring a PProcess or constructing
+			 * anything, so a helper that failed to take it reports
+			 * TEST_OPAL_CHILD_NO_CONTAINMENT and builds no manager.
 			 *
-			 * The window in which the port is free is bounded by those two facts and
-			 * contains NO manager at all: the parent constructs none (asserted at the
-			 * end of this case, where it still owns no PTLib process), and the helper
-			 * constructs one only after taking the port.  If some third party grabs
-			 * the port inside that window, the helper's own precondition fails and
-			 * this case fails loudly - which is the correct outcome and precisely the
-			 * one a borrowed exclusion used to hide.
+			 * The window in which the port is free contains no manager at all: the parent
+			 * constructs none - asserted at the end of this case, where it still owns no
+			 * PTLib process - and the helper constructs one only after taking the port.  A
+			 * third party that grabs the port inside that window fails the helper's own
+			 * precondition and fails this case loudly, which is the correct outcome.
 			 */
 			test_opal_iax2_guard_release();
 
@@ -2807,9 +2583,6 @@ FST_CORE_BEGIN("conf_opal")
 					   "the isolated configuration-absent check must run to completion in its own process");
 			fst_xcheck(child_signal == 0, "the isolated configuration-absent check must not be terminated by a signal");
 
-			/* The substantive assertion: ReadConfig() reported SWITCH_STATUS_FALSE
-			 * when no opal.conf could be located.  The distinct exit codes make an
-			 * unexpected value name its own failure mode in the log line above. */
 			fst_xcheck(child_code == TEST_OPAL_CHILD_OK,
 					   "ReadConfig() must report SWITCH_STATUS_FALSE when no opal.conf can be located");
 
@@ -2884,8 +2657,6 @@ FST_CORE_BEGIN("conf_opal")
 			/* the plugin search path was pinned before any PProcess existed */
 			fst_requires(test_opal_plugin_path_is_pinned());
 
-			/* this process holds the port, so a wildcard bind of it cannot succeed
-			 * for as long as this case runs - which is what OPAL is about to try */
 			fst_requires(test_opal_iax2_containment_in_effect());
 
 			if (switch_find_local_ip(local_ip, sizeof(local_ip), &local_mask, AF_INET) == SWITCH_STATUS_SUCCESS
@@ -2915,8 +2686,6 @@ FST_CORE_BEGIN("conf_opal")
 				}
 			}
 
-			/* and this process still holds the port after the manager is gone, so
-			 * the manager's destruction released nothing it did not own */
 			fst_check(test_opal_iax2_containment_in_effect());
 		}
 		FST_TEST_END()

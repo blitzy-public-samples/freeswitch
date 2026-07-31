@@ -55,19 +55,14 @@ validate_sofia_sip()
 	exit 0
 }
 
-# Function to report whether the COMPLETE mod_h323 toolkit is installed
+# Probe the COMPLETE mod_h323 toolkit, so the optional module stays disabled unless
+# it can actually be built.
 #
-# PTLib on its own is not the capability mod_h323 needs: its Makefile.am compiles
-# against the OpenH323/H323Plus headers (-I/usr/include/openh323) and links
-# -lopenh323 -lpt -lrt, and OPAL installs a ptlib.pc of its own, so a PTLib-only
-# or OPAL-only host would otherwise be told to build a module whose H.323
-# implementation is absent - turning a missing optional toolkit into a hard build
-# failure instead of leaving the module disabled.  This probe therefore mirrors the
-# module's own compile and link inputs rather than a proxy for them.  It is
-# non-mutating: it builds a throw-away translation unit inside a temporary
-# directory and removes it again, touching nothing in the tree.  It is also
-# fail-closed - a missing compiler, header or library, or a failed mktemp, all
-# leave mod_h323 disabled, which is the intended degradation.
+# PTLib alone is not that capability: mod_h323 also needs the OpenH323/H323Plus
+# headers and -lopenh323, and OPAL installs a ptlib.pc of its own.  The probe
+# therefore mirrors the module's own compile and link inputs instead of standing in
+# for them, and it builds in a temporary directory outside the tree.  Any failure -
+# compiler, header, library or mktemp - leaves mod_h323 disabled.
 h323_toolkit_available()
 {
 	local -a compiler
@@ -77,8 +72,8 @@ h323_toolkit_available()
 
 	pkg-config --exists ptlib || return 1
 
-	# configure.ac's IS64BITLINUX conditional adds -DP_64BIT to the module on
-	# x86_64, and a probe built with flags the module does not use proves nothing
+	# Match configure.ac's IS64BITLINUX conditional; a probe built with flags the
+	# module does not use proves nothing
 	if [ "$(uname -m)" = "x86_64" ]; then
 		flags+=(-DP_64BIT)
 	fi
@@ -100,25 +95,17 @@ h323_toolkit_available()
 	return "$status"
 }
 
-# Function to report how many ACTIVE - that is, uncommented - lines the generated
-# modules.conf carries for one module path
+# Print how many ACTIVE - uncommented - lines the generated modules.conf carries for
+# one module path, or fail if the list cannot be read.
 #
-# The expression is anchored on the whole line, so a module path can only ever
-# match its own entry and never a longer one that merely contains it -
-# `xml_int/mod_xml_curl' cannot be answered by `xml_int/mod_xml_curl_extra', and
-# `endpoints/mod_opal' cannot be answered by a neighbouring endpoint.  A count is
-# printed rather than a yes/no verdict because the only acceptable answer for a
-# module that has to be built is exactly one: zero means the entry was never
-# activated, and more than one means the generated file carries a duplicate whose
-# effective state this script cannot reason about.
+# The expression is anchored on the whole line so a module path only ever matches its
+# own entry, never a longer one that contains it.  A count rather than a yes/no
+# verdict, because the only acceptable answer for a module that has to be built is
+# exactly one: zero means it was never activated, more than one means a duplicate
+# whose effective state this script cannot reason about.
 #
-# The count is always a number on success, so a caller can compare it directly.
-# Failing to READ the module list is never reported as a count, because "the list
-# could not be read" and "the module is not listed" are different facts and only
-# the second one is safe to act on: a caller asserting a module is disabled must
-# not be able to satisfy that assertion with an answer nobody ever obtained.  Both
-# ways the read can fail are therefore diagnosed and returned as a failure - an
-# absent modules.conf before the read, and a grep that could not complete it.
+# A failed READ is never rendered as a count.  "The list could not be read" and "the
+# module is not listed" are different facts, and only the second is safe to act on.
 modules_conf_active_count()
 {
 	local module="$1"
@@ -130,16 +117,10 @@ modules_conf_active_count()
 		return 1
 	fi
 
-	# grep's exit status is the only thing that separates the two ways of finding
-	# no match, so it is captured on the very next line and acted on rather than
-	# discarded.  There are three outcomes, not two: 0 means lines matched and the
-	# count is on stdout; 1 means nothing matched, which is a legitimate answer
-	# here and normalises to zero; and anything above 1 means grep could not
-	# complete the read at all - modules.conf unreadable, removed between the -f
-	# test above and the read, or an I/O error - printing nothing.  Only the middle
-	# case may become a count, because require_module_disabled_for_tests() treats a
-	# count of zero as PROOF that a module will not be built, and a read that never
-	# happened proves nothing.
+	# grep's status is the only thing separating "nothing matched" (1, a legitimate
+	# zero) from "the read never completed" (above 1), so it is captured rather than
+	# discarded: require_module_disabled_for_tests() treats a count of zero as PROOF
+	# that a module will not be built.
 	count=$(grep -c -E "^[[:space:]]*${module}[[:space:]]*$" modules.conf)
 	status=$?
 
@@ -152,9 +133,8 @@ modules_conf_active_count()
 		count=0
 	fi
 
-	# Whatever is echoed here is compared against a literal by both callers, so it
-	# has to be a number or the comparison is meaningless rather than merely wrong.
-	# Anything else is treated as a failed read for the same reason as above.
+	# Both callers compare this against a literal, so a non-numeric result is a
+	# meaningless comparison and is treated as a failed read
 	case "$count" in
 		'' | *[![:digit:]]*)
 			echo "Error: modules.conf produced an unusable active-line count '$count' for '$module'" >&2
@@ -167,22 +147,17 @@ modules_conf_active_count()
 	return 0
 }
 
-# Function to activate one module in the generated modules.conf and prove it worked
+# Activate one module in the generated modules.conf and verify the activation.
 #
-# The proof is the point.  sed cannot report an address that never matched - it
-# exits 0 whether it changed a line or not - so an entry that was renamed,
-# removed or duplicated upstream would be skipped in silence.  That silence is
-# expensive here: src/mod/Makefile.am wraps each module's ENTIRE recipe in a test
-# on whether the module appears in CONF_MODULES, which configure.ac derives by
-# stripping comments from modules.conf, so a module that failed to activate
-# contributes nothing to `print_tests' and nothing to `check' - no warning, no
-# error, and a green build that silently ran none of that module's tests.  The
-# edit is therefore followed by a postcondition that counts what the edit was
-# supposed to produce, and the caller aborts the run when it does not hold.
+# Verification is the point: sed exits 0 whether or not its address matched, and a
+# module that failed to activate contributes nothing to `print_tests' and nothing to
+# `check' - src/mod/Makefile.am wraps each module's entire recipe in a test on
+# CONF_MODULES, which configure.ac derives by stripping comments from modules.conf.
+# The failure mode is a green build that silently ran none of that module's tests, so
+# the edit is followed by a postcondition and the caller aborts when it does not hold.
 #
-# The substitution is anchored on the whole line and replaces it outright, so it
-# cannot disturb a neighbouring entry, and it is idempotent - an already-active
-# line does not match the address and is left exactly as it is.
+# The substitution is anchored on the whole line, so it cannot disturb a neighbouring
+# entry, and it is idempotent - an already-active line does not match the address.
 enable_module_for_tests()
 {
 	local module="$1"
@@ -200,13 +175,11 @@ enable_module_for_tests()
 	return 0
 }
 
-# Function to prove that a module whose capability probe failed will NOT be built
+# Verify that a module whose capability probe failed will NOT be built.
 #
-# The absent-toolkit outcome needs verifying just as positively as the present
-# one.  An endpoint module that is somehow active while its toolkit is missing
-# does not degrade, it fails the build - which is the single thing the capability
-# guards exist to prevent - so the guard's negative branch asserts the entry is
-# still commented out instead of assuming it.
+# An endpoint module that is active while its toolkit is missing does not degrade, it
+# fails the build - the one thing the capability guards exist to prevent - so the
+# absent-toolkit outcome is asserted rather than assumed.
 require_module_disabled_for_tests()
 {
 	local module="$1"
@@ -238,27 +211,18 @@ configure_freeswitch()
 				-e '/languages\/mod_lua/s/^#//g' \
 				modules.conf
 
-			# mod_xml_curl owns one of the module-local test suites this arm exists to
-			# collect and depends on no optional toolkit, so it is enabled
-			# unconditionally - and the activation is verified rather than assumed,
-			# because a silently skipped uncomment would drop its whole suite from
-			# `check' without failing anything
+			# mod_xml_curl carries a module-local test suite and depends on no
+			# optional toolkit, so it is enabled unconditionally
 			enable_module_for_tests 'xml_int/mod_xml_curl' || exit 1
 
-			# Enable optional endpoint modules only when their toolkit can actually
-			# build them, so an absent, incomplete or too-old H.323/OPAL toolkit
-			# leaves them disabled rather than failing the build.  OPAL is gated on
-			# the version its own header demands - mod_opal.h #errors below 3.12.8 -
-			# and H.323 on the complete PTLib plus OpenH323/H323Plus provider set,
-			# because a bare ptlib.pc is installed by OPAL too and cannot by itself
-			# build mod_h323.
+			# Enable the optional endpoint modules only when their toolkit can build
+			# them, so an absent, incomplete or too-old H.323/OPAL toolkit leaves them
+			# disabled rather than failing the build.  OPAL is gated on the version its
+			# own header demands (mod_opal.h #errors below 3.12.8).
 			#
-			# Both outcomes of each probe are asserted, which is why these are
-			# if/else blocks rather than `probe && sed' compounds: a compound leaves
-			# the enabling edit unchecked, and leaves the absent-toolkit branch with
-			# no postcondition at all.  Here a passing probe must end with the module
-			# active, and a failing probe must end with it still commented out, and
-			# anything else aborts this arm before ./configure runs.
+			# Both outcomes of each probe are asserted - a passing probe must leave the
+			# module active, a failing probe must leave it commented out - which is why
+			# these are if/else blocks rather than `probe && sed' compounds.
 			if pkg-config --atleast-version=3.12.8 opal; then
 				enable_module_for_tests 'endpoints/mod_opal' || exit 1
 			else

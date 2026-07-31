@@ -33,9 +33,8 @@
  * HARNESS ARCHITECTURE
  * ---------------------------------------------------------------------------
  *
- * This suite covers the opt-in BadgerFish JSON response decoder that
- * mod_xml_curl gained alongside its original XML-only decode step, plus the
- * hardening that decoder is required to carry.  It observes the production
+ * This suite covers mod_xml_curl's opt-in BadgerFish JSON response decoder and
+ * the hardening that decoder is required to carry.  It observes the production
  * module; it does not widen it.  Nothing is de-staticised, no new header is
  * introduced, and the module's symbol surface is unchanged.
  *
@@ -96,7 +95,7 @@
  * ------------------------------------------------------
  * Asserting that a JSON failure "falls back" is only meaningful if the assertion
  * runs the code that actually performs the fallback.  That code is the HTTP-200
- * block inside xml_url_fetch(): the format dispatch, and then the untouched
+ * block inside xml_url_fetch(): the format dispatch, and then the
  * switch_xml_parse_file() call that every JSON failure edge converges on.  A
  * test that only observes the decode helper returning NULL would stay green if
  * that parse call were deleted, which is precisely the property a fallback test
@@ -288,23 +287,17 @@ static void fst_xc_uuid_format(char *buffer, const switch_uuid_t *uuid);
 static char fst_xc_temp_dir[1024] = "";
 
 /*
- * The cleanup verdict, kept across cases.
+ * The cleanup verdict, kept across cases.  The active path is cleared once a case
+ * is done with it, so the next case creates a fresh directory; it is copied here
+ * first so that residue can still be named -- by the error the removal logs, and by
+ * the case that asserts the previous case's directory is gone.
  *
- * The active path above is cleared once a case is done with it, so that the next
- * case creates a fresh directory rather than reusing one that may not have gone
- * away.  Clearing it is therefore necessary -- but it was also the only record of
- * what had just been removed, which is what let a directory that survived removal
- * do so silently.  The path is copied here first, so a residue can still be named:
- * by the error the removal logs, and by the case that asserts the previous case's
- * directory is gone.
- *
- * Residue is not a cosmetic problem here: the directory is this suite's isolation
- * boundary, so a surviving entry means the next case would run against state it did
- * not create.  fst_xc_temp_dir_create() therefore refuses outright once
- * fst_xc_temp_dir_failures is non-zero, which turns residue into a failure of the
- * very next case instead of a diagnostic nobody reads.  The counter is the
- * condition rather than the residue name, because a directory that survives rmdir()
- * is residue too and carries no entry name to record.
+ * The directory is this suite's isolation boundary, so a surviving entry means the
+ * next case would run against state it did not create.  fst_xc_temp_dir_create()
+ * refuses outright once fst_xc_temp_dir_failures is non-zero, which turns residue
+ * into a failure of the next case rather than a diagnostic nobody reads.  The
+ * counter is the condition rather than the residue name, because a directory that
+ * survives rmdir() is residue too and carries no entry name to record.
  */
 static char fst_xc_temp_dir_last[1024] = "";
 static char fst_xc_temp_dir_residue[256] = "";
@@ -363,22 +356,15 @@ static int fst_xc_teardown_failed = 0;
  * it are gone, 0 otherwise.  Called from the teardown block, so it runs whether a
  * case finished or left early, and it is safe to call when nothing was created.
  *
- * Every outcome is checked rather than discarded.  An ignored failure here is
- * indistinguishable from a clean run and would conceal exactly what this private
- * directory exists to make visible: a file the suite could not delete, a document a
- * case left open, or residue the module wrote where it was not expected to.  It also
- * means residue is being orphaned in a shared -- and, with no configured override,
- * world-writable -- location, once per case and again on every run, and neither
- * unlink() nor rmdir() reports that any other way.  ENOENT is the expected answer for
- * a document the case never wrote, so only other errors count.
- *
- * A failure is reported three ways so that it can be attributed after the fact: the
- * offending path is logged with its errno, the directory name is persisted to
- * fst_xc_temp_dir_last and the first offender to fst_xc_temp_dir_residue before the
- * active path is cleared, and fst_xc_teardown_failed is latched so the next case's
- * setup and the final declared case both fail on it.  Nothing is short-circuited: a
- * logger that would not unbind must not stop the private directory being cleaned, or
- * one reported defect would become two.
+ * ENOENT is the expected answer for a document the case never wrote, so only other
+ * errors count.  A failure is reported three ways so that it can be attributed after
+ * the fact: the offending path is logged with its errno, the directory name is
+ * persisted to fst_xc_temp_dir_last and the first offender to
+ * fst_xc_temp_dir_residue before the active path is cleared, and
+ * fst_xc_teardown_failed is latched so the next case's setup and the final declared
+ * case both fail on it.  Nothing is short-circuited: a logger that would not unbind
+ * must not stop the private directory being cleaned, or one reported defect would
+ * become two.
  */
 static int fst_xc_temp_dir_destroy(void)
 {
@@ -399,7 +385,6 @@ static int fst_xc_temp_dir_destroy(void)
 		return 1;
 	}
 
-	/* the documents this suite knows a case may have written */
 	for (i = 0; names[i]; i++) {
 		fst_xc_temp_path(names[i], path, sizeof(path));
 
@@ -417,16 +402,13 @@ static int fst_xc_temp_dir_destroy(void)
 
 	/*
 	 * Anything the directory still holds is residue the sweep above did not know
-	 * about -- a document written under a name that list does not carry.  It is named
-	 * and counted before it is removed, because the name is the whole diagnostic;
-	 * removing it as well is what stops one surprise from orphaning this directory
-	 * and, since the name would recur, every directory after it.
+	 * about.  It is named and counted before it is removed, because the name is the
+	 * whole diagnostic.
 	 *
 	 * Two bounded passes: removing an entry part-way through an enumeration leaves it
 	 * unspecified whether the entries after it are still reported, so a second pass
 	 * covers anything the first could have missed.  The pool is created here rather
-	 * than reusing fst_pool, which the teardown prologue has already destroyed by the
-	 * time this runs.
+	 * than reusing fst_pool, which the teardown prologue has already destroyed.
 	 */
 	if (switch_core_new_memory_pool(&pool) == SWITCH_STATUS_SUCCESS) {
 		for (pass = 0; pass < 2; pass++) {
@@ -460,7 +442,6 @@ static int fst_xc_temp_dir_destroy(void)
 		switch_core_destroy_memory_pool(&pool);
 	}
 
-	/* persisted before the active path is cleared, so a failure can still name it */
 	switch_copy_string(fst_xc_temp_dir_last, fst_xc_temp_dir, sizeof(fst_xc_temp_dir_last));
 
 	if (rmdir(fst_xc_temp_dir) != 0 && errno != ENOENT) {
@@ -551,7 +532,6 @@ typedef struct {
 	int content_type_storage_freed;
 	int content_type_alloc_failures;
 	int content_type_served_from_handle;
-	/* every CURLOPT_HTTPHEADER handoff, in the order the fetch made them */
 	int setopt_count;
 	int httpheader_set_count;
 	const void *httpheader_list[FST_XC_MAX_HTTPHEADER_SETS];
@@ -567,29 +547,16 @@ typedef struct {
 static fst_xc_transport_t fst_xc_transport;
 
 /*
- * -------------------------------------------------------------------------
- * MODELLING WHAT libcurl OWNS
- * -------------------------------------------------------------------------
  * libcurl owns the string CURLINFO_CONTENT_TYPE hands back and frees it together
- * with the easy handle, so the production fetch has to take that read while the
- * handle is alive and copy the value out.  A shim that answered from storage of
- * its own would keep working if that ordering were ever broken -- which is
- * exactly the regression the placement of the production read exists to prevent.
- *
- * These slots therefore reproduce libcurl's ownership rather than describe it.
- * Every handle the init shim hands out gets a slot; the first
- * CURLINFO_CONTENT_TYPE read on that handle allocates a copy the slot owns; the
- * cleanup shim overwrites that copy and frees it.  Three consequences, all
- * deliberate:
- *
- *   - a read taken after cleanup is refused and counted rather than served, so
- *     moving the production read past switch_curl_easy_cleanup() makes the
- *     ordering assertions fail instead of silently passing;
- *   - a fetch that kept libcurl's pointer instead of copying the value reads the
- *     overwritten bytes at the decode site, so the response is no longer
- *     recognised as JSON and the document assertions fail -- and under the
- *     always-on address sanitizer that same read is reported as a use-after-free;
- *   - a read against a handle this shim never issued is refused and counted too.
+ * with the easy handle, so the fetch has to take that read while the handle is alive
+ * and copy the value out.  These slots reproduce that ownership rather than describe
+ * it: every handle the init shim hands out gets a slot, the first content-type read
+ * on that handle allocates a copy the slot owns, and the cleanup shim overwrites that
+ * copy and frees it.  So a read taken after cleanup is refused and counted rather
+ * than served; a fetch that kept libcurl's pointer instead of copying the value reads
+ * the overwritten bytes at the decode site, which the always-on address sanitizer
+ * reports as a use-after-free; and a read against a handle this shim never issued is
+ * refused too.
  */
 #define FST_XC_MAX_TRACKED_HANDLES 4
 
@@ -602,7 +569,6 @@ typedef struct {
 static fst_xc_handle_t fst_xc_handles[FST_XC_MAX_TRACKED_HANDLES];
 static int fst_xc_handle_count = 0;
 
-/* Releases anything a previous fetch's handles still own, then forgets them. */
 static void fst_xc_handles_reset(void)
 {
 	int i = 0;
@@ -711,7 +677,6 @@ static int fst_xc_transport_request_list(void)
 	return -1;
 }
 
-/* 1 when `header` was on the list the request itself carried. */
 static int fst_xc_transport_request_header(const char *header)
 {
 	return fst_xc_transport_header_in_list(fst_xc_transport_request_list(), header);
@@ -854,15 +819,12 @@ SWITCH_DECLARE(switch_CURLcode) fst_xc_curl_easy_perform(switch_CURL *handle)
 
 /*
  * Serves the two pieces of response metadata the module reads, with libcurl's own
- * lifetime rules rather than a convenient approximation of them.  Both reads must
- * arrive while the handle is alive; each records its ordinal so the case can
- * assert that both preceded the cleanup.  CURLINFO_CONTENT_TYPE hands back a
- * pointer into handle-owned storage that the caller must copy, exactly as libcurl
- * does, and NULL when the response carried no such header.
- *
- * A read on a destroyed -- or never-issued -- handle is refused with an error and
- * counted.  Refusing is the point: in production that read is a use-after-free,
- * and a shim that answered it anyway would let the defect pass unnoticed.
+ * lifetime rules rather than an approximation of them.  Both reads must arrive while
+ * the handle is alive; each records its ordinal so the case can assert that both
+ * preceded the cleanup.  CURLINFO_CONTENT_TYPE hands back a pointer into
+ * handle-owned storage that the caller must copy, and NULL when the response carried
+ * no such header.  A read on a destroyed -- or never-issued -- handle is refused with
+ * an error and counted, because in production that read is a use-after-free.
  *
  * The CURLINFO is decided BEFORE the variadic argument is touched, and each branch
  * retrieves it as exactly the pointer type libcurl documents for that info -- long *
@@ -871,9 +833,7 @@ SWITCH_DECLARE(switch_CURLcode) fst_xc_curl_easy_perform(switch_CURL *handle)
  * char ** and void * are three mutually incompatible types, so pulling the argument
  * out as a void * and casting afterwards is undefined behaviour even on the ABIs
  * where every object pointer happens to share a representation.  An info this shim
- * does not serve is refused the way libcurl refuses an unsupported one, and refused
- * without starting a variadic scan at all, so no argument is ever read under a type
- * it was not passed as.
+ * does not serve is refused without starting a variadic scan at all.
  */
 SWITCH_DECLARE(switch_CURLcode) fst_xc_curl_easy_getinfo(switch_CURL *curl, switch_CURLINFO info, ...)
 {
@@ -970,8 +930,6 @@ SWITCH_DECLARE(void) fst_xc_curl_slist_free_all(switch_curl_slist_t *list)
 		return;
 	}
 
-	/* the list's own address, so the handoff recorded by the setopt shim can be
-	   matched against the object rather than against its text */
 	fst_xc_transport.released_list[bucket] = (const void *) list;
 
 	for (node = list; node; node = node->next) {
@@ -986,51 +944,33 @@ SWITCH_DECLARE(void) fst_xc_curl_slist_free_all(switch_curl_slist_t *list)
 }
 
 /*
- * -------------------------------------------------------------------------
- * OBSERVING THE OPTION HANDOFF
- * -------------------------------------------------------------------------
- * Recording a header list as it is released says what the fetch BUILT.  It cannot
- * say what the fetch GAVE CURL, and those are different claims: a list built with
- * a correct Accept entry but never passed to CURLOPT_HTTPHEADER is not sent, and a
- * fetch that suppresses the 100-continue builds two lists and hands curl only the
- * second.  Deleting either production handoff would leave a release-time-only
- * observation entirely green.
+ * Recording a header list as it is released says what the fetch BUILT, not what it
+ * GAVE CURL, and those are different claims: a list carrying a correct Accept entry
+ * but never passed to CURLOPT_HTTPHEADER is not sent, and a fetch that suppresses the
+ * 100-continue builds two lists and hands curl only the second.
  *
  * switch_curl_easy_setopt cannot be redirected the way the other five names are.
  * <switch_curl.h> makes it an object-like alias for curl_easy_setopt, and
  * <curl/curl.h> then makes curl_easy_setopt itself a function-like macro on every
- * supported toolchain -- the argument type-checker when it is available and a
- * three-argument identity macro otherwise -- so defining a macro of either name
- * ahead of those headers is a redefinition the build refuses.
+ * supported toolchain, so defining a macro of either name ahead of those headers is a
+ * redefinition the build refuses.  The seam is therefore taken one level lower and
+ * after the fact: the module source above has already been compiled, so undefining
+ * the macro here cannot affect it, and every call it made resolves to the ordinary
+ * external function defined below.  That definition inherits the build's
+ * -fvisibility=hidden, so it binds this translation unit's call sites and cannot
+ * preempt libcurl for anyone else.  No transfer is ever performed and the production
+ * code discards every setopt return value, so the shim records and returns success.
  *
- * The seam is therefore taken one level lower and after the fact.  The module
- * source above has already been compiled, so undefining the macro here cannot
- * affect it, and every call it made resolves to the ordinary external function
- * defined below.  The definition inherits the build's -fvisibility=hidden, which
- * keeps it out of the executable's dynamic symbol table: it binds the module's
- * call sites in this translation unit and cannot preempt libcurl for anyone else.
- *
- * Forwarding to libcurl would be meaningless as well as impossible -- the real
- * entry point is unreachable once shadowed, no transfer is ever performed, the
- * handle is destroyed by a shim, and the production code discards every setopt
- * return value -- so the shim records and returns success.  It also captures the
- * one option the module sets through curl_easy_setopt directly, so nothing in the
- * fetch's option handling escapes observation.
- *
- * The option is decided BEFORE the variadic argument is touched, and the argument
- * is retrieved as exactly the type the caller passed, for the same reason the
- * getinfo shim above retrieves long * and char ** rather than void *.  va_arg has
- * to be invoked with a type compatible with the argument actually passed, and the
- * production call site hands CURLOPT_HTTPHEADER a switch_curl_slist_t * -- which
- * <switch_curl.h> defines as struct curl_slist * -- so that is the type named here.
- * struct curl_slist * and void * are incompatible types, so pulling the argument
- * out as a void * and relying on the two sharing a representation would be
- * undefined behaviour even on the ABIs where they do.  The value is only widened
- * to the generic const void * observation storage AFTER it has been read under its
- * own type, because the record exists to identify the list by address and must
- * stay comparable with the address the free-all shim records.  An option this shim
- * does not observe is returned on without starting a variadic scan at all, so no
- * argument is ever read under a type it was not passed as.
+ * The option is decided BEFORE the variadic argument is touched, and the argument is
+ * retrieved as exactly the type the caller passed: the production call site hands
+ * CURLOPT_HTTPHEADER a switch_curl_slist_t *, which <switch_curl.h> defines as struct
+ * curl_slist *, so that is the type named here.  struct curl_slist * and void * are
+ * incompatible types, so pulling the argument out as a void * and relying on the two
+ * sharing a representation would be undefined behaviour even on the ABIs where they
+ * do.  The value is widened to the generic const void * observation storage only
+ * AFTER it has been read under its own type, so it stays comparable with the address
+ * the free-all shim records.  An option this shim does not observe is returned on
+ * without starting a variadic scan at all.
  */
 #undef curl_easy_setopt
 
@@ -1256,7 +1196,7 @@ static int fst_xc_write_file(const char *path, const char *text, switch_size_t l
 #define FST_XC_LOG_FALLBACK "falling back to XML parsing"
 #define FST_XC_LOG_IDX_FALLBACK 0
 
-/* The pre-existing error the production XML parse reports when it cannot parse. */
+/* The error the production XML parse reports when it cannot parse. */
 #define FST_XC_LOG_PARSE_ERROR "Error Parsing Result!"
 #define FST_XC_LOG_IDX_PARSE_ERROR 1
 
@@ -1360,16 +1300,14 @@ static int fst_xc_log_capture_start(void)
  * returned SUCCESS no dispatch can still be inside fst_xc_logger() and the pool
  * backing the mutex and condition is safe to destroy.
  *
- * That ordering is the whole reason the unbind status is checked rather than
- * discarded.  The pool is destroyed ONLY after a successful unbind: if the unbind
- * did not remove this logger, a dispatch on the core's log thread can still be
- * about to enter fst_xc_logger(), and freeing the mutex it locks would be a
- * use-after-free in another thread - the one failure mode a test harness must
- * never introduce into the core it is testing.  So on failure nothing is released
- * and nothing is cleared: fst_xc_log_bound stays set so the next call retries the
- * unbind, the mutex and condition stay valid so a late dispatch remains safe, and
- * the failure is reported and latched.  Returns 1 only when the logger is
- * demonstrably unbound and its pool released.
+ * The pool is therefore destroyed ONLY after a successful unbind: if the unbind did
+ * not remove this logger, a dispatch on the core's log thread can still be about to
+ * enter fst_xc_logger(), and freeing the mutex it locks would be a use-after-free in
+ * another thread.  On failure nothing is released and nothing is cleared -
+ * fst_xc_log_bound stays set so the next call retries the unbind, the mutex and
+ * condition stay valid so a late dispatch remains safe, and the failure is reported
+ * and latched.  Returns 1 only when the logger is demonstrably unbound and its pool
+ * released.
  */
 static int fst_xc_log_capture_stop(void)
 {
@@ -1780,27 +1718,21 @@ FST_CORE_BEGIN("conf")
 		FST_TEARDOWN_BEGIN()
 		{
 			/*
-			 * Safety net, and the only cleanup this suite relies on.  fst_requires()
-			 * jumps straight to teardown on failure, so anything a case registers has
-			 * to be removable from here as well as from the case itself.  Every call
-			 * below is idempotent and harmless when the case never got that far.
+			 * The only cleanup this suite relies on.  fst_requires() jumps straight to
+			 * teardown on failure, so anything a case registers has to be removable from
+			 * here as well as from the case itself; every call below is idempotent and
+			 * harmless when the case never got that far.
 			 *
 			 * Order matters: module state is released before the private directory is
-			 * removed, because releasing it unbinds fetch functions whose documents
-			 * live in that directory.
+			 * removed, because releasing it unbinds fetch functions whose documents live
+			 * in that directory.
 			 *
-			 * Both stops report their own failure and latch fst_xc_teardown_failed,
-			 * which the next case's setup asserts and the last declared case asserts
-			 * cumulatively.  Neither is short-circuited on the other's failure: a logger
-			 * that would not unbind must not stop the private directory being cleaned, or
-			 * one reported defect would become two.
-			 *
-			 * The directory removal is additionally asserted rather than merely attempted.
-			 * fst_requires() is the one check that is meaningful here -- it manufactures a
-			 * reportable entry when it is used outside a case -- and orphaning residue in a
-			 * shared directory is worth stopping on, because the same case would orphan more
-			 * of it on every run.  The removal logs which entry defeated it before it fails,
-			 * so the report names the offender and not just the expression.
+			 * Both stops latch fst_xc_teardown_failed, which the next case's setup asserts
+			 * and the last declared case asserts cumulatively.  Neither is short-circuited
+			 * on the other's failure: a logger that would not unbind must not stop the
+			 * private directory being cleaned, or one reported defect would become two.
+			 * The directory removal is asserted rather than merely attempted, because the
+			 * same case would orphan more residue on every run.
 			 */
 			fst_xc_log_capture_stop();
 			fst_xc_module_state_cleanup();
@@ -2174,9 +2106,7 @@ FST_CORE_BEGIN("conf")
 			 * And the directory the previous case used is gone.  Every case gets a fresh
 			 * uuid, so "this directory is empty" holds by construction and proves nothing
 			 * about cleanup; that the previous one no longer exists is the assertion that
-			 * does, and it is only possible to make because the path is now kept when the
-			 * active one is cleared.  Discarding it was what let an orphaned directory
-			 * accumulate silently, one per case and again on every run.
+			 * does.
 			 */
 			fst_requires(*fst_xc_temp_dir_last != '\0');
 			fst_xcheck(strcmp(fst_xc_temp_dir_last, fst_xc_temp_dir) != 0, "each case must be given its own private directory");
@@ -2560,23 +2490,18 @@ FST_CORE_BEGIN("conf")
 			int j;
 
 			/*
-			 * Width is bounded because of what it COSTS to build, not because of what it
-			 * occupies.  switch_xml_add_child_d() reaches switch_xml_insert(), which walks the
-			 * parent's existing ordered and same-name lists to their tail whenever the new
-			 * offset is not smaller than the head's -- and this translator deliberately passes
-			 * a constant offset of zero so that insertion order becomes document order, so
-			 * every one of those comparisons is 0 <= 0 and every append walks every sibling
-			 * already present.  n children under one parent therefore cost n*(n-1)/2
-			 * comparisons on the ordered chain, and again on the same-name chain.  Neither of
-			 * the other ceilings bounds that: the node ceiling would still admit
-			 * XML_CURL_JSON_MAX_NODES children under a single parent, of the order of 4*10^8
-			 * comparisons on the synchronous provisioning fetch path, and the array ceiling is
-			 * never reached at all by width accumulated across several member names.  These
-			 * cases pin the per-parent ceiling that does bound it.
+			 * Width is bounded because of what it COSTS to build.  switch_xml_add_child_d()
+			 * reaches switch_xml_insert(), which walks the parent's ordered and same-name
+			 * lists to their tail whenever the new offset is not smaller than the head's --
+			 * and the translator passes a constant offset of zero so that insertion order
+			 * becomes document order, so every append walks every sibling already present.
+			 * n children under one parent therefore cost n*(n-1)/2 comparisons on each
+			 * chain.  Neither of the other ceilings bounds that: the node ceiling would
+			 * still admit XML_CURL_JSON_MAX_NODES children under a single parent, and the
+			 * array ceiling is never reached by width accumulated across several member
+			 * names.  These cases pin the per-parent ceiling that does bound it.
 			 */
 
-			/* a parent exactly at the ceiling is accepted, and every child survives in
-			   document order, so the ceiling refuses abuse rather than silently truncating */
 			SWITCH_STANDARD_STREAM(stream);
 			stream.write_function(&stream, "%s", "{\"directory\":{\"user\":[");
 			for (i = 0; i < XML_CURL_JSON_MAX_CHILDREN_PER_PARENT; i++) {
@@ -2595,8 +2520,6 @@ FST_CORE_BEGIN("conf")
 					   "a parent at the full ceiling must keep its children in document order");
 			switch_safe_free(rendered);
 
-			/* one child past the ceiling is refused outright, so the fetch path falls back to
-			   the XML parse rather than handing the core a quietly truncated tree */
 			SWITCH_STANDARD_STREAM(stream);
 			stream.write_function(&stream, "%s", "{\"directory\":{\"user\":[");
 			for (i = 0; i < XML_CURL_JSON_MAX_CHILDREN_PER_PARENT + 1; i++) {
@@ -2607,9 +2530,6 @@ FST_CORE_BEGIN("conf")
 					   "one child past the per-parent ceiling must be refused");
 			switch_safe_free(stream.data);
 
-			/* the ceiling is AGGREGATE, which is the whole reason it has to exist separately:
-			   three arrays that each sit comfortably inside the array ceiling still add up to
-			   a parent the array ceiling on its own would never have questioned */
 			SWITCH_STANDARD_STREAM(stream);
 			stream.write_function(&stream, "%s", "{\"directory\":{");
 			for (i = 0; i < 3; i++) {
@@ -2624,9 +2544,6 @@ FST_CORE_BEGIN("conf")
 					   "width summed across several member names must be refused");
 			switch_safe_free(stream.data);
 
-			/* and it is enforced at both insertion sites: one array brings this parent to just
-			   under the ceiling and the single-object members that follow carry it past, so the
-			   check cannot live in the array branch alone */
 			SWITCH_STANDARD_STREAM(stream);
 			stream.write_function(&stream, "%s", "{\"directory\":{\"u\":[");
 			for (i = 0; i < XML_CURL_JSON_MAX_CHILDREN_PER_PARENT - 6; i++) {
@@ -2641,9 +2558,6 @@ FST_CORE_BEGIN("conf")
 					   "the ceiling must be enforced on single-object children too");
 			switch_safe_free(stream.data);
 
-			/* the scenario the ceiling exists for: one parent handed the entire node budget.
-			   It is refused before a single child is inserted, so the quadratic build that
-			   would otherwise run to completion on the fetch path never starts. */
 			SWITCH_STANDARD_STREAM(stream);
 			stream.write_function(&stream, "%s", "{\"directory\":{\"user\":[");
 			for (i = 0; i < XML_CURL_JSON_MAX_NODES; i++) {
@@ -2654,8 +2568,6 @@ FST_CORE_BEGIN("conf")
 					   "a parent handed the whole node budget must be refused");
 			switch_safe_free(stream.data);
 
-			/* the ceiling is per parent and not per document, because the cost it bounds is
-			   paid once per parent: two parents may each sit at the ceiling and be accepted */
 			SWITCH_STANDARD_STREAM(stream);
 			stream.write_function(&stream, "%s", "{\"directory\":{\"domain\":[");
 			for (i = 0; i < 2; i++) {
@@ -2828,30 +2740,28 @@ FST_CORE_BEGIN("conf")
 		 * The compact repeated-child document, which the array mapping exists to
 		 * express and which must therefore never be refused as oversized.
 		 *
-		 * The decoder's resource ceilings have to bound what the translation
-		 * ALLOCATES, and the volume of names it writes is not bounded by the length
-		 * of the payload it reads: an array collapses n repeated children onto one
-		 * key, so a key that occurs once in the input is written n times into the
-		 * tree.  {"directory":{"extension":[{},{},{},{},{}]}} is forty-four bytes of
-		 * JSON and already writes forty-five bytes of element names, so accounting
-		 * name volume against the payload length refuses the canonical shape - a
-		 * silent, section-wide provisioning failure that looks like a malformed
-		 * response.  Names are therefore charged against their own expanded-output
-		 * ceiling, and this case is what holds that apart from the input-size check.
+		 * The decoder's resource ceilings bound what the translation ALLOCATES, and the
+		 * volume of names it writes is not bounded by the length of the payload it
+		 * reads: an array collapses n repeated children onto one key, so a key that
+		 * occurs once in the input is written n times into the tree.
+		 * {"directory":{"extension":[{},{},{},{},{}]}} is forty-four bytes of JSON and
+		 * already writes forty-five bytes of element names, so charging name volume
+		 * against the payload length would refuse the canonical shape - a silent,
+		 * section-wide provisioning failure that looks like a malformed response.  Names
+		 * are charged against their own expanded-output ceiling instead, and this case
+		 * holds that apart from the input-size check.
 		 *
-		 * Parity is asserted rather than substring-matched, because the point is
-		 * that the compact form produces exactly the tree its XML twin does; and
-		 * the ceilings that must still bite are asserted alongside it, so relaxing
-		 * one accounting rule cannot quietly relax the others.
+		 * Parity is asserted rather than substring-matched, because the point is that
+		 * the compact form produces exactly the tree its XML twin does; the ceilings
+		 * that must still bite are asserted alongside it, so relaxing one accounting
+		 * rule cannot quietly relax the others.
 		 */
 		FST_TEST_BEGIN(compact_repeated_children_are_not_refused)
 		{
-			/* the document named in the review, and its minified XML twin */
 			static const char review_json[] = "{\"directory\":{\"extension\":[{},{},{},{},{}]}}";
 			static const char review_xml[] = "<document type=\"freeswitch/xml\"><section name=\"directory\">"
 				"<extension></extension><extension></extension><extension></extension>"
 				"<extension></extension><extension></extension></section></document>";
-			/* one element beyond XML_CURL_JSON_MAX_ARRAY_ELEMENTS, and one within it */
 			static const int within = XML_CURL_JSON_MAX_ARRAY_ELEMENTS;
 			static const int beyond = XML_CURL_JSON_MAX_ARRAY_ELEMENTS + 1;
 			char *from_json = NULL;
@@ -2865,7 +2775,6 @@ FST_CORE_BEGIN("conf")
 			int i = 0;
 			int counted = 0;
 
-			/* 1. the exact review document translates, and to the identical bytes */
 			from_json = fst_xc_render(review_json, "directory");
 			fst_xcheck(from_json != NULL, "the canonical compact repeated-child document must not be refused");
 
@@ -2879,7 +2788,6 @@ FST_CORE_BEGIN("conf")
 			switch_safe_free(from_json);
 			switch_safe_free(from_xml);
 
-			/* 2. every child is present, in order, and each is an empty element */
 			xml_tree = xml_curl_json_to_xml(review_json, "directory");
 			fst_requires(xml_tree != NULL);
 			section_tag = switch_xml_child(xml_tree, "section");
@@ -2894,11 +2802,11 @@ FST_CORE_BEGIN("conf")
 			xml_tree = NULL;
 
 			/*
-			 * 3. A run right at the element ceiling.  This is the worst case for the
-			 *    accounting the fix separated: the payload is a few bytes per element
-			 *    while the tree receives the whole key each time, so the transformed
-			 *    name volume is an order of magnitude larger than the input.  Refusing
-			 *    it would mean the element ceiling could never actually be reached.
+			 * A run right at the element ceiling is the worst case for separate name
+			 * accounting: the payload is a few bytes per element while the tree receives
+			 * the whole key each time, so the transformed name volume is an order of
+			 * magnitude larger than the input.  Refusing it would mean the element
+			 * ceiling could never actually be reached.
 			 */
 			room = (switch_size_t) (beyond * 4) + 128;
 			bulk = (char *) malloc(room);
@@ -2914,11 +2822,6 @@ FST_CORE_BEGIN("conf")
 
 			fst_xcheck(fst_xc_accepts(bulk, "directory"), "a run of repeated children at the element ceiling must be accepted");
 
-			/*
-			 * 4. And one element beyond it is still refused, from the same buffer, so
-			 *    the boundary is asserted rather than assumed: the ceiling that bounds
-			 *    the expansion is the element count, and it still binds.
-			 */
 			switch_snprintf(bulk, room, "%s", "{\"directory\":{\"extension\":[");
 			for (i = 0; i < beyond; i++) {
 				used = strlen(bulk);
@@ -2932,11 +2835,10 @@ FST_CORE_BEGIN("conf")
 			switch_safe_free(bulk);
 
 			/*
-			 * 5. The charge helper itself, which every ceiling now routes through.
-			 *    It tests the remaining headroom instead of the sum, so an addend
-			 *    large enough to wrap the counter is refused rather than silently
-			 *    accepted - the failure mode that would make every ceiling above
-			 *    bypassable with one enormous name.
+			 * The charge helper every ceiling routes through tests the remaining headroom
+			 * instead of the sum, so an addend large enough to wrap the counter is refused
+			 * rather than silently accepted - the failure mode that would make every
+			 * ceiling above bypassable with one enormous name.
 			 */
 			{
 				switch_size_t counter = 0;
@@ -2947,8 +2849,7 @@ FST_CORE_BEGIN("conf")
 				 * fst_check_int_equals() expands its first operand twice - once in the
 				 * comparison and once as a message argument - so a call with a side
 				 * effect placed there would be applied twice, in an order the standard
-				 * does not fix.  Every assertion in this block is on state, so it has
-				 * to be state that was produced exactly once.
+				 * does not fix.
 				 */
 				charged = xml_curl_json_budget_charge(&counter, 10, 10);
 				fst_check_int_equals(charged, 1);
@@ -2967,9 +2868,8 @@ FST_CORE_BEGIN("conf")
 			}
 
 			/*
-			 * 6. Names are accounted separately from values, but they are still
-			 *    accounted: a single name beyond the per-name ceiling is refused, so
-			 *    separating the two counters did not remove the bound on either.
+			 * Names are accounted separately from values, but they are still accounted:
+			 * a single name beyond the per-name ceiling is refused.
 			 */
 			{
 				char oversized[XML_CURL_JSON_MAX_NAME_BYTES + 64] = "";
@@ -3293,11 +3193,8 @@ FST_CORE_BEGIN("conf")
 			/* the 100-continue list is not built at all for this binding */
 			fst_check_int_equals(fst_xc_transport.sent_header_count[FST_XC_HEADER_LIST_EXPECT], 0);
 			/*
-			 * The handoff, not just the build: curl was given a list exactly once, it
-			 * was given it on the handle this fetch created, it was given it before the
-			 * transfer, and the list it was left holding is the one carrying Accept.
-			 * Removing the production CURLOPT_HTTPHEADER call fails these; a
-			 * release-time observation on its own would not notice.
+			 * The handoff, not just the build: removing the CURLOPT_HTTPHEADER call fails
+			 * these, where a release-time observation on its own would not notice.
 			 */
 			fst_check_int_equals(fst_xc_transport.httpheader_set_count, 1);
 			fst_xcheck(fst_xc_transport.setopt_count > fst_xc_transport.httpheader_set_count,
@@ -3313,9 +3210,8 @@ FST_CORE_BEGIN("conf")
 					   "the header list must reach curl before the transfer is performed");
 			/*
 			 * The response metadata is read while the handle is still alive, and never
-			 * afterwards.  Moving either read past switch_curl_easy_cleanup() -- which
-			 * is a use-after-free in production, because libcurl frees the
-			 * Content-Type string with the handle -- fails here rather than passing.
+			 * afterwards: libcurl frees the Content-Type string with the handle, so a read
+			 * past switch_curl_easy_cleanup() is a use-after-free.
 			 */
 			fst_xcheck(fst_xc_transport.response_code_op > 0, "the response code must be read");
 			fst_xcheck(fst_xc_transport.content_type_op > 0, "the response content type must be read");
@@ -3329,13 +3225,6 @@ FST_CORE_BEGIN("conf")
 			fst_check_int_equals(fst_xc_transport.content_type_alloc_failures, 0);
 			fst_xcheck(fst_xc_transport.content_type_served_from_handle,
 					   "the content type must be served from storage the handle owns, as libcurl serves it");
-			/*
-			 * The handle-owned Content-Type copy was overwritten and released when the
-			 * handle was destroyed, which happens before the decode dispatch below.  So
-			 * the two assertions that follow -- that the response decoded, and that it
-			 * decoded as JSON -- can only hold if the fetch copied the value out while
-			 * the handle was alive rather than carrying libcurl's pointer forward.
-			 */
 			fst_check_int_equals(fst_xc_transport.content_type_storage_freed, 1);
 			fst_xcheck(xml != NULL, "a JSON response to a JSON binding must decode");
 			fst_check_string_equals(fst_xc_fetched_user_id(xml), "1000");
@@ -3376,10 +3265,10 @@ FST_CORE_BEGIN("conf")
 
 			/*
 			 * 4. Nothing can decode an empty body, so both decoders report and the fetch
-			 *    resolves to nothing.  This is the one path that emits the module's
-			 *    pre-existing parse error as well as the new fallback warning, and the
-			 *    two are deliberately distinct messages: the warning explains why JSON
-			 *    was abandoned, the error reports that XML failed too.
+			 *    resolves to nothing.  This is the one path that emits the terminal parse
+			 *    error as well as the fallback warning, and the two are distinct messages:
+			 *    the warning explains why JSON was abandoned, the error reports that XML
+			 *    failed too.
 			 */
 			xml = fst_xc_drive_fetch(&binding, "directory", "", "application/json", 200);
 			fst_xcheck(fst_xc_fetch_barrier_ok, "the log queue must drain before the warning counters are read");
@@ -3389,13 +3278,11 @@ FST_CORE_BEGIN("conf")
 			fst_xc_unlink_preprocessed();
 
 			/*
-			 * 5. No response-format at all.  The gateway answers JSON, and the module
-			 *    treats it exactly as it did before this parameter existed: no Accept
-			 *    header is negotiated, no JSON decode is attempted, no fallback warning
-			 *    is emitted, and switch_xml_parse_file() is handed the body and returns
-			 *    the diagnostic-carrying tree it has always returned for a non-XML
-			 *    document.  That last detail is what makes this a behaviour assertion
-			 *    rather than a smoke test.
+			 * 5. With no response-format the gateway's JSON is treated as XML: no Accept
+			 *    header is negotiated, no decode is attempted, no fallback warning is
+			 *    emitted, and switch_xml_parse_file() is handed the body and returns the
+			 *    diagnostic-carrying tree it returns for any non-XML document.  That last
+			 *    detail is what makes this a behaviour assertion rather than a smoke test.
 			 */
 			memset(&binding, 0, sizeof(binding));
 			binding.url = (char *) "http://127.0.0.1:1/provision";
@@ -3448,13 +3335,6 @@ FST_CORE_BEGIN("conf")
 					   "the 100-continue suppression must be on that same list");
 			fst_xcheck(!fst_xc_transport_header_in_list(FST_XC_HEADER_LIST_CONTENT_TYPE, "Accept: application/json"),
 					   "Accept must not be appended to the list this binding makes curl discard");
-			/*
-			 * And the handoff for that composition: curl is given a list twice, the two
-			 * handoffs name different objects, and the one curl is left holding is the
-			 * Expect list.  Removing the second production CURLOPT_HTTPHEADER call
-			 * leaves curl holding the first list, which carries neither entry -- so
-			 * these assertions fail where a content-only check would still pass.
-			 */
 			fst_check_int_equals(fst_xc_transport.httpheader_set_count, 2);
 			fst_xcheck(fst_xc_transport.httpheader_list[0] != fst_xc_transport.httpheader_list[1],
 					   "the second handoff must replace the list curl holds rather than repeat the first");
@@ -3474,15 +3354,11 @@ FST_CORE_BEGIN("conf")
 			xml = NULL;
 
 			/*
-			 * 8. The same JSON round trip, driven by a mixed-case parameter value.  The
-			 *    module compares the value case-insensitively, and this is the only
-			 *    place that claim is exercised on the HTTP path -- the file: shortcut
-			 *    returns before the format decision is ever reached, so a case
-			 *    assertion made there proves nothing about negotiation or dispatch.
-			 *    Here the value has to survive all three: the Accept negotiation, the
-			 *    decode dispatch, and the decoded document.  Sub-case 5 supplies the
-			 *    negative half -- a binding that asked for nothing negotiates nothing --
-			 *    so a case-sensitive comparison has nowhere left to hide.
+			 * 8. A mixed-case parameter value, on the HTTP path: the file: shortcut returns
+			 *    before the format decision is reached, so a case assertion made there
+			 *    proves nothing about negotiation or dispatch.  Here the value has to
+			 *    survive the Accept negotiation, the decode dispatch and the decoded
+			 *    document.
 			 */
 			memset(&binding, 0, sizeof(binding));
 			binding.url = (char *) "http://127.0.0.1:1/provision";
@@ -3509,34 +3385,25 @@ FST_CORE_BEGIN("conf")
 		FST_TEST_END()
 
 		/*
-		 * The confidentiality regression, over BOTH lines the JSON path can write:
-		 * neither the fallback warning nor the terminal parse error may carry any
-		 * part of the gateway URL beyond its authority, and neither may carry the
-		 * request form body.
+		 * Neither of the two lines the JSON path can write may carry any part of the
+		 * gateway URL beyond its authority, and neither may carry the request form body.
 		 *
-		 * The path of a provisioning URL is not inert.  Deployments routinely
-		 * address a tenant by putting its identifier - or an account key, or a
-		 * bearer value - in a path segment, exactly as they put tokens in a query
-		 * string, and a warning is written to whatever the operator's logger
-		 * persists to.  Redacting the userinfo and the query while reproducing the
-		 * path therefore leaves the same class of secret in the same place.  The
-		 * form body is worse: it ends with the value that was looked up and carries
-		 * every event variable the binding mapped into it.
+		 * The path of a provisioning URL is not inert.  Deployments routinely address a
+		 * tenant by putting its identifier - or an account key, or a bearer value - in a
+		 * path segment, exactly as they put tokens in a query string, and a warning is
+		 * written to whatever the operator's logger persists to.  Redacting the userinfo
+		 * and the query while reproducing the path therefore leaves the same class of
+		 * secret in the same place.  The form body is worse: it ends with the value that
+		 * was looked up and carries every event variable the binding mapped into it.
 		 *
-		 * This case drives the REAL fetch, so it observes the bytes the module
-		 * actually logs rather than the return value of the redaction helper: the
-		 * bound counting logger sees every dispatched line, and the assertion is
-		 * that the count of lines containing the secret is zero while the count of
-		 * the expected production message is one.  Asserting the helper alone would
-		 * still pass if a future edit logged binding->url or the form body directly
-		 * somewhere else in the fetch.
-		 *
-		 * Sub-cases 1 to 4 exercise the fallback warning, with a body the XML parse
-		 * can still read.  Sub-cases 5 onwards exercise the terminal diagnostic,
-		 * with a body neither decoder can read - the branch that historically wrote
-		 * both raw operands, and the branch the JSON path made newly reachable.
-		 * Both halves are needed: covering only the first leaves the leakiest line
-		 * in the module unexecuted by the very case that exists to police it.
+		 * This case drives the REAL fetch, so it observes the bytes the module logs
+		 * rather than the return value of the redaction helper: the bound counting logger
+		 * sees every dispatched line, and the assertion is that the count of lines
+		 * carrying the secret is zero while the count of the expected message is one.
+		 * Asserting the helper alone would still pass if an edit logged binding->url or
+		 * the form body directly somewhere else in the fetch.  Both the fallback warning
+		 * and the terminal diagnostic are covered, because covering only the first leaves
+		 * the leakiest line in the module unexecuted by the case that exists to police it.
 		 */
 		FST_TEST_BEGIN(log_hygiene_url_path_is_never_logged)
 		{
@@ -3547,7 +3414,6 @@ FST_CORE_BEGIN("conf")
 			static const char secret_path_segment[] = "s3cr3t-tenant-token";
 			static const char secret_password[] = "hunter2";
 			static const char secret_query_value[] = "deadbeefapikey";
-			/* the looked-up value, which the module places last in the POST form body */
 			static const char secret_subscriber[] = "s3cr3t-subscriber-9911";
 			static const char gateway_url[] = "https://provisioner:hunter2@127.0.0.1:1"
 				"/tenants/s3cr3t-tenant-token/directory?apikey=deadbeefapikey#frag";
@@ -3607,33 +3473,23 @@ FST_CORE_BEGIN("conf")
 									"https://[redacted]@127.0.0.1:1/[redacted]");
 
 			/*
-			 * -----------------------------------------------------------------
-			 * 5 onwards: the TERMINAL diagnostic, not just the fallback warning.
-			 * -----------------------------------------------------------------
-			 * Everything above supplies a body the XML parse can read, so the
-			 * fetch resolves and the module's pre-existing "Error Parsing Result!"
-			 * line never runs.  That line is the one this module has always
-			 * written with the raw gateway URL and the raw POST form body as its
-			 * two operands, and the JSON path made it reachable in a new way: a
-			 * response that decodes as neither representation now arrives there
-			 * after the JSON decode has been abandoned.  A confidentiality case
-			 * that never executes it proves nothing about it.
+			 * The terminal "Error Parsing Result!" diagnostic, whose two operands are the
+			 * gateway URL and the POST form body.  Everything above supplies a body the XML
+			 * parse can read, so the fetch resolves and that line never runs; a
+			 * confidentiality case that never executes it proves nothing about it.
 			 *
-			 * An empty body is what reaches it deterministically.  switch_xml_parse_str()
-			 * never returns NULL - it returns a tree carrying an error string - so
-			 * switch_xml_parse_file() reports failure only when the preprocessed
-			 * file has no bytes at all.  Every sub-case below therefore answers
-			 * with an empty payload announced as JSON: the decode is abandoned
-			 * (one warning), the XML parse then fails (one error), and the fetch
-			 * resolves to nothing, which is exactly the state in which the
-			 * diagnostic is written.
+			 * An empty body reaches it deterministically.  switch_xml_parse_str() never
+			 * returns NULL - it returns a tree carrying an error string - so
+			 * switch_xml_parse_file() reports failure only when the preprocessed file has
+			 * no bytes at all.  Every sub-case below therefore answers with an empty
+			 * payload announced as JSON: the decode is abandoned (one warning), the XML
+			 * parse then fails (one error), and the fetch resolves to nothing.
 			 *
-			 * The watched strings are the two operands' secrets, one fetch each
-			 * because only one absence pattern can be armed at a time: the URL's
-			 * path segment, its userinfo password, its query value, the lookup's
-			 * key_value, and the literal "key_value=" - which appears in the form
-			 * body and nowhere else, so it catches the body being logged whatever
-			 * values it happens to carry.
+			 * The watched strings are the two operands' secrets, one fetch each because
+			 * only one absence pattern can be armed at a time: the URL's path segment, its
+			 * userinfo password, its query value, the lookup's key_value, and the literal
+			 * "key_value=" - which appears in the form body and nowhere else, so it catches
+			 * the body being logged whatever values it happens to carry.
 			 */
 			fst_xc_log_watch_absent(secret_path_segment);
 			xml = fst_xc_drive_fetch_ex(&binding, "directory", secret_subscriber, "", "application/json", 200);
@@ -3723,27 +3579,21 @@ FST_CORE_BEGIN("conf")
 		FST_TEST_END()
 
 		/*
-		 * The log-injection regression for the one operand of these lines that is
-		 * chosen by the CALLER rather than by the operator or the remote gateway.
+		 * Log injection through the one operand of these lines that the CALLER chooses
+		 * rather than the operator or the remote gateway.
 		 *
-		 * A section selector is not an internal constant.  mod_commands registers
-		 * an `xml_locate' API command whose argument is passed straight into
-		 * switch_xml_locate(), and switch_xml_locate() is what dispatches to this
-		 * module's binding - so the bytes that reach these lines are picked by
-		 * whoever issued the lookup, over the console or over an event socket.  A
-		 * selector carrying CR LF forges a second, wholly fabricated log entry,
-		 * and one carrying an escape sequence reaches the terminal of whoever
-		 * tails the log.  Neither is hypothetical once the operand is written out
-		 * verbatim, and neither is prevented by the URL and Content-Type
-		 * renderings, which are the other two operands of the same warning.
+		 * A section selector is not an internal constant.  mod_commands registers an
+		 * `xml_locate' API command whose argument is passed straight into
+		 * switch_xml_locate(), which is what dispatches to this module's binding - so the
+		 * bytes that reach these lines are picked by whoever issued the lookup, over the
+		 * console or over an event socket.  A selector carrying CR LF forges a second,
+		 * wholly fabricated log entry, and one carrying an escape sequence reaches the
+		 * terminal of whoever tails the log.  Neither is prevented by the URL and
+		 * Content-Type renderings, which are the other two operands of the same warning.
 		 *
-		 * Both lines that render a section are covered, for the same reason the
-		 * URL case covers both: the fallback warning, reached with a body the XML
-		 * parse can still read, and the terminal diagnostic, reached with a body
-		 * neither decoder can read.  The expected rendering is written out by hand
-		 * rather than computed from the helper, so each assertion is an
-		 * independent statement of what the sanitizer must produce rather than a
-		 * restatement of what it happens to produce.
+		 * Both lines that render a section are covered.  The expected rendering is written
+		 * out by hand rather than computed from the helper, so each assertion states
+		 * independently what the sanitizer must produce.
 		 */
 		FST_TEST_BEGIN(log_hygiene_section_selector_is_neutralised)
 		{
@@ -3781,7 +3631,6 @@ FST_CORE_BEGIN("conf")
 			   this also states that a selector of this length survives whole. */
 			fst_check_string_equals(xml_curl_json_sanitize_token(hostile_section, rendered, sizeof(rendered)), neutralised);
 
-			/* 1. no log line may carry the CR LF that would forge a second entry */
 			fst_xc_log_watch_absent("\r\n");
 			xml = fst_xc_drive_fetch(&binding, hostile_section, xml_body, "text/xml", 200);
 			fst_xcheck(fst_xc_fetch_barrier_ok, "the log queue must drain before the warning counters are read");
@@ -3790,7 +3639,6 @@ FST_CORE_BEGIN("conf")
 			switch_xml_free(xml);
 			xml = NULL;
 
-			/* 2. nor the escape sequence aimed at the operator's terminal */
 			fst_xc_log_watch_absent("\033[2J");
 			xml = fst_xc_drive_fetch(&binding, hostile_section, xml_body, "text/xml", 200);
 			fst_xcheck(fst_xc_fetch_barrier_ok, "the log queue must drain before the warning counters are read");
@@ -3799,7 +3647,6 @@ FST_CORE_BEGIN("conf")
 			switch_xml_free(xml);
 			xml = NULL;
 
-			/* 3. nor any other control byte, escape sequences aside */
 			fst_xc_log_watch_absent("\001");
 			xml = fst_xc_drive_fetch(&binding, hostile_section, xml_body, "text/xml", 200);
 			fst_xcheck(fst_xc_fetch_barrier_ok, "the log queue must drain before the warning counters are read");
@@ -3808,12 +3655,8 @@ FST_CORE_BEGIN("conf")
 			switch_xml_free(xml);
 			xml = NULL;
 
-			/*
-			 * 4. and the warning is still worth writing: "logs nothing" would
-			 *    satisfy all three checks above on its own, so what must survive is
-			 *    asserted too - the selector that was asked for, in the form the
-			 *    sanitizer produces, in the field it belongs to.
-			 */
+			/* the watched needle must be PRESENT here: "logs nothing" would satisfy the
+			   three absence checks above on its own */
 			switch_snprintf(needle, sizeof(needle), "JSON decode of the [%s] response", neutralised);
 			fst_xc_log_watch_absent(needle);
 			xml = fst_xc_drive_fetch(&binding, hostile_section, xml_body, "text/xml", 200);
@@ -3823,12 +3666,8 @@ FST_CORE_BEGIN("conf")
 			switch_xml_free(xml);
 			xml = NULL;
 
-			/*
-			 * 5. a lookup that arrives without a selector renders as a stable
-			 *    marker rather than as an empty field, so the warning still reads
-			 *    as a sentence and an absent selector cannot be mistaken for one
-			 *    that was present and blank.
-			 */
+			/* a stable marker rather than an empty field, so a selector that never arrived
+			   cannot be mistaken for one that was present and blank */
 			switch_copy_string(needle, "JSON decode of the [(absent)] response", sizeof(needle));
 			fst_xc_log_watch_absent(needle);
 			xml = fst_xc_drive_fetch(&binding, "", xml_body, "application/json", 200);
@@ -3838,11 +3677,6 @@ FST_CORE_BEGIN("conf")
 			switch_xml_free(xml);
 			xml = NULL;
 
-			/*
-			 * 6. and the rendering is bounded, which is the other half of what a
-			 *    log-injection guard owes: a caller cannot grow a log line without
-			 *    limit by asking for a very long section.
-			 */
 			memset(oversized, 'A', 200);
 			switch_snprintf(oversized + 200, sizeof(oversized) - 200, "%s", "TAILMARKER");
 			fst_xc_log_watch_absent("TAILMARKER");
@@ -3854,12 +3688,7 @@ FST_CORE_BEGIN("conf")
 			switch_xml_free(xml);
 			xml = NULL;
 
-			/*
-			 * 7. the terminal diagnostic renders the same selector, and an empty
-			 *    body announced as JSON is what reaches it: the decode is abandoned
-			 *    (one warning), the XML parse then fails (one error), and the fetch
-			 *    resolves to nothing.
-			 */
+			/* an empty body announced as JSON is what reaches the terminal diagnostic */
 			fst_xc_log_watch_absent("\r\n");
 			xml = fst_xc_drive_fetch(&binding, hostile_section, "", "application/json", 200);
 			fst_xcheck(fst_xc_fetch_barrier_ok, "the log queue must drain before the warning counters are read");
@@ -3871,7 +3700,6 @@ FST_CORE_BEGIN("conf")
 			xml = NULL;
 			fst_xc_unlink_preprocessed();
 
-			/* 8. and it names the selector in its neutralised form, in its own field */
 			switch_snprintf(needle, sizeof(needle), "section [%s] tag_name", neutralised);
 			fst_xc_log_watch_absent(needle);
 			xml = fst_xc_drive_fetch(&binding, hostile_section, "", "application/json", 200);
@@ -4067,35 +3895,26 @@ FST_CORE_BEGIN("conf")
 		FST_TEST_END()
 
 		/*
-		 * Declared last, and deliberately last: every preceding case's teardown has
-		 * run by the time this body executes, so this is where their cumulative
-		 * result becomes an assertion.
+		 * Declared last: every preceding case's teardown has run by the time this body
+		 * executes, so this is where their cumulative result becomes an assertion.
 		 *
-		 * The teardown block runs outside any test's assertion scope, which is why a
-		 * failure there is latched rather than reported in place.  Without this case
-		 * the latch would be read only by the setup of a following case, and the last
-		 * case in the suite would have no follower - so an undeleted file or a logger
-		 * that would not unbind at the very end of the run would still pass silently,
-		 * which is the exact class of defect the checked teardown exists to expose.
-		 *
-		 * It touches no module state and allocates nothing, so it cannot disturb what
-		 * the case above deliberately left behind, and its own teardown removes only
-		 * the standard set the shared helper already handles.
+		 * A teardown block runs outside any test's assertion scope, which is why a failure
+		 * there is latched rather than reported in place.  Without this case the latch
+		 * would be read only by the setup of a following case, and the last case in the
+		 * suite has no follower - so an undeleted file or a logger that would not unbind at
+		 * the very end of the run would pass silently.  It touches no module state and
+		 * allocates nothing, so it cannot disturb what the case above left behind.
 		 */
 		FST_TEST_BEGIN(teardown_is_observable)
 		{
 			char preserved[1024] = "";
 
-			/* the cumulative result of every teardown that has already run */
 			fst_xcheck(fst_xc_teardown_failed == 0, "every case's teardown must have completed: an earlier one reported unfinished cleanup");
 			fst_check_int_equals(fst_xc_log_bound, 0);
 
 			/*
-			 * And the checked removal itself, exercised directly rather than only
-			 * through the teardown block that cannot assert on it: a clean removal
-			 * reports success, the directory is demonstrably gone afterwards, the
-			 * recorded name is cleared, a repeat is a harmless success, and none of
-			 * it latches a failure.
+			 * And the checked removal itself, exercised directly rather than only through
+			 * the teardown block that cannot assert on it.
 			 */
 			fst_xcheck(*fst_xc_temp_dir != '\0', "the setup block must have created this case's private directory");
 			switch_copy_string(preserved, fst_xc_temp_dir, sizeof(preserved));
