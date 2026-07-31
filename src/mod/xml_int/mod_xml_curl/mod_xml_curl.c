@@ -140,10 +140,31 @@ static size_t file_callback(void *ptr, size_t size, size_t nmemb, void *data)
 
 /*
  * JSON: the JSON-specific logic from here down to xml_url_fetch() lives in its own file-static
- * functions, separate from the XML fetch path below. None of it executes unless a binding opts
- * in with response-format=json. Every function reports failure through a falsy return so that
- * the single dispatch point in xml_url_fetch() can fall back to the switch_xml_parse_file()
- * call it shares with the XML path.
+ * functions, separate from the XML fetch path below. No response is DECODED as JSON unless a
+ * binding opts in with response-format=json, and a binding that does not opt in behaves exactly
+ * as it did before this feature existed. Every function reports failure through a falsy return
+ * so that the single dispatch point in xml_url_fetch() can fall back to the
+ * switch_xml_parse_file() call it shares with the XML path.
+ *
+ * Be precise about the boundary, because it is behavioural rather than textual: three small
+ * mechanics introduced with this feature sit on the shared fetch path and therefore run for
+ * every binding, opted in or not. Each is behaviour preserving by construction and each is
+ * commented where it appears:
+ *
+ *   - the header list the Accept entry has to land on is selected once, unconditionally
+ *     (request_headers in xml_url_fetch());
+ *   - CURLINFO_CONTENT_TYPE is read next to CURLINFO_RESPONSE_CODE for every fetch, because it
+ *     can only be read while the curl handle is alive; the value is simply unused when no JSON
+ *     was negotiated;
+ *   - the pre-existing switch_xml_parse_file() call, its SWITCH_LOG_ERROR report and its
+ *     NULL-return semantics are unaltered, but they are now reached through an `if (!xml)'
+ *     wrapper that is always true when no JSON was negotiated.
+ *
+ * The "Expect:" append that suppresses 100-continue is deliberately NOT on that list. It is
+ * routed through xml_curl_json_append_header() only for an opted-in binding, which is the one
+ * case where the list can already be carrying the Accept entry and so has something to lose on
+ * an allocation failure. A binding that never asked for JSON reaches the original statement,
+ * unaltered and silent, so the format-absent request path stays byte-for-byte what it was.
  *
  * The translation implements the BadgerFish convention: attributes are members prefixed with
  * '@', text content lives under '$', child elements are nested keys, repeated children of the
@@ -182,31 +203,92 @@ static size_t file_callback(void *ptr, size_t size, size_t nmemb, void *data)
  * CJSON_NESTING_LIMIT, but that is set by the autotools build only, so a build that does not
  * define it would otherwise inherit a far looser default. Bounding the input here keeps the
  * behaviour identical on every platform and every build.
+ *
+ * XML_CURL_JSON_MAX_CHILDREN_PER_PARENT bounds the COST of building the tree rather than its
+ * size, and it is the reason a merely wide response cannot become a denial of service.
+ * switch_xml_add_child_d() reaches switch_xml_insert(), which places a child by walking the
+ * parent's existing lists to their tail whenever the new offset is not smaller than the head's
+ * -- "for (cur = head; cur->ordered && cur->ordered->off <= off; cur = cur->ordered)" in
+ * src/switch_xml.c. This translator deliberately passes a constant offset of zero so that
+ * insertion order becomes document order, so every comparison is 0 <= 0 and every append walks
+ * every sibling already present: adding n children under one parent costs n*(n-1)/2 comparisons
+ * on the ordered chain, and again on the same-name chain. The node ceiling alone is therefore not
+ * a bound on work -- 20000 children under a single parent is of the order of 4*10^8 comparisons,
+ * performed synchronously on the provisioning fetch path. Capping the width of any one parent at
+ * w makes the whole-document total at most XML_CURL_JSON_MAX_NODES * w, i.e. linear in the node
+ * ceiling instead of quadratic. 256 is chosen because it is two orders of magnitude below the
+ * node ceiling yet still an order of magnitude above the widest parent in any shipped FreeSWITCH
+ * provisioning document, so it bounds abuse without constraining legitimate input.
+ *
+ * XML_CURL_JSON_MAX_ARRAY_ELEMENTS is deliberately no larger than that per-parent ceiling: an
+ * array is the one construct that can express repetition, so allowing a single array to be wider
+ * than a parent may be would only mean discovering the same refusal later and after more work.
+ * The two checks remain distinct because the array ceiling refuses before anything is built,
+ * while the per-parent ceiling is what catches width accumulated across several member names.
  */
 #define XML_CURL_JSON_MAX_DEPTH 32			/* nesting levels in the JSON document */
 #define XML_CURL_JSON_MAX_VALUES 50000		/* objects + arrays + strings in the document */
 #define XML_CURL_JSON_MAX_OBJECT_MEMBERS 256	/* members of one JSON object */
-#define XML_CURL_JSON_MAX_ARRAY_ELEMENTS 4096	/* repeated children under one name */
+#define XML_CURL_JSON_MAX_ARRAY_ELEMENTS 256	/* repeated children under one name */
+#define XML_CURL_JSON_MAX_CHILDREN_PER_PARENT 256	/* child elements built under one parent */
 #define XML_CURL_JSON_MAX_NODES 20000		/* elements + attributes built in total */
 #define XML_CURL_JSON_MAX_STRING_BYTES 8192	/* bytes in one name or one value */
 #define XML_CURL_JSON_MAX_NAME_BYTES 128	/* bytes in one element or attribute name */
 
 /*
+ * JSON: ceiling for the cumulative NAME bytes the translation writes into the tree. It is
+ * deliberately a ceiling of its own rather than the payload length, because a repeated child key
+ * is written once per array element: the canonical document {"directory":{"extension":[{},{},{}]}}
+ * legitimately transforms into more name bytes than it occupies as input, and charging that
+ * expansion against the input size would refuse the very shape the array mapping exists to
+ * express. The value is derived from the two ceilings that already bound the expansion - at most
+ * XML_CURL_JSON_MAX_NODES elements and attributes, each name at most
+ * XML_CURL_JSON_MAX_NAME_BYTES plus the one byte a BadgerFish '@' prefix adds - so it bounds the
+ * allocation the translation can perform without constraining any document shape those ceilings
+ * already permit.
+ */
+#define XML_CURL_JSON_MAX_TRANSFORMED_NAME_BYTES (XML_CURL_JSON_MAX_NODES * (XML_CURL_JSON_MAX_NAME_BYTES + 1))
+
+/*
  * JSON: the budget threaded through the recursive translation. Keeping the counters in one
  * caller-owned structure is what makes the ceilings above document-wide rather than per-node, so
- * a wide-and-shallow document cannot amplify past a deep-and-narrow one. max_text_bytes is
- * seeded from the length of the payload actually received, so the cumulative volume of decoded
- * names and values can never exceed the response size the binding already capped - escape
- * sequences only ever shrink, so anything larger is amplification and is refused.
+ * a wide-and-shallow document cannot amplify past a deep-and-narrow one.
+ *
+ * The two volume counters are deliberately separate, because they are bounded by different
+ * things. Every decoded value - an attribute value or an element's text - appears exactly once in
+ * the payload and escape sequences only ever shrink, so text_bytes is soundly bounded by the
+ * length of the payload the binding already size-capped. Names are not: an array collapses n
+ * repeated children onto one key, so the key is written n times into the tree from a single
+ * occurrence in the input. Charging both against the input length conflates input validation with
+ * output accounting and rejects valid compact documents, so name_bytes carries its own explicit
+ * expanded-output ceiling instead.
  */
 struct xml_curl_json_budget {
 	int depth;						/* nesting depth of the node being translated */
 	switch_size_t nodes;			/* elements and attributes built so far */
-	switch_size_t text_bytes;		/* cumulative decoded name and value bytes */
+	switch_size_t name_bytes;		/* cumulative element and attribute name bytes written */
+	switch_size_t text_bytes;		/* cumulative decoded attribute-value and text bytes */
 	switch_size_t max_text_bytes;	/* ceiling for text_bytes: the payload length */
 };
 
 typedef struct xml_curl_json_budget xml_curl_json_budget_t;
+
+/*
+ * JSON: charges `add` against `*counter` unless the charge would breach `limit`. The test is
+ * written against the remaining headroom rather than on the sum, so it is correct for every value
+ * of `add` and cannot itself overflow - which is the whole point of routing every charge through
+ * one place. Returns 1 when the charge was accepted, and leaves the counter untouched otherwise.
+ */
+static int xml_curl_json_budget_charge(switch_size_t *counter, switch_size_t add, switch_size_t limit)
+{
+	if (!counter || *counter > limit || add > limit - *counter) {
+		return 0;
+	}
+
+	*counter += add;
+
+	return 1;
+}
 
 /* JSON: length of the UTF-8 sequence starting at p, or 0 when the bytes are not a well-formed
    sequence. Strict by design: overlong encodings, surrogate code points and anything above
@@ -817,7 +899,15 @@ static int xml_curl_json_check_object(cJSON *object)
  *
  * The budget is shared across the whole document, so breadth is bounded as tightly as depth: a
  * flat response with a million repeated children is refused for the same reason a deeply nested
- * one is.
+ * one is. Its two volume counters are charged separately - names against the expanded-output
+ * ceiling, decoded values against the payload length - so bounding the tree this builds never
+ * costs a document shape the element and node ceilings already allow.
+ *
+ * Width is additionally bounded per parent by the local "children" counter, which is what keeps
+ * the cost of switch_xml_insert()'s tail walk linear in the node ceiling; the counter is a local
+ * rather than a budget member precisely because the limit it enforces is per parent, and each
+ * recursive call gets its own. It is charged after the shared counters above and immediately
+ * before the insertion whose cost it bounds, at both of the two append sites.
  */
 static int xml_curl_json_to_xml_node(switch_xml_t node, cJSON *object, xml_curl_json_budget_t *budget)
 {
@@ -825,6 +915,7 @@ static int xml_curl_json_to_xml_node(switch_xml_t node, cJSON *object, xml_curl_
 	cJSON *element = NULL;
 	switch_xml_t child = NULL;
 	int elements;
+	int children = 0;
 
 	if (!node || !object || !budget) {
 		return 0;
@@ -854,8 +945,12 @@ static int xml_curl_json_to_xml_node(switch_xml_t node, cJSON *object, xml_curl_
 			if (++budget->nodes > XML_CURL_JSON_MAX_NODES) {
 				return 0;
 			}
-			budget->text_bytes += strlen(member->string) + strlen(member->valuestring);
-			if (budget->text_bytes > budget->max_text_bytes) {
+			/* The name is charged against the expanded-output ceiling and the value against the
+			   payload length: the two are bounded by different things. */
+			if (!xml_curl_json_budget_charge(&budget->name_bytes, strlen(member->string), XML_CURL_JSON_MAX_TRANSFORMED_NAME_BYTES)) {
+				return 0;
+			}
+			if (!xml_curl_json_budget_charge(&budget->text_bytes, strlen(member->valuestring), budget->max_text_bytes)) {
 				return 0;
 			}
 			switch_xml_set_attr_d(node, member->string + 1, member->valuestring);
@@ -864,16 +959,16 @@ static int xml_curl_json_to_xml_node(switch_xml_t node, cJSON *object, xml_curl_
 			if (!cJSON_IsString(member) || !member->valuestring || !xml_curl_json_is_valid_text(member->valuestring)) {
 				return 0;
 			}
-			budget->text_bytes += strlen(member->valuestring);
-			if (budget->text_bytes > budget->max_text_bytes) {
+			if (!xml_curl_json_budget_charge(&budget->text_bytes, strlen(member->valuestring), budget->max_text_bytes)) {
 				return 0;
 			}
 			switch_xml_set_txt_d(node, member->valuestring);
 		} else if (cJSON_IsArray(member)) {
 			/* Repeated children of one name collapse into a JSON array. A constant offset of
 			   zero makes switch_xml_insert() append, so array order becomes document order.
-			   That append walks the existing same-name list, so the element ceiling bounds
-			   the quadratic term as well as the allocation. */
+			   That append walks the parent's existing ordered and same-name lists to their
+			   tail, so the per-parent width ceiling below - not the array ceiling, and not
+			   the node ceiling - is what bounds the quadratic term. */
 			if (!xml_curl_json_is_valid_xml_name(member->string)) {
 				return 0;
 			}
@@ -889,8 +984,14 @@ static int xml_curl_json_to_xml_node(switch_xml_t node, cJSON *object, xml_curl_
 				if (++budget->nodes > XML_CURL_JSON_MAX_NODES) {
 					return 0;
 				}
-				budget->text_bytes += strlen(member->string);
-				if (budget->text_bytes > budget->max_text_bytes) {
+				/* One charge per element: this is exactly the repeated-key expansion the
+				   expanded-output ceiling exists to bound and the payload length must not. */
+				if (!xml_curl_json_budget_charge(&budget->name_bytes, strlen(member->string), XML_CURL_JSON_MAX_TRANSFORMED_NAME_BYTES)) {
+					return 0;
+				}
+				/* Aggregate width of THIS parent, across every member name, checked before
+				   the insertion whose cost it bounds. */
+				if (++children > XML_CURL_JSON_MAX_CHILDREN_PER_PARENT) {
 					return 0;
 				}
 				if (!(child = switch_xml_add_child_d(node, member->string, 0))) {
@@ -908,8 +1009,12 @@ static int xml_curl_json_to_xml_node(switch_xml_t node, cJSON *object, xml_curl_
 			if (++budget->nodes > XML_CURL_JSON_MAX_NODES) {
 				return 0;
 			}
-			budget->text_bytes += strlen(member->string);
-			if (budget->text_bytes > budget->max_text_bytes) {
+			if (!xml_curl_json_budget_charge(&budget->name_bytes, strlen(member->string), XML_CURL_JSON_MAX_TRANSFORMED_NAME_BYTES)) {
+				return 0;
+			}
+			/* The same aggregate width ceiling: a parent reaches it just as readily through
+			   many distinct single children as through one long array. */
+			if (++children > XML_CURL_JSON_MAX_CHILDREN_PER_PARENT) {
 				return 0;
 			}
 			if (!(child = switch_xml_add_child_d(node, member->string, 0))) {
@@ -1045,6 +1150,14 @@ static switch_xml_t xml_curl_json_to_xml(const char *json_text, const char *requ
 	   matching the attribute order of the equivalent XML document. */
 	switch_xml_set_attr_d(section, "name", requested_section);
 
+	/*
+	 * JSON: the payload length bounds the DECODED VALUE volume only. Every attribute value and
+	 * every text run appears exactly once in the payload and escape sequences only ever shrink, so
+	 * a larger decoded total would be amplification. Element and attribute NAMES are accounted
+	 * separately against XML_CURL_JSON_MAX_TRANSFORMED_NAME_BYTES, because an array writes one
+	 * key once per element and a valid compact document therefore transforms into more name bytes
+	 * than it occupies as input.
+	 */
 	memset(&budget, 0, sizeof(budget));
 	budget.max_text_bytes = strlen(json_text);
 
@@ -1203,11 +1316,12 @@ static int xml_curl_json_append_header(switch_curl_slist_t **list, const char *h
    xml_url_fetch(). Validates the response Content-Type, reads the capped temporary file and
    runs the BadgerFish translation for the section that was requested. Every failure edge - and
    only a failure edge - emits one SWITCH_LOG_WARNING and returns NULL, so the caller falls
-   through to the unmodified XML parse; a fallback is a degradation worth surfacing rather than a
-   failure. The URL and the Content-Type are redacted and sanitized before they are logged,
-   because both are attacker-influenced or credential-bearing. cJSON_GetErrorPtr() is
-   deliberately not consulted: it is process global while this code runs concurrently on many
-   fetch threads, so it could report an unrelated thread's error. */
+   through to the XML parse, which decodes and reports exactly as it always has; a fallback is a
+   degradation worth surfacing rather than a failure. The URL and the Content-Type are redacted
+   and sanitized before they are logged, because both are attacker-influenced or
+   credential-bearing. cJSON_GetErrorPtr() is deliberately not consulted: it is process global
+   while this code runs concurrently on many fetch threads, so it could report an unrelated
+   thread's error. */
 static switch_xml_t xml_curl_json_decode_response(const char *filename, const char *content_type, switch_size_t max_bytes, const char *url,
 												  const char *section)
 {
@@ -1268,6 +1382,10 @@ static switch_xml_t xml_url_fetch(const char *section, const char *tag_name, con
 	char content_type[256] = "";	/* JSON: copy of the response Content-Type, taken while the curl handle is alive */
 	char *curl_content_type = NULL;	/* JSON: libcurl-owned; never freed here */
 	char safe_url[256] = "";		/* JSON: redacted rendering of the gateway URL, for logging only */
+	char safe_section[64] = "";		/* JSON: sanitized rendering of the requested section, for logging only */
+	char safe_tag[64] = "";			/* JSON: sanitized rendering of the requested tag name, for logging only */
+	char safe_key[64] = "";			/* JSON: sanitized rendering of the requested key name, for logging only */
+	char safe_type[96] = "";		/* JSON: sanitized rendering of the response Content-Type, for logging only */
 	int json_response = 0;			/* JSON: 1 once this fetch has actually negotiated JSON */
 	switch_curl_slist_t **request_headers = NULL;	/* JSON: the list curl is finally handed */
 
@@ -1284,8 +1402,11 @@ static switch_xml_t xml_url_fetch(const char *section, const char *tag_name, con
 
 	/* JSON: the Accept header has to land on the list curl is finally handed, and that is not
 	   always the list the other request headers are built on: when disable100continue is set,
-	   the Expect: branch below hands curl its own list instead. Selecting the target here keeps
-	   the format decision single and leaves that branch exactly as it is. */
+	   the Expect: branch below hands curl its own list instead. Selecting the target once, here,
+	   keeps the format decision single and keeps that branch's behaviour as it was - it still
+	   appends only Expect: and still hands curl the same list. This selection is unconditional
+	   and therefore also runs for a binding that never asked for JSON, where it merely records
+	   which list an Accept entry would have gone to and is otherwise inert. */
 	request_headers = binding->disable100continue ? &slist : &headers;
 
 	if ((file_url = strstr(binding->url, "file:"))) {
@@ -1343,14 +1464,17 @@ static switch_xml_t xml_url_fetch(const char *section, const char *tag_name, con
 		headers = switch_curl_slist_append(headers, "Content-Type: application/x-www-form-urlencoded");
 
 		/* JSON: when the binding opted in, advertise that a BadgerFish JSON response is
-		   acceptable. This is the only place the request path acts on the format decision. It is
-		   additive - the request Content-Type above, the form body and the rest of the XML
-		   request path are untouched, and switch_curl_slist_free_all() below releases whichever
-		   list carries this entry. If the header cannot be added the request is still made, but
-		   it is made as an XML request, so the response is handled as one. */
+		   acceptable. This is the only place the request path acts on the format decision, and
+		   it is purely additive: it appends one entry and changes nothing else, so the request
+		   Content-Type above, the form body, the user agent, the redirect limit and every other
+		   request option keep the values they have always had. switch_curl_slist_free_all()
+		   below releases whichever list carries this entry. If the header cannot be added, the
+		   request is still made - without any format negotiation - and the format decision is
+		   lowered so that the response is decoded the way an unopted binding's response is. */
 		if (json_response && !xml_curl_json_append_header(request_headers, "Accept: application/json")) {
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-							  "Could not add the Accept: application/json request header for [%s]; requesting XML instead\n",
+							  "Could not add the Accept: application/json request header for [%s]; continuing without JSON "
+							  "negotiation, so the response will be decoded as XML\n",
 							  xml_curl_json_redact_url(binding->url, safe_url, sizeof(safe_url)));
 			json_response = 0;
 		}
@@ -1383,18 +1507,28 @@ static switch_xml_t xml_url_fetch(const char *section, const char *tag_name, con
 		}
 
 		if (binding->disable100continue) {
-			/* JSON: this append goes through the same non-destructive helper the Accept entry
-			   above uses. It has to, because when this binding suppresses the 100-continue the
-			   Accept entry was appended to THIS list: assigning the append result straight back
-			   would, on an allocation failure, replace a list already carrying Accept with NULL,
-			   leak it, and then hand curl an empty header set while the fetch still believed it
-			   had negotiated JSON. Keeping the list means the worst case is that the suppression
-			   is not applied - the request is still made, and it is still made as the JSON
-			   request it announced. */
-			if (!xml_curl_json_append_header(&slist, "Expect:")) {
-				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
-								  "Could not add the Expect: request header for [%s]; 100-continue suppression is not applied\n",
-								  xml_curl_json_redact_url(binding->url, safe_url, sizeof(safe_url)));
+			if (json_response) {
+				/* JSON: only the opted-in path routes this append through the non-destructive
+				   helper, and only because this path has something to lose. When the binding
+				   suppresses the 100-continue the Accept entry was appended to THIS list:
+				   assigning the append result straight back would, on an allocation failure,
+				   replace a list already carrying Accept with NULL, leak it, and then hand curl
+				   an empty header set while the fetch still believed it had negotiated JSON.
+				   Keeping the list means the worst case is that the suppression is not applied -
+				   the request is still made, and it is still made as the JSON request it
+				   announced. */
+				if (!xml_curl_json_append_header(&slist, "Expect:")) {
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+									  "Could not add the Expect: request header for [%s]; 100-continue suppression is not applied\n",
+									  xml_curl_json_redact_url(binding->url, safe_url, sizeof(safe_url)));
+				}
+			} else {
+				/* An XML-only binding reaches the pre-existing statement unchanged and stays
+				   silent, because nothing has been appended to this list that an allocation
+				   failure could discard. Diverting it through the checked helper would add a
+				   warning to a path that has never had one, and the format-absent request path
+				   is contractually byte-for-byte what it has always been. */
+				slist = switch_curl_slist_append(slist, "Expect:");
 			}
 			switch_curl_easy_setopt(curl_handle, CURLOPT_HTTPHEADER, slist);
 		}
@@ -1449,7 +1583,9 @@ static switch_xml_t xml_url_fetch(const char *section, const char *tag_name, con
 		/* JSON: the response Content-Type has to be read here, adjacent to the response code
 		   and before switch_curl_easy_cleanup() below, because libcurl owns that string and
 		   frees it together with the handle. Reading it at the decode site would be a
-		   use-after-free. libcurl returns NULL when the response carried no Content-Type. */
+		   use-after-free. libcurl returns NULL when the response carried no Content-Type.
+		   The probe is unconditional, so it also runs for a binding that never asked for JSON;
+		   there it only fills a local buffer that nothing goes on to consult. */
 		switch_curl_easy_getinfo(curl_handle, CURLINFO_CONTENT_TYPE, &curl_content_type);
 		if (curl_content_type) {
 			switch_copy_string(content_type, curl_content_type, sizeof(content_type));
@@ -1471,18 +1607,50 @@ static switch_xml_t xml_url_fetch(const char *section, const char *tag_name, con
 			   attempt the BadgerFish decode first. The helper emits one WARNING on every failure
 			   edge and returns NULL, so a non-JSON Content-Type, a body that could not be read
 			   in full, unparseable JSON, a document naming a section other than the one that was
-			   requested, and a document outside the canonical contract all converge on the
-			   original XML parse below. */
+			   requested, and a document outside the canonical contract all converge on the XML
+			   parse below. */
 			if (json_response) {
 				xml = xml_curl_json_decode_response(filename, content_type, binding->curl_max_bytes, binding->url, section);
 			}
 
 			/* JSON: parse the response as XML whenever the JSON decode did not produce a
-			   document. This is the shared fallback: it reports a genuine parse failure and
-			   returns NULL exactly as it does for a binding that never asked for JSON. */
+			   document. The parse call, its error report and its NULL-return semantics are the
+			   pre-existing ones; only their enclosing `if (!xml)' is new, and it is always taken
+			   for a binding that never asked for JSON, because nothing before it can have set
+			   xml. So both the JSON failure edges and the legacy path arrive at one place where a
+			   decode failure is finally reported. */
 			if (!xml) {
 				if (!(xml = switch_xml_parse_file(filename))) {
-					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Error Parsing Result! [%s]\ndata: [%s]\n", binding->url, data);
+					if (json_response) {
+						/*
+						 * JSON: the opted-in path reports the same failure without persisting a
+						 * credential. This branch is reachable in a way it was not before - a
+						 * body that is valid JSON but not valid XML now arrives here after the
+						 * decode was abandoned - and both operands of the pre-existing line are
+						 * secret-bearing: a gateway-url legitimately carries userinfo and query
+						 * tokens, and `data' is the POST form body, which ends with the
+						 * key_value of the lookup and carries every event variable the binding
+						 * mapped into it. Neither is diagnostically necessary: what identifies
+						 * the failure is which gateway answered, which lookup it was answering
+						 * and what it actually sent back. So the URL is redacted to its
+						 * authority, the lookup is summarised by its coordinates only - never
+						 * key_value - and the response is described by its Content-Type and
+						 * size rather than its content. Every rendering is sanitized and
+						 * bounded, so a remote Content-Type cannot forge a second log line.
+						 * Level, channel, message prefix and the NULL return are unchanged, and
+						 * a binding without response-format takes the untouched branch below.
+						 */
+						switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+										  "Error Parsing Result! [%s]\nrequest: section [%s] tag_name [%s] key_name [%s]; response: content-type [%s], %ld bytes\n",
+										  xml_curl_json_redact_url(binding->url, safe_url, sizeof(safe_url)),
+										  xml_curl_json_sanitize_token(section, safe_section, sizeof(safe_section)),
+										  xml_curl_json_sanitize_token(tag_name, safe_tag, sizeof(safe_tag)),
+										  xml_curl_json_sanitize_token(key_name, safe_key, sizeof(safe_key)),
+										  xml_curl_json_sanitize_token(content_type, safe_type, sizeof(safe_type)),
+										  (long) config_data.bytes);
+					} else {
+						switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Error Parsing Result! [%s]\ndata: [%s]\n", binding->url, data);
+					}
 				}
 			}
 		} else {
