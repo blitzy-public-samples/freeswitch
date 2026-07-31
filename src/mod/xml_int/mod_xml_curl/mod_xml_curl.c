@@ -1317,11 +1317,15 @@ static int xml_curl_json_append_header(switch_curl_slist_t **list, const char *h
    runs the BadgerFish translation for the section that was requested. Every failure edge - and
    only a failure edge - emits one SWITCH_LOG_WARNING and returns NULL, so the caller falls
    through to the XML parse, which decodes and reports exactly as it always has; a fallback is a
-   degradation worth surfacing rather than a failure. The URL and the Content-Type are redacted
-   and sanitized before they are logged, because both are attacker-influenced or
-   credential-bearing. cJSON_GetErrorPtr() is deliberately not consulted: it is process global
-   while this code runs concurrently on many fetch threads, so it could report an unrelated
-   thread's error. */
+   degradation worth surfacing rather than a failure. Every operand of that warning is rendered
+   through a bounding helper first, because not one of them is trustworthy: the URL is
+   credential-bearing, the Content-Type is chosen by the remote gateway, and the section is
+   chosen by whoever asked for the lookup - the xml_locate API passes its argument straight into
+   switch_xml_locate(), so an unprivileged caller reaches this line with a section of its own
+   composition. Logging any of them verbatim would let a newline forge a second log entry or a
+   control sequence reach an operator's terminal. cJSON_GetErrorPtr() is deliberately not
+   consulted: it is process global while this code runs concurrently on many fetch threads, so it
+   could report an unrelated thread's error. */
 static switch_xml_t xml_curl_json_decode_response(const char *filename, const char *content_type, switch_size_t max_bytes, const char *url,
 												  const char *section)
 {
@@ -1329,6 +1333,7 @@ static switch_xml_t xml_curl_json_decode_response(const char *filename, const ch
 	char *json_text = NULL;
 	char safe_url[256] = "";
 	char safe_content_type[96] = "";
+	char safe_section[64] = "";
 	const char *reason = "unknown translation error";
 
 	if (zstr(filename)) {
@@ -1348,7 +1353,8 @@ static switch_xml_t xml_curl_json_decode_response(const char *filename, const ch
 	if (!xml) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
 						  "JSON decode of the [%s] response from [%s] failed (%s) [Content-Type: %s]; falling back to XML parsing\n",
-						  switch_str_nil(section), xml_curl_json_redact_url(url, safe_url, sizeof(safe_url)), reason,
+						  xml_curl_json_sanitize_token(section, safe_section, sizeof(safe_section)),
+						  xml_curl_json_redact_url(url, safe_url, sizeof(safe_url)), reason,
 						  xml_curl_json_sanitize_token(content_type, safe_content_type, sizeof(safe_content_type)));
 	}
 

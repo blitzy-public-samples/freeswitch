@@ -3723,6 +3723,171 @@ FST_CORE_BEGIN("conf")
 		FST_TEST_END()
 
 		/*
+		 * The log-injection regression for the one operand of these lines that is
+		 * chosen by the CALLER rather than by the operator or the remote gateway.
+		 *
+		 * A section selector is not an internal constant.  mod_commands registers
+		 * an `xml_locate' API command whose argument is passed straight into
+		 * switch_xml_locate(), and switch_xml_locate() is what dispatches to this
+		 * module's binding - so the bytes that reach these lines are picked by
+		 * whoever issued the lookup, over the console or over an event socket.  A
+		 * selector carrying CR LF forges a second, wholly fabricated log entry,
+		 * and one carrying an escape sequence reaches the terminal of whoever
+		 * tails the log.  Neither is hypothetical once the operand is written out
+		 * verbatim, and neither is prevented by the URL and Content-Type
+		 * renderings, which are the other two operands of the same warning.
+		 *
+		 * Both lines that render a section are covered, for the same reason the
+		 * URL case covers both: the fallback warning, reached with a body the XML
+		 * parse can still read, and the terminal diagnostic, reached with a body
+		 * neither decoder can read.  The expected rendering is written out by hand
+		 * rather than computed from the helper, so each assertion is an
+		 * independent statement of what the sanitizer must produce rather than a
+		 * restatement of what it happens to produce.
+		 */
+		FST_TEST_BEGIN(log_hygiene_section_selector_is_neutralised)
+		{
+			/* announced as XML against a JSON binding, so the decode is abandoned
+			   and the one fallback warning is emitted while the fetch still
+			   resolves */
+			static const char xml_body[] = "<document type=\"freeswitch/xml\"><section name=\"directory\">"
+				"<user id=\"2000\"></user></section></document>";
+			/* a selector a caller can ask for: a bracket that closes the field
+			   early, CR LF to begin a line of its own, a CSI clear-screen aimed at
+			   the operator's terminal, a lone control byte, and a forged severity
+			   to sit in the fabricated entry */
+			static const char hostile_section[] = "directory]\r\n\033[2J\001[CRITICAL] forged";
+			/* the same bytes with every one outside printable ASCII replaced by
+			   '.', computed by hand: CR, LF and ESC are three consecutive
+			   replacements - the escape sequence loses only its introducer, so the
+			   "[2J" that followed it stays visible as the inert text it now is -
+			   then SOH is the fourth, and nothing else may be altered */
+			static const char neutralised[] = "directory]...[2J.[CRITICAL] forged";
+			char oversized[256] = "";
+			char rendered[64] = "";
+			char needle[256] = "";
+			xml_binding_t binding;
+			switch_xml_t xml = NULL;
+
+			fst_requires(fst_xc_log_capture_start());
+
+			memset(&binding, 0, sizeof(binding));
+			binding.url = (char *) "https://127.0.0.1:1/provision";
+			binding.curl_max_bytes = XML_CURL_MAX_BYTES;
+			binding.response_format = (char *) "json";
+
+			/* the rendering on its own, against an independently written
+			   expectation.  The buffer is the size the production line uses, so
+			   this also states that a selector of this length survives whole. */
+			fst_check_string_equals(xml_curl_json_sanitize_token(hostile_section, rendered, sizeof(rendered)), neutralised);
+
+			/* 1. no log line may carry the CR LF that would forge a second entry */
+			fst_xc_log_watch_absent("\r\n");
+			xml = fst_xc_drive_fetch(&binding, hostile_section, xml_body, "text/xml", 200);
+			fst_xcheck(fst_xc_fetch_barrier_ok, "the log queue must drain before the warning counters are read");
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_FALLBACK), 1);
+			fst_xcheck(fst_xc_log_count(FST_XC_LOG_IDX_ABSENT) == 0, "no log line may carry a newline taken from the requested section");
+			switch_xml_free(xml);
+			xml = NULL;
+
+			/* 2. nor the escape sequence aimed at the operator's terminal */
+			fst_xc_log_watch_absent("\033[2J");
+			xml = fst_xc_drive_fetch(&binding, hostile_section, xml_body, "text/xml", 200);
+			fst_xcheck(fst_xc_fetch_barrier_ok, "the log queue must drain before the warning counters are read");
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_FALLBACK), 1);
+			fst_xcheck(fst_xc_log_count(FST_XC_LOG_IDX_ABSENT) == 0, "no log line may carry a terminal control sequence from the requested section");
+			switch_xml_free(xml);
+			xml = NULL;
+
+			/* 3. nor any other control byte, escape sequences aside */
+			fst_xc_log_watch_absent("\001");
+			xml = fst_xc_drive_fetch(&binding, hostile_section, xml_body, "text/xml", 200);
+			fst_xcheck(fst_xc_fetch_barrier_ok, "the log queue must drain before the warning counters are read");
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_FALLBACK), 1);
+			fst_xcheck(fst_xc_log_count(FST_XC_LOG_IDX_ABSENT) == 0, "no log line may carry a control byte from the requested section");
+			switch_xml_free(xml);
+			xml = NULL;
+
+			/*
+			 * 4. and the warning is still worth writing: "logs nothing" would
+			 *    satisfy all three checks above on its own, so what must survive is
+			 *    asserted too - the selector that was asked for, in the form the
+			 *    sanitizer produces, in the field it belongs to.
+			 */
+			switch_snprintf(needle, sizeof(needle), "JSON decode of the [%s] response", neutralised);
+			fst_xc_log_watch_absent(needle);
+			xml = fst_xc_drive_fetch(&binding, hostile_section, xml_body, "text/xml", 200);
+			fst_xcheck(fst_xc_fetch_barrier_ok, "the log queue must drain before the warning counters are read");
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_FALLBACK), 1);
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_ABSENT), 1);
+			switch_xml_free(xml);
+			xml = NULL;
+
+			/*
+			 * 5. a lookup that arrives without a selector renders as a stable
+			 *    marker rather than as an empty field, so the warning still reads
+			 *    as a sentence and an absent selector cannot be mistaken for one
+			 *    that was present and blank.
+			 */
+			switch_copy_string(needle, "JSON decode of the [(absent)] response", sizeof(needle));
+			fst_xc_log_watch_absent(needle);
+			xml = fst_xc_drive_fetch(&binding, "", xml_body, "application/json", 200);
+			fst_xcheck(fst_xc_fetch_barrier_ok, "the log queue must drain before the warning counters are read");
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_FALLBACK), 1);
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_ABSENT), 1);
+			switch_xml_free(xml);
+			xml = NULL;
+
+			/*
+			 * 6. and the rendering is bounded, which is the other half of what a
+			 *    log-injection guard owes: a caller cannot grow a log line without
+			 *    limit by asking for a very long section.
+			 */
+			memset(oversized, 'A', 200);
+			switch_snprintf(oversized + 200, sizeof(oversized) - 200, "%s", "TAILMARKER");
+			fst_xc_log_watch_absent("TAILMARKER");
+			xml = fst_xc_drive_fetch(&binding, oversized, xml_body, "text/xml", 200);
+			fst_xcheck(fst_xc_fetch_barrier_ok, "the log queue must drain before the warning counters are read");
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_FALLBACK), 1);
+			fst_xcheck(fst_xc_log_count(FST_XC_LOG_IDX_ABSENT) == 0,
+					   "a selector longer than the rendering buffer must be truncated rather than logged whole");
+			switch_xml_free(xml);
+			xml = NULL;
+
+			/*
+			 * 7. the terminal diagnostic renders the same selector, and an empty
+			 *    body announced as JSON is what reaches it: the decode is abandoned
+			 *    (one warning), the XML parse then fails (one error), and the fetch
+			 *    resolves to nothing.
+			 */
+			fst_xc_log_watch_absent("\r\n");
+			xml = fst_xc_drive_fetch(&binding, hostile_section, "", "application/json", 200);
+			fst_xcheck(fst_xc_fetch_barrier_ok, "the log queue must drain before the warning counters are read");
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_FALLBACK), 1);
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_PARSE_ERROR), 1);
+			fst_xcheck(xml == NULL, "a body neither decoder can read must resolve to nothing");
+			fst_xcheck(fst_xc_log_count(FST_XC_LOG_IDX_ABSENT) == 0, "the terminal parse error must not carry a newline from the requested section");
+			switch_xml_free(xml);
+			xml = NULL;
+			fst_xc_unlink_preprocessed();
+
+			/* 8. and it names the selector in its neutralised form, in its own field */
+			switch_snprintf(needle, sizeof(needle), "section [%s] tag_name", neutralised);
+			fst_xc_log_watch_absent(needle);
+			xml = fst_xc_drive_fetch(&binding, hostile_section, "", "application/json", 200);
+			fst_xcheck(fst_xc_fetch_barrier_ok, "the log queue must drain before the warning counters are read");
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_PARSE_ERROR), 1);
+			fst_check_int_equals(fst_xc_log_count(FST_XC_LOG_IDX_ABSENT), 1);
+			switch_xml_free(xml);
+			xml = NULL;
+			fst_xc_unlink_preprocessed();
+
+			fst_xc_log_watch_absent(NULL);
+			fst_xcheck(fst_xc_log_capture_stop(), "the counting logger must unbind and release cleanly");
+		}
+		FST_TEST_END()
+
+		/*
 		 * Declared last: this is the only case that mutates module-wide state, so
 		 * nothing that runs after it can be affected by what it leaves behind.
 		 */

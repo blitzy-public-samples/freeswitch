@@ -100,6 +100,97 @@ h323_toolkit_available()
 	return "$status"
 }
 
+# Function to report how many ACTIVE - that is, uncommented - lines the generated
+# modules.conf carries for one module path
+#
+# The expression is anchored on the whole line, so a module path can only ever
+# match its own entry and never a longer one that merely contains it -
+# `xml_int/mod_xml_curl' cannot be answered by `xml_int/mod_xml_curl_extra', and
+# `endpoints/mod_opal' cannot be answered by a neighbouring endpoint.  A count is
+# printed rather than a yes/no verdict because the only acceptable answer for a
+# module that has to be built is exactly one: zero means the entry was never
+# activated, and more than one means the generated file carries a duplicate whose
+# effective state this script cannot reason about.
+#
+# The count is always a number on success, so a caller can compare it directly.
+# An absent modules.conf is not reported as a count of zero, because "the file
+# does not exist" and "the module is not listed" are different facts and only the
+# second one is safe to act on: it is diagnosed and reported as a failure so that
+# a caller asserting a module is disabled cannot be satisfied by a missing file.
+modules_conf_active_count()
+{
+	local module="$1"
+	local count
+
+	if [ ! -f modules.conf ]; then
+		echo "Error: modules.conf is missing, cannot determine whether '$module' is enabled" >&2
+		return 1
+	fi
+
+	# grep -c prints 0 and exits 1 when nothing matched, which is a valid answer
+	# here rather than an error, so the status is discarded and the value kept.
+	count=$(grep -c -E "^[[:space:]]*${module}[[:space:]]*$" modules.conf)
+
+	echo "${count:-0}"
+
+	return 0
+}
+
+# Function to activate one module in the generated modules.conf and prove it worked
+#
+# The proof is the point.  sed cannot report an address that never matched - it
+# exits 0 whether it changed a line or not - so an entry that was renamed,
+# removed or duplicated upstream would be skipped in silence.  That silence is
+# expensive here: src/mod/Makefile.am wraps each module's ENTIRE recipe in a test
+# on whether the module appears in CONF_MODULES, which configure.ac derives by
+# stripping comments from modules.conf, so a module that failed to activate
+# contributes nothing to `print_tests' and nothing to `check' - no warning, no
+# error, and a green build that silently ran none of that module's tests.  The
+# edit is therefore followed by a postcondition that counts what the edit was
+# supposed to produce, and the caller aborts the run when it does not hold.
+#
+# The substitution is anchored on the whole line and replaces it outright, so it
+# cannot disturb a neighbouring entry, and it is idempotent - an already-active
+# line does not match the address and is left exactly as it is.
+enable_module_for_tests()
+{
+	local module="$1"
+	local active
+
+	sed -i -e "s%^[[:space:]]*#[[:space:]]*${module}[[:space:]]*$%${module}%" modules.conf || return 1
+
+	active=$(modules_conf_active_count "$module") || return 1
+
+	if [ "$active" != "1" ]; then
+		echo "Error: expected exactly 1 active '$module' line in modules.conf, found ${active:-0}" >&2
+		return 1
+	fi
+
+	return 0
+}
+
+# Function to prove that a module whose capability probe failed will NOT be built
+#
+# The absent-toolkit outcome needs verifying just as positively as the present
+# one.  An endpoint module that is somehow active while its toolkit is missing
+# does not degrade, it fails the build - which is the single thing the capability
+# guards exist to prevent - so the guard's negative branch asserts the entry is
+# still commented out instead of assuming it.
+require_module_disabled_for_tests()
+{
+	local module="$1"
+	local active
+
+	active=$(modules_conf_active_count "$module") || return 1
+
+	if [ "$active" != "0" ]; then
+		echo "Error: '$module' is active in modules.conf but its toolkit capability probe failed; leave the entry commented out" >&2
+		return 1
+	fi
+
+	return 0
+}
+
 # Function to handle freeswitch configuration
 configure_freeswitch()
 {
@@ -114,8 +205,14 @@ configure_freeswitch()
 				-e '/applications\/mod_http_cache/s/^#//g' \
 				-e '/formats\/mod_opusfile/s/^#//g' \
 				-e '/languages\/mod_lua/s/^#//g' \
-				-e '/xml_int\/mod_xml_curl/s/^#//g' \
 				modules.conf
+
+			# mod_xml_curl owns one of the module-local test suites this arm exists to
+			# collect and depends on no optional toolkit, so it is enabled
+			# unconditionally - and the activation is verified rather than assumed,
+			# because a silently skipped uncomment would drop its whole suite from
+			# `check' without failing anything
+			enable_module_for_tests 'xml_int/mod_xml_curl' || exit 1
 
 			# Enable optional endpoint modules only when their toolkit can actually
 			# build them, so an absent, incomplete or too-old H.323/OPAL toolkit
@@ -123,9 +220,25 @@ configure_freeswitch()
 			# the version its own header demands - mod_opal.h #errors below 3.12.8 -
 			# and H.323 on the complete PTLib plus OpenH323/H323Plus provider set,
 			# because a bare ptlib.pc is installed by OPAL too and cannot by itself
-			# build mod_h323
-			pkg-config --atleast-version=3.12.8 opal && sed -i -e '/endpoints\/mod_opal/s/^#//g' modules.conf
-			h323_toolkit_available && sed -i -e '/endpoints\/mod_h323/s/^#//g' modules.conf
+			# build mod_h323.
+			#
+			# Both outcomes of each probe are asserted, which is why these are
+			# if/else blocks rather than `probe && sed' compounds: a compound leaves
+			# the enabling edit unchecked, and leaves the absent-toolkit branch with
+			# no postcondition at all.  Here a passing probe must end with the module
+			# active, and a failing probe must end with it still commented out, and
+			# anything else aborts this arm before ./configure runs.
+			if pkg-config --atleast-version=3.12.8 opal; then
+				enable_module_for_tests 'endpoints/mod_opal' || exit 1
+			else
+				require_module_disabled_for_tests 'endpoints/mod_opal' || exit 1
+			fi
+
+			if h323_toolkit_available; then
+				enable_module_for_tests 'endpoints/mod_h323' || exit 1
+			else
+				require_module_disabled_for_tests 'endpoints/mod_h323' || exit 1
+			fi
 
 			export ASAN_OPTIONS=log_path=stdout:disable_coredump=0:unmap_shadow_on_exit=1:fast_unwind_on_malloc=0
 

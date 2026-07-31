@@ -158,8 +158,7 @@
  * on case 8 reaching its own assertions.
  *
  * Socket footprint, stated so that nobody has to rediscover it.  Every socket
- * this suite is responsible for is bound to loopback, and the guard below is not
- * opened at all in one of the two containment states:
+ * this suite is responsible for is bound to loopback:
  *
  *   127.0.0.1:21720 TCP - the H.323 call-signalling listener the injected
  *             configuration declares, held only for as long as the FSManager
@@ -185,17 +184,28 @@
  *             which a manager can exist - not that a single socket persists for
  *             the whole run.
  *
- *             And there are TWO states that count as contained, either of which
- *             test_opal_iax2_containment_in_effect() accepts: this suite holds
- *             the port on loopback, or something outside this suite already
- *             holds it.  The second state is established ONLY by an EADDRINUSE
- *             refusal of the guard's own bind, which is itself the proof that
- *             the port is taken, and in that state the suite owns no guard
- *             socket at all.  Any other bind failure leaves the port free, is
- *             logged as an error and does not count, so the manager-constructing
- *             cases refuse to run rather than proceed on a maybe.  The verdict
- *             is recomputed on every acquire and discarded on every release, so
- *             it is never a remembered claim about the past.
+ *             EXACTLY ONE STATE COUNTS AS CONTAINED: the process about to
+ *             construct a manager holds this port itself.  A port that some
+ *             other holder already owns does NOT count, even though the guard's
+ *             own bind is refused with EADDRINUSE and even though a wildcard
+ *             bind would be refused too for as long as that holder lasts - and
+ *             "for as long as that holder lasts" is the entire problem.  The
+ *             holder is another process and may close its socket at any instant,
+ *             including between the check and the construction a few statements
+ *             later, after which OPAL's wildcard listen succeeds and starts the
+ *             very two threads the guard exists to prevent while the case
+ *             carries on believing it could not.  So every bind refusal, that
+ *             one included, is a hard containment failure: it is logged with the
+ *             reason and the manager-constructing cases refuse to run rather
+ *             than proceed on an exclusion they do not own.
+ *
+ *             Ownership moves in exactly one place, and it moves rather than
+ *             being shared: the isolated helper of case 1 is the process that
+ *             constructs the manager there, so the parent releases the port
+ *             before spawning it, the helper takes it as its own fatal
+ *             precondition, and the parent takes it back - and asserts that it
+ *             did - once the helper has been reaped.  No manager exists anywhere
+ *             during that window.
  *
  *             What the containment changes is one thing, and it is observable:
  *             the IAX2 endpoint stays UNINITIALISED.  InitialisedOK() is false
@@ -1197,27 +1207,6 @@ static switch_memory_pool_t *test_opal_guard_pool = NULL;
 static switch_socket_t *test_opal_iax2_guard = NULL;
 
 /*
- * Set ONLY when the guard's bind was refused BECAUSE THE ADDRESS IS ALREADY IN
- * USE, which is the one failure that means some other holder owns the port.
- * That produces the same containment this suite would have produced itself - a
- * wildcard bind will be refused too - so it is an acceptable substitute for
- * holding the guard.
- *
- * NO OTHER FAILURE QUALIFIES, and the distinction is the whole point.  A bind
- * that failed because the process ran out of descriptors, or lacked permission,
- * or was handed an address that does not exist locally, leaves the port FREE:
- * treating that as containment would let a manager construct and open UDP 4569
- * on the wildcard address while the suite asserted that it could not.  Every
- * such failure is therefore a hard containment failure, which the fatal
- * precondition in each manager-constructing case turns into an aborted case.
- *
- * The verdict is recomputed from scratch on every acquire and discarded on every
- * release, so it always describes the port as it is now rather than as it once
- * was.
- */
-static int test_opal_iax2_port_has_foreign_owner = 0;
-
-/*
  * True for a bind status that means "already in use".
  *
  * switch_socket_bind() is a thin wrapper over fspr_socket_bind()
@@ -1229,6 +1218,11 @@ static int test_opal_iax2_port_has_foreign_owner = 0;
  * is made against the platform's EADDRINUSE directly.  <errno.h> arrives through
  * switch.h, and the value compared is the one the kernel gave the failing bind.
  * The cast is needed only because switch_status_t is an enum.
+ *
+ * Used for DIAGNOSIS ONLY.  A port some other holder already owns is NOT a
+ * substitute for holding the guard - see test_opal_iax2_containment_in_effect() -
+ * so this predicate decides which of two error messages explains a refusal, never
+ * whether the refusal is tolerable.
  */
 static int test_opal_status_is_addr_in_use(switch_status_t status)
 {
@@ -1249,12 +1243,6 @@ static switch_status_t test_opal_iax2_guard_acquire(void)
 	if (test_opal_iax2_guard) {
 		return SWITCH_STATUS_SUCCESS;
 	}
-
-	/* No guard is held, so nothing is yet known about the port on this attempt:
-	 * discard any earlier verdict so that what follows is the only thing that can
-	 * establish one.  This is what stops a single historical refusal from being
-	 * remembered as containment for the rest of the run. */
-	test_opal_iax2_port_has_foreign_owner = 0;
 
 	if (!test_opal_guard_pool && switch_core_new_memory_pool(&test_opal_guard_pool) != SWITCH_STATUS_SUCCESS) {
 		return SWITCH_STATUS_FALSE;
@@ -1279,13 +1267,29 @@ static switch_status_t test_opal_iax2_guard_acquire(void)
 		switch_socket_close(test_opal_iax2_guard);
 		test_opal_iax2_guard = NULL;
 
-		/* ONLY an address-in-use refusal establishes that someone else owns the
-		 * port and therefore that the containment exists without this guard.  Any
-		 * other failure leaves the port free, so the verdict stays false and the
-		 * manager-constructing cases refuse to run. */
-		test_opal_iax2_port_has_foreign_owner = test_opal_status_is_addr_in_use(bound);
-
-		if (!test_opal_iax2_port_has_foreign_owner) {
+		/*
+		 * EVERY refusal is a containment failure, including address-in-use, and the
+		 * two are separated here only so the log says which one happened.
+		 *
+		 * Address-in-use is the tempting one to tolerate: it proves the port is
+		 * taken right now, and a wildcard bind would be refused for as long as that
+		 * lasts.  But "for as long as that lasts" is not a property this suite
+		 * controls.  The holder is another process, free to close its socket at any
+		 * instant - including between this bind being refused and an FSManager
+		 * being constructed a few statements later - and the moment it does, the
+		 * port is free and IAX2EndPoint::Initialise() binds the WILDCARD address
+		 * and starts its transmitter and receiver, while the case that checked
+		 * carries on believing it cannot.  A borrowed exclusion is therefore not an
+		 * exclusion at all, and treating it as one is exactly the check-then-use
+		 * gap this guard exists to close.  Only a socket THIS process holds can be
+		 * relied upon, because only that one cannot be released behind its back.
+		 */
+		if (test_opal_status_is_addr_in_use(bound)) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+							  "IAX2 containment guard could not take %s:%d because another holder already owns it; containment "
+							  "cannot be established by this suite, so no FSManager may be constructed. Release the port and "
+							  "run the suite again.\n", TEST_OPAL_GUARD_ADDRESS, (int) IAX2EndPoint::DefaultUdpPort);
+		} else {
 			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
 							  "IAX2 containment guard could not take %s:%d and the refusal was not address-in-use (status=%d)\n",
 							  TEST_OPAL_GUARD_ADDRESS, (int) IAX2EndPoint::DefaultUdpPort, (int) bound);
@@ -1300,10 +1304,10 @@ static switch_status_t test_opal_iax2_guard_acquire(void)
 /*
  * Release the guard and its pool.  Idempotent.
  *
- * The foreign-owner verdict is discarded too.  Once the guard is gone this suite
- * knows nothing about who holds the port, and a remembered verdict would be a
- * claim about the past presented as a fact about the present.  The next acquire
- * establishes it again from scratch.
+ * Nothing about the port is remembered across a release, because after this
+ * returns there is nothing to remember: containment is the socket, so giving up
+ * the socket gives up the containment.  The next acquire establishes it again
+ * from scratch or fails.
  */
 static void test_opal_iax2_guard_release(void)
 {
@@ -1315,22 +1319,29 @@ static void test_opal_iax2_guard_release(void)
 	if (test_opal_guard_pool) {
 		switch_core_destroy_memory_pool(&test_opal_guard_pool);
 	}
-
-	test_opal_iax2_port_has_foreign_owner = 0;
 }
 
 /*
- * True when the IAX2 default port cannot be bound on the wildcard address by
- * anyone - either because this suite holds it on loopback or because another
- * holder already had it.
+ * True when THIS PROCESS holds the IAX2 default port, and therefore when a
+ * wildcard bind of that port is guaranteed to be refused for as long as the
+ * caller keeps running.
  *
- * A LIVE CHECK, not a reading of remembered state.  A held guard answers
- * immediately; otherwise the guard is taken NOW, which both establishes the
- * containment when the port is free and recomputes the foreign-owner verdict
- * from that attempt alone.  Only then is the verdict consulted.  So a caller can
- * never be told "contained" on the strength of a stale flag, and every
- * manager-constructing case - each of which requires this fatally before it
- * constructs anything - is gated on the state of the port at that instant.
+ * A LIVE CHECK OF OWNED STATE, which is the whole of the contract.  A guard
+ * already held answers immediately; otherwise one is taken NOW and the answer is
+ * whether that succeeded.  There is no third answer: a port held by somebody else
+ * does not qualify, however certain the observation was at the instant it was
+ * made, because the observation expires the moment the other holder closes its
+ * socket and nothing informs the caller when it does.  Every case that
+ * constructs an FSManager requires this fatally beforehand, so the exclusion each
+ * one relies on is one this process owns and cannot lose behind its back rather
+ * than one it merely witnessed.
+ *
+ * The one place ownership legitimately moves is the isolated helper: the parent
+ * releases the guard before spawning it, the helper takes it for itself as its
+ * own fatal precondition, and the parent takes it back after reaping.  No
+ * FSManager is constructed anywhere in that window - see the handover in the
+ * configuration-absent case - so at every instant at which a manager exists, the
+ * process that built it is the process holding the port.
  */
 static int test_opal_iax2_containment_in_effect(void)
 {
@@ -1338,11 +1349,7 @@ static int test_opal_iax2_containment_in_effect(void)
 		return 1;
 	}
 
-	if (test_opal_iax2_guard_acquire() == SWITCH_STATUS_SUCCESS) {
-		return 1;
-	}
-
-	return test_opal_iax2_port_has_foreign_owner;
+	return test_opal_iax2_guard_acquire() == SWITCH_STATUS_SUCCESS;
 }
 
 /*
@@ -1943,6 +1950,15 @@ static int test_opal_exec_plan_build(test_opal_exec_plan_t * plan, const char *a
  * The three preconditions are the same ones the in-process version asserted, in
  * the same order, each with its own exit code so a precondition failure cannot be
  * mistaken for the substantive assertion failing.
+ *
+ * The containment precondition is load-bearing HERE in a way it is not in the
+ * parent: this is the process that constructs the manager, so this is the process
+ * that must own the IAX2 port.  Its own setup hook has already taken the port -
+ * the parent released it before the spawn precisely so that this could succeed -
+ * and the check below confirms the socket is held by THIS process rather than
+ * inferring an exclusion from somebody else's.  A helper that could not take the
+ * port therefore builds nothing and reports TEST_OPAL_CHILD_NO_CONTAINMENT, which
+ * the parent surfaces as a failed case.
  *
  * The branch is driven TWICE over the same manager.  Once would only show that the
  * status is reported; twice makes the repeatability of the failure path the property
@@ -2622,6 +2638,7 @@ FST_CORE_BEGIN("conf_opal")
 			pid_t helper_pid = -1;
 			int child_code = -1;
 			int child_signal = 0;
+			int guard_regained = 0;
 
 			/*
 			 * ---------------------------------------------------------------
@@ -2692,9 +2709,18 @@ FST_CORE_BEGIN("conf_opal")
 			/* Fatal preconditions, asserted in the PARENT before it spawns anything.
 			 *
 			 * The child inherits this environment, and it is the process that brings
-			 * a PProcess up and constructs the manager, so an unpinned or uncontained
-			 * parent would hand those hazards straight to it.  Asserted per case, not
-			 * just once, so no re-ordering can leave a manager built without either. */
+			 * a PProcess up and constructs the manager, so an unpinned parent would
+			 * hand that hazard straight to it.  Asserted per case, not just once, so
+			 * no re-ordering can leave a manager built without the pin.
+			 *
+			 * The containment requirement is asserted here for a different reason
+			 * than in every other case: this case builds no manager, so what it needs
+			 * to establish is not an exclusion to construct under but that the port
+			 * is takeable by this suite AT ALL before it gives the port up for the
+			 * handover below.  Proving that first is what makes the release safe:
+			 * without it, a run in which the port was permanently unavailable would
+			 * release nothing, spawn a helper that could not take it either, and
+			 * report the failure one layer further away from its cause. */
 			fst_requires(test_opal_plugin_path_is_pinned());
 			fst_requires(test_opal_iax2_containment_in_effect());
 
@@ -2707,10 +2733,51 @@ FST_CORE_BEGIN("conf_opal")
 			 * is reduced to spawning it and decoding its verdict.
 			 */
 
+			/*
+			 * THE GUARD HANDOVER, and the reason it is a handover rather than an
+			 * inheritance.
+			 *
+			 * The helper is the process that constructs the manager, so the helper is
+			 * the process that has to own the exclusion.  It cannot be handed a
+			 * bound socket: it is a freshly EXEC'd image, and the containment it
+			 * needs is a socket of its own in its own address space.  Nor can the
+			 * parent simply keep holding the port while the helper runs - that would
+			 * put the helper in exactly the position this fix exists to abolish,
+			 * asserting containment it does not own on the strength of an
+			 * address-in-use refusal it cannot renew.
+			 *
+			 * So ownership moves.  The parent has already proved above that the port
+			 * is takeable by this suite, and it releases it here; the helper's setup
+			 * hook takes it, and the helper's body requires it fatally before it
+			 * acquires a PProcess or constructs anything - so a helper that failed to
+			 * take it reports TEST_OPAL_CHILD_NO_CONTAINMENT and builds no manager.
+			 *
+			 * The window in which the port is free is bounded by those two facts and
+			 * contains NO manager at all: the parent constructs none (asserted at the
+			 * end of this case, where it still owns no PTLib process), and the helper
+			 * constructs one only after taking the port.  If some third party grabs
+			 * the port inside that window, the helper's own precondition fails and
+			 * this case fails loudly - which is the correct outcome and precisely the
+			 * one a borrowed exclusion used to hide.
+			 */
+			test_opal_iax2_guard_release();
+
 			/* argv[0] is FCTX's own main() parameter and is the fallback image path;
 			 * /proc/self/exe is preferred where it exists.  Passing it in rather than
 			 * reaching for a global keeps the spawn helper free of hidden inputs. */
 			isolated = test_opal_run_readconfig_isolated(argv[0], &child_code, &child_signal, &helper_pid);
+
+			/*
+			 * Ownership comes straight back, as the very next statement after the
+			 * helper has been reaped, so the free window closes here and not at the
+			 * mercy of an assertion below breaking out of the case body first.  The
+			 * helper's guard died with its address space - a UDP socket has no
+			 * lingering state to wait out - so this is expected to succeed on the
+			 * failure paths too, and it is recorded rather than asserted inline so
+			 * that the diagnosis of a failed helper is logged before any verdict is
+			 * pronounced on the handover.
+			 */
+			guard_regained = test_opal_iax2_containment_in_effect();
 
 			if (isolated == SWITCH_STATUS_SUCCESS && child_code == TEST_OPAL_CHILD_OK) {
 				/* Clean run: the helper's own pid-named log directory is residue and
@@ -2752,6 +2819,17 @@ FST_CORE_BEGIN("conf_opal")
 			 * logged the offending path and errno for anything it could not remove. */
 			fst_xcheck(cleaned == SWITCH_STATUS_SUCCESS,
 					   "the helper's pid-named working directory must be removed in full after a clean isolated run");
+
+			/*
+			 * THE HANDOVER COMPLETED.  Asserting this is what makes the release above
+			 * safe to have done: the port is owned by this process again, so every
+			 * case declared after this one - each of which constructs a manager -
+			 * inherits a real exclusion rather than a port the helper might have left
+			 * bound or a third party might have taken during the window.  It also
+			 * proves the helper left nothing behind on the port, which is a property
+			 * of the helper worth knowing independently of its verdict.
+			 */
+			fst_xcheck(guard_regained, "the IAX2 port guard must be back in this process's ownership once the helper has been reaped");
 
 			/* THE ISOLATION PROPERTY ITSELF.  The parent never built a manager, so
 			 * it still owns no PTLib process - which is what makes the containment
@@ -2806,8 +2884,8 @@ FST_CORE_BEGIN("conf_opal")
 			/* the plugin search path was pinned before any PProcess existed */
 			fst_requires(test_opal_plugin_path_is_pinned());
 
-			/* the port is unavailable to a wildcard bind, by us or by another
-			 * holder - either way OPAL cannot take it */
+			/* this process holds the port, so a wildcard bind of it cannot succeed
+			 * for as long as this case runs - which is what OPAL is about to try */
 			fst_requires(test_opal_iax2_containment_in_effect());
 
 			if (switch_find_local_ip(local_ip, sizeof(local_ip), &local_mask, AF_INET) == SWITCH_STATUS_SUCCESS
@@ -2837,7 +2915,8 @@ FST_CORE_BEGIN("conf_opal")
 				}
 			}
 
-			/* and the guard still holds the port after the manager is gone */
+			/* and this process still holds the port after the manager is gone, so
+			 * the manager's destruction released nothing it did not own */
 			fst_check(test_opal_iax2_containment_in_effect());
 		}
 		FST_TEST_END()
