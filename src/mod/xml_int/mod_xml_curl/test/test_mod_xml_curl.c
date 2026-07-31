@@ -1016,6 +1016,21 @@ SWITCH_DECLARE(void) fst_xc_curl_slist_free_all(switch_curl_slist_t *list)
  * return value -- so the shim records and returns success.  It also captures the
  * one option the module sets through curl_easy_setopt directly, so nothing in the
  * fetch's option handling escapes observation.
+ *
+ * The option is decided BEFORE the variadic argument is touched, and the argument
+ * is retrieved as exactly the type the caller passed, for the same reason the
+ * getinfo shim above retrieves long * and char ** rather than void *.  va_arg has
+ * to be invoked with a type compatible with the argument actually passed, and the
+ * production call site hands CURLOPT_HTTPHEADER a switch_curl_slist_t * -- which
+ * <switch_curl.h> defines as struct curl_slist * -- so that is the type named here.
+ * struct curl_slist * and void * are incompatible types, so pulling the argument
+ * out as a void * and relying on the two sharing a representation would be
+ * undefined behaviour even on the ABIs where they do.  The value is only widened
+ * to the generic const void * observation storage AFTER it has been read under its
+ * own type, because the record exists to identify the list by address and must
+ * stay comparable with the address the free-all shim records.  An option this shim
+ * does not observe is returned on without starting a variadic scan at all, so no
+ * argument is ever read under a type it was not passed as.
  */
 #undef curl_easy_setopt
 
@@ -1029,11 +1044,14 @@ CURLcode curl_easy_setopt(CURL *handle, CURLoption option, ...)
 	fst_xc_transport.setopt_count++;
 
 	if (option == CURLOPT_HTTPHEADER) {
+		switch_curl_slist_t *headers = NULL;
 		const void *list = NULL;
 
 		va_start(ap, option);
-		list = va_arg(ap, const void *);
+		headers = va_arg(ap, switch_curl_slist_t *);
 		va_end(ap);
+
+		list = (const void *) headers;
 
 		if (fst_xc_transport.httpheader_set_count < FST_XC_MAX_HTTPHEADER_SETS) {
 			fst_xc_transport.httpheader_list[fst_xc_transport.httpheader_set_count] = list;

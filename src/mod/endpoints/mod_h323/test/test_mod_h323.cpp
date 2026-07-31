@@ -46,18 +46,26 @@
  * there is none to start.  Alongside those, the suite drives
  * FSH323EndPoint::ReadConfig() and FSH323EndPoint::Initialise() directly.
  *
- * That is a statement about FreeSWITCH's runtime entry point and nothing wider:
- * the H.323 TOOLKIT does start threads of its own, and two cases here reach the
- * code that starts them.  FSH323EndPoint::Initialise() hands every configured
- * listener to H323EndPoint::StartListener(), and an H323Listener IS a PThread
- * (h323plus transports.h), so a listener that binds successfully leaves a live
- * toolkit thread behind for as long as the endpoint owning it lives.  Two cases
- * take that path - the module-load case, whose listener then lives until the
- * shutdown case deletes the process, and the codec-preference case, which owns
- * and deletes its own endpoint within the case.  Both are confined to a
- * loopback address on a fixed high port, and no case starts a gatekeeper RAS
- * thread at all; see NETWORK SIDE-EFFECT CONTAINMENT below for the rules that
- * make that true and for how each thread is reclaimed.
+ * That statement is about FreeSWITCH's runtime entry point, and the H.323 TOOLKIT
+ * would ordinarily start threads of its own on top of it: FSH323EndPoint::
+ * Initialise() hands every configured listener to H323EndPoint::StartListener(),
+ * an H323Listener IS a PThread (h323plus transports.h), and a listener that binds
+ * successfully would leave a live toolkit thread behind for as long as the
+ * endpoint owning it lives.  IN THIS SUITE IT DOES NOT HAPPEN AT ALL.  Both of
+ * the toolkit entry points that would do it - StartListener() and
+ * UseGatekeeper() - are retargeted onto local doubles by a preprocessor rewrite
+ * installed immediately before the production translation unit is included and
+ * withdrawn immediately after it, so the production call sites reach
+ * fst_h323_start_listener() and fst_h323_use_gatekeeper() instead.  Those doubles
+ * record the request, open no socket, adopt no listener object and start no
+ * thread.  Consequently NO case in this suite binds a socket, NO case leaves a
+ * toolkit listener thread behind, and NO case starts a gatekeeper RAS thread; the
+ * two cases that do run the real Initialise() assert exactly that, by requiring
+ * the endpoint's own H323ListenerList to be EMPTY afterwards.  The loopback
+ * address and fixed high port that every injected configuration carries are
+ * therefore defence in depth rather than the containment itself - they bound what
+ * a regression in the rewrite could reach.  See NETWORK SIDE-EFFECT CONTAINMENT
+ * and HERMETIC TOOLKIT INTERPOSITION below for the full argument.
  *
  * WHY THE PRODUCTION TRANSLATION UNIT IS INCLUDED (and not just the header)
  * ------------------------------------------------------------------------
@@ -612,6 +620,17 @@ static int fst_h323_release_recorded_pools(void)
  * file's direct dependency set.
  */
 #include <fcntl.h>
+
+/*
+ * fstat() and S_ISFIFO(), and poll().  Both belong to the helper-provenance
+ * handshake described at fst_h323_helper_provenance_ok() below: before the helper
+ * believes a descriptor number handed to it in the environment, it establishes
+ * that the descriptor is actually a pipe (fstat + S_ISFIFO) and then reads the
+ * parent's one-time record from it under a bounded wait (poll), so that no
+ * descriptor that merely happens to be open can wedge the helper.
+ */
+#include <sys/stat.h>
+#include <poll.h>
 
 /*
  * The module entry points are non-static with C linkage: mod_h323.cpp wraps
@@ -1345,9 +1364,12 @@ static void fst_h323_process_release(void)
  * process, and allocating, logging, parsing XML or constructing a C++ object is
  * none of those things.
  *
- * So the forked image DOES NOTHING BUT EXEC.  Between fork() and exec it
- * performs exactly two calls, alarm() and execve(), both on POSIX's
- * async-signal-safe list, plus _exit() on the single path where execve fails.
+ * So the forked image DOES NOTHING BUT EXEC.  The block holds FOUR call sites and
+ * no others, every one of them on POSIX's async-signal-safe list: dup2(), alarm()
+ * and execve() on the path that works, and _exit() as the fourth on the single
+ * path where execve fails.  Three of the four therefore execute on any successful
+ * spawn.  The descriptor dup2() redirects onto standard output was opened by the
+ * PARENT before the fork precisely so that the child needs no open() of its own.
  * No allocation, no logging, no XML, no PTLib, no C++ construction, no locking.
  * execve() then replaces the address space wholesale, which discards every
  * inherited lock, every inherited thread state and every inherited stdio buffer
@@ -1362,11 +1384,26 @@ static void fst_h323_process_release(void)
  * argv is therefore exactly one element, the program path, and the marker
  * travels in the environment.
  *
- * Everything execve() needs - path, argv and envp - is built in the PARENT
- * before the fork, precisely so that the child needs no allocator to reach exec.
- * The parent releases the plan on every path, including immediately after a
- * successful fork: the child has its own copy of that memory, so freeing it in
- * the parent cannot affect the exec.
+ * THE MARKER ALONE IS NOT ENOUGH TO DISPATCH THE HELPER BODY.  An environment
+ * variable is a public channel that anything in this process's ancestry can set
+ * and that persists into every later descendant, and helper mode _exit()s from
+ * inside the FIRST declared case - so a top-level run that believed a stale or
+ * inherited marker would run one case, exit with that case's status, and be
+ * recorded by the runner as a clean pass with the six later cases never run and
+ * nothing in the output saying so.  The marker is consequently paired with a
+ * PROVENANCE HANDSHAKE the environment cannot supply on its own: the parent writes
+ * a one-time token into an anonymous pipe and closes the write end before forking,
+ * and the helper must read that exact record back out of the inherited descriptor
+ * before it will act.  fst_h323_helper_provenance_ok() carries the whole argument.
+ *
+ * Everything execve() needs - path, argv and envp, plus the handshake pipe and its
+ * token - is built in the PARENT before the fork, precisely so that the child needs
+ * no allocator to reach exec.  The parent releases the plan on every path,
+ * including immediately after a successful fork: the child has its own copy of that
+ * memory, so freeing it in the parent cannot affect the exec.  It closes its own
+ * copy of the pipe's read end at the same point, for the same reason and with the
+ * same safety - the descriptor the new image will read from is the one execve
+ * carried across, not this one.
  *
  * The watchdog is unchanged in spirit and stronger in reach.  alarm() is armed
  * before the exec and a pending alarm SURVIVES an exec - it is a per-process
@@ -1407,6 +1444,7 @@ static void fst_h323_process_release(void)
 #define FST_H323_CHILD_SECOND_NOT_FALSE  45	/* repeat ReadConfig() did not fail  */
 #define FST_H323_CHILD_SECOND_LISTENERS  46	/* repeat left a listener            */
 #define FST_H323_CHILD_EXEC_FAILED       47	/* fork succeeded, execve() did not  */
+#define FST_H323_CHILD_BAD_PROVENANCE    48	/* helper marker without provenance  */
 
 /*
  * The environment marker that selects helper mode, and the one mode this suite
@@ -1414,9 +1452,65 @@ static void fst_h323_process_release(void)
  * collide with it, and the value names what the helper is for, so a marker
  * carrying anything else is treated as NOT helper mode rather than as a request
  * this binary does not understand.
+ *
+ * THE MARKER IS NOT, BY ITSELF, AUTHORITY TO RUN AS THE HELPER.
+ * ------------------------------------------------------------
+ * An environment variable is a PUBLIC channel: anything in this process's
+ * ancestry can set it, and anything that sets it once leaves it set for every
+ * later descendant.  A marker alone therefore cannot distinguish "my parent just
+ * exec'd me for this purpose" from "a wrapper script, a CI recipe or a stale
+ * exported shell variable happens to carry this name".  Believing it alone is a
+ * real failure mode rather than a theoretical one: helper mode _exit()s from
+ * inside the FIRST declared case, so a top-level run that entered it by accident
+ * would execute one case body, exit with that body's status, and be recorded by
+ * the runner as a clean pass - with the six remaining cases never run and nothing
+ * in the output saying so.
+ *
+ * The marker is consequently only ever HALF of the credential.  The other half is
+ * a one-time secret the parent writes into an anonymous pipe before it forks, and
+ * which therefore cannot be present in an environment this suite did not itself
+ * construct.  The two names below carry the pipe's descriptor number and the
+ * secret; fst_h323_helper_provenance_ok() is where they are checked, and it
+ * documents the whole handshake.
  */
 #define FST_H323_HELPER_ENV              "FST_MOD_H323_ISOLATED_HELPER"
 #define FST_H323_HELPER_READCONFIG       "readconfig-missing-config"
+#define FST_H323_HELPER_FD_ENV           "FST_MOD_H323_HELPER_FD"
+#define FST_H323_HELPER_TOKEN_ENV        "FST_MOD_H323_HELPER_TOKEN"
+
+/*
+ * The handshake record's leading field, which makes the record self-describing
+ * and versioned: a future mode that needed a different record shape would carry a
+ * different tag, and a mismatched tag fails the byte-for-byte comparison rather
+ * than being silently reinterpreted.
+ */
+#define FST_H323_HELPER_RECORD_TAG       "fst-mod-h323-helper/1"
+
+/*
+ * How many environment names this run owns outright: the mode marker, the
+ * handshake descriptor number and the handshake token.  Named rather than
+ * open-coded because the count appears in three places - the envp size
+ * calculation, the drop list and the append loop - and they must not drift.
+ */
+#define FST_H323_EXEC_OWNED_NAMES        3
+
+/*
+ * Bounds on the helper's read of that record.  The parent writes the whole record
+ * and closes the write end BEFORE forking, so in the intended case the data and
+ * the end-of-file are already waiting and the first poll returns immediately.
+ * These bounds exist for the unintended case: a descriptor number that happens to
+ * name a pipe nobody is writing to must make the helper REFUSE, not block, so the
+ * read is a bounded poll loop rather than a blocking read.
+ */
+#define FST_H323_HELPER_HANDSHAKE_MS     2000
+#define FST_H323_HELPER_HANDSHAKE_POLL_MS 20
+
+/*
+ * Upper bound on a descriptor number this suite will look at.  A number outside
+ * it did not come from a pipe() in this process, and refusing early keeps fstat()
+ * away from an arbitrary integer.
+ */
+#define FST_H323_HELPER_MAX_FD           (1 << 20)
 
 /*
  * The image to exec.  /proc/self/exe is preferred over argv[0] because it is
@@ -1486,6 +1580,159 @@ static int fst_h323_helper_marker_present(void)
 }
 
 /*
+ * ---------------------------------------------------------------------------
+ * THE HELPER-PROVENANCE HANDSHAKE
+ * ---------------------------------------------------------------------------
+ * Answers the question the marker cannot: was this process exec'd as the helper
+ * BY THE PARENT OF THIS RUN, or does it merely happen to have inherited a name?
+ *
+ * WHAT THE PARENT DOES (fst_h323_run_readconfig_isolated, below)
+ * -------------------------------------------------------------
+ * Before it forks, the parent creates an anonymous pipe, mints a fresh UUID,
+ * renders the one-line record "<tag> <mode> <token>", writes that record into the
+ * write end, and CLOSES the write end.  It then passes the READ end's descriptor
+ * number and the token through envp alongside the marker.  A pipe descriptor is
+ * not close-on-exec, so the read end survives the execve untouched; the record
+ * and the end-of-file are already sitting in the pipe buffer by then, so the
+ * helper never waits on the parent and no ordering between the two matters.
+ *
+ * WHY THAT IS UNFORGEABLE BY AN AMBIENT ENVIRONMENT
+ * ------------------------------------------------
+ * An environment can be copied, exported or left stale; a live pipe carrying a
+ * value generated moments ago cannot.  For a stale environment to pass this
+ * check, the descriptor number it names would have to be open in THIS process AND
+ * be a pipe AND contain exactly the record naming exactly that same token - and
+ * the token is a fresh UUID, so a recorded one is worthless the next run.  In
+ * practice a stale descriptor number is either closed, or is some unrelated file
+ * or socket, and every one of those outcomes refuses.
+ *
+ * WHY EACH INDIVIDUAL CHECK IS HERE
+ * ---------------------------------
+ *   - All three variables must be present, and the marker must match the mode
+ *     EXACTLY, so a partial or half-updated environment cannot half-authenticate.
+ *   - The descriptor number is parsed with strtol and the ENTIRE string must be
+ *     consumed, so "3x" or "3 " is rejected rather than read as 3.
+ *   - It must be above STDERR_FILENO: a handshake conducted over one of the three
+ *     standard descriptors would be reading the suite's own console.
+ *   - fstat() must succeed and S_ISFIFO() must hold.  This is the check that turns
+ *     a stale number into a refusal instead of a read against whatever that number
+ *     currently names.  On this failure the descriptor is deliberately NOT closed:
+ *     it is not ours, and closing a descriptor another part of the process owns
+ *     would be a far worse bug than the one being guarded against.
+ *   - The read is a bounded poll loop, so a pipe nobody writes to makes the helper
+ *     refuse rather than hang, and EINTR is retried rather than treated as failure.
+ *   - The buffer is ONE BYTE LARGER than the expected record, so a LONGER record
+ *     overshoots the expected length and fails the same length test a SHORTER one
+ *     fails.  One comparison covers truncation, padding and substitution alike.
+ *   - The comparison is a byte-for-byte memcmp of the exact expected length, not a
+ *     prefix or substring test.
+ *
+ * Called exactly once, from the first declared case, because it CONSUMES the pipe.
+ * Returns 1 only when every check held.
+ */
+static int fst_h323_helper_provenance_ok(void)
+{
+	const char *mode = getenv(FST_H323_HELPER_ENV);
+	const char *fd_text = getenv(FST_H323_HELPER_FD_ENV);
+	const char *token = getenv(FST_H323_HELPER_TOKEN_ENV);
+	char expected[SWITCH_UUID_FORMATTED_LENGTH + 128] = "";
+	char actual[SWITCH_UUID_FORMATTED_LENGTH + 129] = "";
+	struct stat descriptor;
+	struct pollfd waiter;
+	char *parse_end = NULL;
+	long parsed = 0;
+	int fd = -1;
+	int expected_len = 0;
+	int capacity = 0;
+	int filled = 0;
+	int waited_ms = 0;
+	int ready = 0;
+	int ok = 0;
+	ssize_t got = 0;
+
+	if (!mode || !fd_text || !*fd_text || !token || !*token) {
+		return 0;
+	}
+
+	if (strcmp(mode, FST_H323_HELPER_READCONFIG)) {
+		return 0;
+	}
+
+	if (strlen(token) > SWITCH_UUID_FORMATTED_LENGTH) {
+		return 0;
+	}
+
+	parsed = strtol(fd_text, &parse_end, 10);
+
+	if (!parse_end || *parse_end || parsed <= STDERR_FILENO || parsed > FST_H323_HELPER_MAX_FD) {
+		return 0;
+	}
+
+	fd = (int) parsed;
+
+	memset(&descriptor, 0, sizeof(descriptor));
+
+	/* Not closed on this path on purpose: a descriptor that is not the pipe this
+	 * suite created is not this suite's to close. */
+	if (fstat(fd, &descriptor) != 0 || !S_ISFIFO(descriptor.st_mode)) {
+		return 0;
+	}
+
+	expected_len = switch_snprintf(expected, sizeof(expected), "%s %s %s\n", FST_H323_HELPER_RECORD_TAG, mode, token);
+	capacity = expected_len + 1;
+
+	if (expected_len <= 0 || capacity > (int) sizeof(actual)) {
+		close(fd);
+		return 0;
+	}
+
+	while (filled < capacity && waited_ms < FST_H323_HELPER_HANDSHAKE_MS) {
+		memset(&waiter, 0, sizeof(waiter));
+		waiter.fd = fd;
+		waiter.events = POLLIN;
+
+		ready = poll(&waiter, 1, FST_H323_HELPER_HANDSHAKE_POLL_MS);
+
+		if (ready < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+
+			break;
+		}
+
+		if (ready == 0) {
+			waited_ms += FST_H323_HELPER_HANDSHAKE_POLL_MS;
+			continue;
+		}
+
+		got = read(fd, actual + filled, (size_t) (capacity - filled));
+
+		if (got < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+
+			break;
+		}
+
+		if (got == 0) {
+			/* End of file: the parent closed the write end, so whatever has been
+			 * read is the whole record and the length test below judges it. */
+			break;
+		}
+
+		filled += (int) got;
+	}
+
+	ok = (filled == expected_len && !memcmp(actual, expected, (size_t) expected_len)) ? 1 : 0;
+
+	close(fd);
+
+	return ok;
+}
+
+/*
  * Everything execve() needs, built in the parent so that the forked child can
  * reach exec without touching the allocator.
  *
@@ -1532,27 +1779,66 @@ static void fst_h323_exec_plan_release(fst_h323_exec_plan_t * plan)
 }
 
 /*
+ * Format one NAME=VALUE environment entry and hand back an owned copy, or NULL if
+ * it will not fit or either side is missing.
+ *
+ * The length is checked BEFORE the format rather than inferred from the return
+ * value afterwards, because switch_snprintf truncates silently: a bound that is
+ * tested up front is one a static analyser can follow, and a truncated marker
+ * would be worse than no marker at all - it would authenticate nothing while
+ * looking exactly like a credential.
+ */
+static char *fst_h323_env_entry(const char *name, const char *value)
+{
+	char rendered[SWITCH_UUID_FORMATTED_LENGTH + 128] = "";
+
+	if (!name || !value) {
+		return NULL;
+	}
+
+	if (strlen(name) + strlen(value) + 2 > sizeof(rendered)) {
+		return NULL;
+	}
+
+	switch_snprintf(rendered, sizeof(rendered), "%s=%s", name, value);
+
+	return strdup(rendered);
+}
+
+/*
  * Build the plan.  Returns 1 with every member owned by *plan, or 0 with nothing
  * owned and nothing leaked.
  *
- * The environment is copied entry by entry, DROPPING any inherited marker of the
- * same name whatever its value, so helper mode can neither be inherited by
- * accident nor be stale, and the marker this run wants is appended last.  Every
- * allocation is checked, because this runs under the CI static analyser as well
- * as the sanitizer.
+ * The environment is copied entry by entry, DROPPING every inherited entry whose
+ * name is one of the THREE this run owns - the mode marker, the handshake
+ * descriptor number and the handshake token - whatever their values, and appending
+ * a freshly rendered triple in their place.  Dropping all three rather than only
+ * the marker is what makes the credential atomic: a half-inherited triple, where
+ * say the token survived from an earlier run while the descriptor number was
+ * replaced, must not exist, because a helper that assembled its credential from
+ * two different runs would be exactly the situation the handshake exists to rule
+ * out.  Every allocation is checked, because this runs under the CI static
+ * analyser as well as the sanitizer.
  */
-static int fst_h323_exec_plan_build(fst_h323_exec_plan_t * plan, const char *argv0, const char *mode)
+static int fst_h323_exec_plan_build(fst_h323_exec_plan_t * plan, const char *argv0, const char *mode, int handshake_fd, const char *token)
 {
 	extern char **environ;
+	static const char *const owned[FST_H323_EXEC_OWNED_NAMES] = {
+		FST_H323_HELPER_ENV,
+		FST_H323_HELPER_FD_ENV,
+		FST_H323_HELPER_TOKEN_ENV
+	};
 	const char *chosen = NULL;
-	char *marker = NULL;
-	switch_size_t marker_len = 0;
+	char *added[FST_H323_EXEC_OWNED_NAMES] = { NULL, NULL, NULL };
+	char fd_text[32] = "";
 	switch_size_t name_len = 0;
 	switch_size_t count = 0;
 	switch_size_t i = 0;
 	switch_size_t out = 0;
+	int slot = 0;
+	int drop = 0;
 
-	if (!plan || !mode) {
+	if (!plan || !mode || !token || handshake_fd <= STDERR_FILENO) {
 		return 0;
 	}
 
@@ -1584,40 +1870,72 @@ static int fst_h323_exec_plan_build(fst_h323_exec_plan_t * plan, const char *arg
 		;
 	}
 
-	/* +2 for the appended marker and the NULL terminator. */
-	if (!(plan->envp = (char **) calloc(count + 2, sizeof(char *)))) {
+	/* +FST_H323_EXEC_OWNED_NAMES for the appended triple, +1 for the NULL
+	 * terminator.  The drop loop below can only ever shorten the copy, so this is
+	 * an upper bound rather than an exact size. */
+	if (!(plan->envp = (char **) calloc(count + FST_H323_EXEC_OWNED_NAMES + 1, sizeof(char *)))) {
 		fst_h323_exec_plan_release(plan);
 		return 0;
 	}
 
-	name_len = strlen(FST_H323_HELPER_ENV);
-	marker_len = name_len + strlen(mode) + 2;
+	switch_snprintf(fd_text, sizeof(fd_text), "%d", handshake_fd);
 
-	if (!(marker = (char *) malloc(marker_len))) {
-		fst_h323_exec_plan_release(plan);
-		return 0;
+	added[0] = fst_h323_env_entry(FST_H323_HELPER_ENV, mode);
+	added[1] = fst_h323_env_entry(FST_H323_HELPER_FD_ENV, fd_text);
+	added[2] = fst_h323_env_entry(FST_H323_HELPER_TOKEN_ENV, token);
+
+	for (slot = 0; slot < FST_H323_EXEC_OWNED_NAMES; slot++) {
+		if (!added[slot]) {
+			goto fail;
+		}
 	}
-
-	switch_snprintf(marker, marker_len, "%s=%s", FST_H323_HELPER_ENV, mode);
 
 	for (i = 0; i < count; i++) {
-		if (!strncmp(environ[i], FST_H323_HELPER_ENV "=", name_len + 1)) {
+		drop = 0;
+
+		for (slot = 0; slot < FST_H323_EXEC_OWNED_NAMES; slot++) {
+			name_len = strlen(owned[slot]);
+
+			/* Name match only: compare up to the name and require the very next
+			 * byte to be the '=', so FST_MOD_H323_HELPER_FD cannot be mistaken for
+			 * a longer name that merely starts with it. */
+			if (!strncmp(environ[i], owned[slot], name_len) && environ[i][name_len] == '=') {
+				drop = 1;
+				break;
+			}
+		}
+
+		if (drop) {
 			continue;
 		}
 
 		if (!(plan->envp[out] = strdup(environ[i]))) {
-			free(marker);
-			fst_h323_exec_plan_release(plan);
-			return 0;
+			goto fail;
 		}
 
 		out++;
 	}
 
-	plan->envp[out++] = marker;
+	/* Ownership of each appended entry transfers to the plan as it is stored, so
+	 * the failure path below cannot double-free one that already landed. */
+	for (slot = 0; slot < FST_H323_EXEC_OWNED_NAMES; slot++) {
+		plan->envp[out++] = added[slot];
+		added[slot] = NULL;
+	}
+
 	plan->envp[out] = NULL;
 
 	return 1;
+
+  fail:
+
+	for (slot = 0; slot < FST_H323_EXEC_OWNED_NAMES; slot++) {
+		switch_safe_free(added[slot]);
+	}
+
+	fst_h323_exec_plan_release(plan);
+
+	return 0;
 }
 
 /*
@@ -1682,6 +2000,40 @@ static int fst_h323_readconfig_child_body(void)
 }
 
 /*
+ * Write the whole buffer or report failure, retrying on EINTR and on a short
+ * write.
+ *
+ * A partial write would produce a record that fails the helper's byte-for-byte
+ * comparison, which is the safe outcome but a confusing one to diagnose, so the
+ * loop makes "the record was delivered intact" the only success.
+ */
+static int fst_h323_write_all(int fd, const char *data, switch_size_t len)
+{
+	switch_size_t sent = 0;
+	ssize_t wrote = 0;
+
+	while (sent < len) {
+		wrote = write(fd, data + sent, len - sent);
+
+		if (wrote < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+
+			return 0;
+		}
+
+		if (wrote == 0) {
+			return 0;
+		}
+
+		sent += (switch_size_t) wrote;
+	}
+
+	return 1;
+}
+
+/*
  * Run fst_h323_readconfig_child_body() in a SEPARATELY BOOTSTRAPPED helper
  * process and report what happened to it.
  *
@@ -1701,12 +2053,20 @@ static int fst_h323_readconfig_child_body(void)
 static switch_status_t fst_h323_run_readconfig_isolated(const char *argv0, int *code, int *sig, pid_t *helper_pid)
 {
 	fst_h323_exec_plan_t plan;
+	switch_uuid_t uuid;
+	char token[SWITCH_UUID_FORMATTED_LENGTH + 1] = "";
+	char record[SWITCH_UUID_FORMATTED_LENGTH + 128] = "";
+	int handshake[2];
+	int record_len = 0;
 	int devnull = -1;
 	pid_t pid = -1;
 	pid_t reaped = 0;
 	int status = 0;
 	int waited_ms = 0;
 	switch_status_t result = SWITCH_STATUS_FALSE;
+
+	handshake[0] = -1;
+	handshake[1] = -1;
 
 	*code = -1;
 	*sig = 0;
@@ -1722,8 +2082,56 @@ static switch_status_t fst_h323_run_readconfig_isolated(const char *argv0, int *
 		return SWITCH_STATUS_FALSE;
 	}
 
+	/*
+	 * THE PROVENANCE THE HELPER WILL CHECK, created before anything else, because
+	 * the exec plan has to carry the descriptor number and the token into the new
+	 * image's environment.  See fst_h323_helper_provenance_ok() for what the other
+	 * side does with them and why a marker on its own is not enough.
+	 */
+	if (pipe(handshake) != 0) {
+		return SWITCH_STATUS_FALSE;
+	}
+
+	/* A handshake conducted over one of the three standard descriptors would be
+	 * reading the suite's own console.  The helper refuses such a number outright,
+	 * so refuse to create one here rather than spawning a helper that could not
+	 * possibly authenticate. */
+	if (handshake[0] <= STDERR_FILENO || handshake[1] <= STDERR_FILENO) {
+		close(handshake[0]);
+		close(handshake[1]);
+		return SWITCH_STATUS_FALSE;
+	}
+
+	memset(&uuid, 0, sizeof(uuid));
+	switch_uuid_get(&uuid);
+	switch_uuid_format(token, &uuid);
+
+	record_len = switch_snprintf(record, sizeof(record), "%s %s %s\n",
+								 FST_H323_HELPER_RECORD_TAG, FST_H323_HELPER_READCONFIG, token);
+
+	/*
+	 * Written, and the write end CLOSED, BEFORE the fork.  Both halves of that
+	 * matter.  Writing first means the record is already in the pipe buffer when the
+	 * new image starts, so the helper never waits on this process and the two need
+	 * no ordering between them at all.  Closing the write end first means the helper
+	 * sees end-of-file the instant it has consumed the record, so its read
+	 * terminates on data rather than on a timeout, and a record longer than expected
+	 * is impossible rather than merely unlikely.  The record is under a hundred
+	 * bytes against a pipe buffer of at least 4 KiB, so this write cannot block.
+	 */
+	if (record_len <= 0 || record_len >= (int) sizeof(record)
+		|| !fst_h323_write_all(handshake[1], record, (switch_size_t) record_len)) {
+		close(handshake[0]);
+		close(handshake[1]);
+		return SWITCH_STATUS_FALSE;
+	}
+
+	close(handshake[1]);
+	handshake[1] = -1;
+
 	/* Built BEFORE the fork: the child must not need the allocator. */
-	if (!fst_h323_exec_plan_build(&plan, argv0, FST_H323_HELPER_READCONFIG)) {
+	if (!fst_h323_exec_plan_build(&plan, argv0, FST_H323_HELPER_READCONFIG, handshake[0], token)) {
+		close(handshake[0]);
 		return SWITCH_STATUS_FALSE;
 	}
 
@@ -1747,6 +2155,8 @@ static switch_status_t fst_h323_run_readconfig_isolated(const char *argv0, int *
 			close(devnull);
 		}
 
+		close(handshake[0]);
+
 		return SWITCH_STATUS_FALSE;
 	}
 
@@ -1754,8 +2164,10 @@ static switch_status_t fst_h323_run_readconfig_isolated(const char *argv0, int *
 		/*
 		 * ASYNC-SIGNAL-SAFE REGION - DO NOT ADD ANYTHING TO THIS BLOCK.
 		 *
-		 * Exactly four calls, all on POSIX's async-signal-safe list: dup2(),
-		 * alarm(), execve() and - only where execve failed - _exit().  Nothing here
+		 * Exactly four call sites and no others, all on POSIX's async-signal-safe
+		 * list: dup2(), alarm() and execve() on the path that works, plus _exit()
+		 * only where execve failed - so three of the four run on a successful
+		 * spawn, which is the same count the block comment above states.  Nothing here
 		 * allocates, locks, logs or constructs, which is the entire reason this
 		 * fork is safe in a process whose core threads are already running.  The
 		 * descriptor dup2() needs was opened by the parent before the fork, so the
@@ -1793,6 +2205,13 @@ static switch_status_t fst_h323_run_readconfig_isolated(const char *argv0, int *
 		close(devnull);
 		devnull = -1;
 	}
+
+	/* The child inherited the read end across the exec - a pipe descriptor is not
+	 * close-on-exec - so this process has no further use for it.  Closing it here
+	 * also means the helper is the only reader, and that this function leaks no
+	 * descriptor on any path. */
+	close(handshake[0]);
+	handshake[0] = -1;
 
 	while (waited_ms < FST_H323_CHILD_DEADLINE_MS) {
 		reaped = waitpid(pid, &status, WNOHANG);
@@ -1875,25 +2294,60 @@ static switch_status_t fst_h323_run_readconfig_isolated(const char *argv0, int *
  * It runs ONLY when the helper reported success.  On any other outcome those
  * same files are the primary evidence for what went wrong, so they are
  * deliberately preserved and the caller reports where they are.
+ *
+ * EVERY REMOVAL IS CHECKED, AND THE VERDICT IS RETURNED
+ * ----------------------------------------------------
+ * Discarding these results would make the residue-neutrality claim above an
+ * intention rather than a property: a cleanup that silently failed would leave a
+ * directory behind every run, the count would creep, and the suite would still
+ * report a clean pass.  So each removal is checked, ONLY absence is tolerated -
+ * ENOENT means the artefact was never written, which is a legitimate outcome for
+ * the ".tmp" sibling in particular - and anything else is logged with the exact
+ * path and the errno text before the aggregate verdict comes back to the caller,
+ * which asserts on it.
  */
-static void fst_h323_remove_helper_dir(pid_t helper_pid)
+static int fst_h323_remove_helper_path(const char *path, int is_dir)
+{
+	int failed = 0;
+
+	failed = is_dir ? (rmdir(path) != 0) : (unlink(path) != 0);
+
+	if (failed && errno != ENOENT) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+						  "helper working directory cleanup failed for %s: %s\n", path, strerror(errno));
+		return 0;
+	}
+
+	return 1;
+}
+
+static switch_status_t fst_h323_remove_helper_dir(pid_t helper_pid)
 {
 	char dir[1024] = "";
 	char path[1152] = "";
+	int ok = 1;
 
 	if (helper_pid <= 0) {
-		return;
+		return SWITCH_STATUS_FALSE;
 	}
 
 	switch_snprintf(dir, sizeof(dir), "%s%s%lu", SWITCH_TEST_BASE_DIR_OVERRIDE, SWITCH_PATH_SEPARATOR, (unsigned long) helper_pid);
 
+	/* &= rather than && throughout: every removal is attempted and every offender
+	 * is named, so one failure cannot hide the next. */
 	switch_snprintf(path, sizeof(path), "%s%s%s", dir, SWITCH_PATH_SEPARATOR, "freeswitch.xml.fsxml");
-	(void) unlink(path);
+	ok &= fst_h323_remove_helper_path(path, 0);
 
 	switch_snprintf(path, sizeof(path), "%s%s%s", dir, SWITCH_PATH_SEPARATOR, "freeswitch.xml.fsxml.tmp");
-	(void) unlink(path);
+	ok &= fst_h323_remove_helper_path(path, 0);
 
-	(void) rmdir(dir);
+	/* The directory itself last.  rmdir() refuses a non-empty directory, so an
+	 * artefact this cleanup did not enumerate keeps the directory alive and
+	 * visible and is reported here rather than being deleted unseen - which is the
+	 * behaviour a test should have towards a tree it did not enumerate. */
+	ok &= fst_h323_remove_helper_path(dir, 1);
+
+	return ok ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
 }
 
 /*
@@ -2213,12 +2667,19 @@ FST_CORE_BEGIN("conf_h323")
 		 *
 		 * WHAT IT RECLAIMS
 		 * ----------------
-		 * Every root pool the module abandoned during the case that just ran.
-		 * FSH323EndPoint::ReadConfig() allocates one on entry and never destroys
-		 * or uses it (mod_h323.cpp:469), so each case that reads configuration -
-		 * five of the seven below, directly or through the module load - strands
-		 * one.  The recording seam above captures them; this is where they are
-		 * released.
+		 * Every root pool the module abandoned IN THIS PROCESS during the case that
+		 * just ran.  FSH323EndPoint::ReadConfig() allocates one on entry and never
+		 * destroys or uses it (mod_h323.cpp:469), so every call to it strands one.
+		 *
+		 * Six of the seven cases below call it, but only FIVE of those calls happen
+		 * in this process, and only those five ever reach this hook: cases 2 through
+		 * 6 read configuration here - directly, or through the module load - while
+		 * case 1 reads it TWICE inside the exec'd helper image, whose pools live and
+		 * die in an address space this hook cannot see and that _exit() discards
+		 * wholesale.  That is why the accounting line this suite logs at the end of a
+		 * run reports five, not six or seven, and why a change to the isolated case
+		 * would change that number without any pool having leaked.  The recording
+		 * seam above captures the five; this is where they are released.
 		 *
 		 * This hook is the right anchor for that and only that, because a
 		 * recorded pool is the one resource in this suite that no case owns and
@@ -2321,6 +2782,7 @@ FST_CORE_BEGIN("conf_h323")
 		FST_TEST_BEGIN(readconfig_without_configuration_fails)
 		{
 			switch_status_t isolated = SWITCH_STATUS_FALSE;
+			switch_status_t cleaned = SWITCH_STATUS_SUCCESS;
 			int child_code = -1;
 			int child_signal = 0;
 			pid_t helper_pid = -1;
@@ -2352,10 +2814,46 @@ FST_CORE_BEGIN("conf_h323")
 			 * exec and a pending alarm survives an exec, so this image is already
 			 * covered - including through its own core bootstrap, which happened
 			 * before this line was reached.
+			 *
+			 * TWO CREDENTIALS ARE REQUIRED, NOT ONE.  The marker names the mode; the
+			 * provenance handshake proves the marker came from the parent of THIS
+			 * run.  Only both together dispatch the helper body, because helper mode
+			 * _exit()s from inside this first case: a top-level run that entered it on
+			 * the strength of an inherited or stale marker alone would run one case,
+			 * exit with that case's status, and be recorded as a clean pass with the
+			 * six later cases silently never run.
+			 *
+			 * A MARKER WITHOUT VALID PROVENANCE IS THEREFORE A HARD REFUSAL, not a
+			 * fallback to an ordinary run.  Continuing as an ordinary run would be the
+			 * friendlier-looking choice and the wrong one: the marker's presence also
+			 * disarms the spawn below (fst_h323_run_readconfig_isolated refuses to
+			 * nest on presence alone), so this case could not do its work anyway, and
+			 * the environment it found itself in is one nothing should silently
+			 * tolerate.  Exiting with a DISTINCT NON-ZERO code makes the
+			 * misconfiguration impossible to miss and impossible to mistake for any
+			 * other outcome; 48 is outside the range a signal or a libc failure
+			 * produces and is neither of automake's reserved 77 (skip) or 99
+			 * (framework error).
+			 *
+			 * The diagnostic goes to STANDARD ERROR rather than through the core
+			 * logger, for the same reason FST_CORE_BEGIN reports a failed core there
+			 * (switch_test.h:296-298): the process is about to _exit(), so a message
+			 * queued for the logging thread might never be written, whereas stderr is
+			 * flushed here and is the one stream the helper path never redirects.
 			 */
-			if (fst_h323_in_helper_mode()) {
+			if (fst_h323_helper_marker_present()) {
+				if (fst_h323_in_helper_mode() && fst_h323_helper_provenance_ok()) {
+					fflush(NULL);
+					_exit(fst_h323_readconfig_child_body());
+				}
+
+				fprintf(stderr,
+						"%s is set in this environment but carries no valid parent provenance, so this process "
+						"refuses to run as the isolated helper and refuses to continue as an ordinary run. "
+						"Unset %s, %s and %s and run the suite again.\n",
+						FST_H323_HELPER_ENV, FST_H323_HELPER_ENV, FST_H323_HELPER_FD_ENV, FST_H323_HELPER_TOKEN_ENV);
 				fflush(NULL);
-				_exit(fst_h323_readconfig_child_body());
+				_exit(FST_H323_CHILD_BAD_PROVENANCE);
 			}
 
 			/* Preconditions, fatal because nothing after them means anything if they
@@ -2381,8 +2879,14 @@ FST_CORE_BEGIN("conf_h323")
 
 			if (isolated == SWITCH_STATUS_SUCCESS && child_code == FST_H323_CHILD_OK) {
 				/* Clean run: the helper's own pid-named log directory is residue and
-				 * nothing more, so it goes. */
-				fst_h323_remove_helper_dir(helper_pid);
+				 * nothing more, so it goes - and the verdict is kept, because a
+				 * cleanup that silently failed would let residue accumulate one
+				 * directory per run while the suite still reported a pass.  On the
+				 * failure branch below no cleanup is attempted at all, and `cleaned'
+				 * keeps its initial SWITCH_STATUS_SUCCESS so the assertion further
+				 * down says nothing about a directory that is being preserved on
+				 * purpose. */
+				cleaned = fst_h323_remove_helper_dir(helper_pid);
 			} else {
 				/* Emitted before the assertions so the diagnosis is on the log even
 				 * when the run is later truncated, and naming the helper's preserved
@@ -2406,6 +2910,13 @@ FST_CORE_BEGIN("conf_h323")
 			 * unexpected value name its own failure mode in the log line above. */
 			fst_xcheck(child_code == FST_H323_CHILD_OK,
 					   "ReadConfig() must report SWITCH_STATUS_FALSE and leave m_listeners empty when no h323.conf can be located");
+
+			/* RESIDUE NEUTRALITY, asserted rather than assumed.  A clean helper run
+			 * must leave this suite with exactly the one pid-named working directory a
+			 * single-core suite leaves; fst_h323_remove_helper_dir() has already
+			 * logged the offending path and errno for anything it could not remove. */
+			fst_xcheck(cleaned == SWITCH_STATUS_SUCCESS,
+					   "the helper's pid-named working directory must be removed in full after a clean isolated run");
 
 			/* THE ISOLATION PROPERTY ITSELF.  The parent's PTLib factories are
 			 * untouched, so the module load declared next still observes a fully

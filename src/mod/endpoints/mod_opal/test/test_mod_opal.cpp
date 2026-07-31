@@ -46,6 +46,26 @@
 #include <signal.h>
 
 /*
+ * open() and O_WRONLY, for the /dev/null descriptor the PARENT opens so that the
+ * helper's console output can be redirected with nothing but dup2() inside the
+ * async-signal-safe region after the fork.  Without that redirection the helper
+ * runs the same FCTX driver as this process and its case line is duplicated into
+ * the output this run is judged by.
+ */
+#include <fcntl.h>
+
+/*
+ * fstat() and S_ISFIFO(), and poll().  Both belong to the helper-provenance
+ * handshake described at test_opal_helper_provenance_ok() below: before the helper
+ * believes a descriptor number handed to it in the environment, it establishes
+ * that the descriptor is actually a pipe (fstat + S_ISFIFO) and then reads the
+ * parent's one-time record from it under a bounded wait (poll), so that no
+ * descriptor that merely happens to be open can wedge the helper.
+ */
+#include <sys/stat.h>
+#include <poll.h>
+
+/*
  * ---------------------------------------------------------------------------
  * Suite design notes
  * ---------------------------------------------------------------------------
@@ -1447,10 +1467,55 @@ static void test_opal_release_process(void)
 #define TEST_OPAL_CHILD_NOT_FALSE       53	/* ReadConfig() did NOT report failure */
 #define TEST_OPAL_CHILD_NOT_FALSE_AGAIN 54	/* the repeated ReadConfig() did NOT report failure */
 #define TEST_OPAL_CHILD_EXEC_FAILED     57	/* fork() succeeded, execve() did not */
+#define TEST_OPAL_CHILD_BAD_PROVENANCE  58	/* helper marker without parent provenance   */
+
+/*
+ * THE MARKER IS NOT, BY ITSELF, AUTHORITY TO RUN AS THE HELPER
+ * -----------------------------------------------------------
+ * The marker below names the mode, and nothing more.  It is an ordinary
+ * environment variable, so it is inherited by anything this binary is run under
+ * and it survives in any shell that exported it once.  A process that dispatched
+ * the helper body on the marker alone would therefore run exactly one case and
+ * exit with that case's status - and because that status is zero when the case
+ * passes, the run would be recorded as a clean pass with every later case
+ * silently never executed.  A test suite that can be reduced to one case by a
+ * stale environment variable, without saying so, is not a safe suite.
+ *
+ * So the marker is paired with a SECOND credential that cannot be inherited
+ * usefully: a one-time record the parent writes into an anonymous pipe before it
+ * forks.  The descriptor number and a freshly generated token travel in the
+ * child's environment, and the helper insists that the descriptor really is a
+ * pipe and that the record on it matches the token exactly.  A token from another
+ * run does not match; a marker with no pipe behind it has nothing to match
+ * against.  Both credentials together mean the parent of THIS run asked for a
+ * helper; anything less is refused outright with TEST_OPAL_CHILD_BAD_PROVENANCE.
+ */
 
 /* The marker that turns an ordinary run of this binary into the helper. */
 #define TEST_OPAL_HELPER_ENV            "FST_MOD_OPAL_ISOLATED_HELPER"
 #define TEST_OPAL_HELPER_READCONFIG     "readconfig-missing-config"
+
+/* The out-of-band half of the credential: the pipe's descriptor number, the
+ * one-time token, and the tag that opens the record so a foreign writer cannot
+ * satisfy the check by accident. */
+#define TEST_OPAL_HELPER_FD_ENV         "FST_MOD_OPAL_HELPER_FD"
+#define TEST_OPAL_HELPER_TOKEN_ENV      "FST_MOD_OPAL_HELPER_TOKEN"
+#define TEST_OPAL_HELPER_RECORD_TAG     "fst-mod-opal-helper/1"
+
+/* The three environment names this suite owns.  Every one is dropped from the
+ * inherited environment before the exec plan appends its own, so no copy the
+ * parent inherited can reach the helper and be mistaken for provenance. */
+#define TEST_OPAL_EXEC_OWNED_NAMES      3
+
+/* The handshake read is bounded so a descriptor that is a pipe but carries
+ * nothing cannot wedge the helper: the record is already in the pipe buffer
+ * before the fork, so this budget is never approached on a real spawn. */
+#define TEST_OPAL_HANDSHAKE_MS          2000
+#define TEST_OPAL_HANDSHAKE_POLL_MS     20
+
+/* An upper bound on a plausible descriptor number, so a hostile or corrupt value
+ * is rejected by arithmetic before it ever reaches fstat(). */
+#define TEST_OPAL_HELPER_MAX_FD         (1 << 20)
 
 /* Preferred image path; argv[0] is the fallback when /proc is not mounted. */
 #define TEST_OPAL_SELF_EXE              "/proc/self/exe"
@@ -1508,6 +1573,195 @@ static int test_opal_helper_marker_present(void)
 }
 
 /*
+ * The SECOND credential: proof that the marker was written by the parent of this
+ * very run, and not inherited, exported by hand or left behind by another tool.
+ *
+ * WHAT IS CHECKED, AND WHY EACH STEP IS THERE
+ * -------------------------------------------
+ * All three names must be present and non-empty, and the mode must match exactly,
+ * so a partial or mistyped environment is refused rather than half-believed.
+ *
+ * The descriptor number is parsed with strtol() and the WHOLE string must be
+ * consumed, so "9x" and " 9" are rejected rather than silently read as 9.  It
+ * must also be above standard error and below a plausible ceiling: a handshake
+ * conducted over one of the three standard descriptors would be reading the
+ * suite's own console, and a wild value has no business reaching fstat().
+ *
+ * fstat() plus S_ISFIFO() then establishes that the number really names a pipe.
+ * A regular file, a socket or a terminal that merely happens to be open at that
+ * number is refused.  Note that this path does NOT close the descriptor: a
+ * descriptor that is not the pipe this suite created is not this suite's to close.
+ *
+ * Finally the record itself is read and compared BYTE FOR BYTE against the tag,
+ * the mode and the token rendered in the same order the parent renders them.  The
+ * read is bounded by poll() so a pipe that carries nothing cannot wedge the helper,
+ * and it asks for one byte MORE than the expected record: a longer record fails
+ * the exact-length test instead of matching on its prefix.  Because the parent
+ * closes the write end before forking, end-of-file arrives as soon as the record
+ * has been consumed, so the normal case terminates on data rather than on time.
+ *
+ * A token from a different run does not match.  A marker with no pipe behind it
+ * has nothing to match against.  That is the whole property being bought.
+ */
+static int test_opal_helper_provenance_ok(void)
+{
+	const char *mode = getenv(TEST_OPAL_HELPER_ENV);
+	const char *fd_text = getenv(TEST_OPAL_HELPER_FD_ENV);
+	const char *token = getenv(TEST_OPAL_HELPER_TOKEN_ENV);
+	char expected[SWITCH_UUID_FORMATTED_LENGTH + 128] = "";
+	char actual[SWITCH_UUID_FORMATTED_LENGTH + 129] = "";
+	struct stat descriptor;
+	struct pollfd waiter;
+	char *parse_end = NULL;
+	long parsed = 0;
+	int fd = -1;
+	int expected_len = 0;
+	int capacity = 0;
+	int filled = 0;
+	int waited_ms = 0;
+	int ready = 0;
+	int ok = 0;
+	ssize_t got = 0;
+
+	if (!mode || !fd_text || !*fd_text || !token || !*token) {
+		return 0;
+	}
+
+	if (strcmp(mode, TEST_OPAL_HELPER_READCONFIG)) {
+		return 0;
+	}
+
+	if (strlen(token) > SWITCH_UUID_FORMATTED_LENGTH) {
+		return 0;
+	}
+
+	parsed = strtol(fd_text, &parse_end, 10);
+
+	if (!parse_end || *parse_end || parsed <= STDERR_FILENO || parsed > TEST_OPAL_HELPER_MAX_FD) {
+		return 0;
+	}
+
+	fd = (int) parsed;
+
+	memset(&descriptor, 0, sizeof(descriptor));
+
+	/* Not closed on this path on purpose: a descriptor that is not the pipe this
+	 * suite created is not this suite's to close. */
+	if (fstat(fd, &descriptor) != 0 || !S_ISFIFO(descriptor.st_mode)) {
+		return 0;
+	}
+
+	expected_len = switch_snprintf(expected, sizeof(expected), "%s %s %s\n", TEST_OPAL_HELPER_RECORD_TAG, mode, token);
+	capacity = expected_len + 1;
+
+	if (expected_len <= 0 || capacity > (int) sizeof(actual)) {
+		close(fd);
+		return 0;
+	}
+
+	while (filled < capacity && waited_ms < TEST_OPAL_HANDSHAKE_MS) {
+		memset(&waiter, 0, sizeof(waiter));
+		waiter.fd = fd;
+		waiter.events = POLLIN;
+
+		ready = poll(&waiter, 1, TEST_OPAL_HANDSHAKE_POLL_MS);
+
+		if (ready < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+
+			break;
+		}
+
+		if (ready == 0) {
+			waited_ms += TEST_OPAL_HANDSHAKE_POLL_MS;
+			continue;
+		}
+
+		got = read(fd, actual + filled, (size_t) (capacity - filled));
+
+		if (got < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+
+			break;
+		}
+
+		if (got == 0) {
+			/* End of file: the parent closed the write end, so whatever has been
+			 * read is the whole record and the length test below judges it. */
+			break;
+		}
+
+		filled += (int) got;
+	}
+
+	ok = (filled == expected_len && !memcmp(actual, expected, (size_t) expected_len)) ? 1 : 0;
+
+	close(fd);
+
+	return ok;
+}
+
+/*
+ * Render one "NAME=VALUE" entry for the exec plan's environment.
+ *
+ * Bounded up front rather than relying on the truncation behaviour of the
+ * formatter, because a silently truncated credential would be a credential the
+ * helper cannot match - a confusing failure in place of a clear refusal.
+ */
+static char *test_opal_env_entry(const char *name, const char *value)
+{
+	char rendered[SWITCH_UUID_FORMATTED_LENGTH + 128] = "";
+
+	if (!name || !value) {
+		return NULL;
+	}
+
+	if (strlen(name) + strlen(value) + 2 > sizeof(rendered)) {
+		return NULL;
+	}
+
+	switch_snprintf(rendered, sizeof(rendered), "%s=%s", name, value);
+
+	return strdup(rendered);
+}
+
+/*
+ * Write the whole buffer or report failure, retrying a short write and an EINTR.
+ *
+ * write() is permitted to transfer less than it was asked for, so a bare call
+ * would leave the handshake record truncated on a pipe that is perfectly healthy.
+ */
+static int test_opal_write_all(int fd, const char *data, switch_size_t len)
+{
+	switch_size_t sent = 0;
+	ssize_t wrote = 0;
+
+	while (sent < len) {
+		wrote = write(fd, data + sent, len - sent);
+
+		if (wrote < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+
+			return 0;
+		}
+
+		if (wrote == 0) {
+			return 0;
+		}
+
+		sent += (switch_size_t) wrote;
+	}
+
+	return 1;
+}
+
+/*
  * Everything execve() needs, built in the parent so that the forked child can
  * reach exec without touching the allocator.
  *
@@ -1550,24 +1804,33 @@ static void test_opal_exec_plan_release(test_opal_exec_plan_t * plan)
  * Build the plan.  Returns 1 with every member owned by *plan, or 0 with nothing
  * owned and nothing leaked.
  *
- * The environment is copied entry by entry, DROPPING any inherited marker of the
- * same name whatever its value, so helper mode can neither be inherited by
- * accident nor be stale, and the marker this run wants is appended last.  Every
- * allocation is checked, because this runs under the CI static analyser as well as
- * the sanitizer.
+ * The environment is copied entry by entry, DROPPING every one of the three names
+ * this suite owns whatever its value, so neither the marker nor either half of the
+ * provenance credential can be inherited by accident or be stale, and this run's
+ * own triple is appended last.  Dropping all three rather than only the marker
+ * matters: a descriptor number and a token surviving from two different runs would
+ * be exactly the situation the handshake exists to rule out.  Every allocation is
+ * checked, because this runs under the CI static analyser as well as the sanitizer.
  */
-static int test_opal_exec_plan_build(test_opal_exec_plan_t * plan, const char *argv0, const char *mode)
+static int test_opal_exec_plan_build(test_opal_exec_plan_t * plan, const char *argv0, const char *mode, int handshake_fd, const char *token)
 {
 	extern char **environ;
+	static const char *const owned[TEST_OPAL_EXEC_OWNED_NAMES] = {
+		TEST_OPAL_HELPER_ENV,
+		TEST_OPAL_HELPER_FD_ENV,
+		TEST_OPAL_HELPER_TOKEN_ENV
+	};
 	const char *chosen = NULL;
-	char *marker = NULL;
-	switch_size_t marker_len = 0;
+	char *added[TEST_OPAL_EXEC_OWNED_NAMES] = { NULL, NULL, NULL };
+	char fd_text[32] = "";
 	switch_size_t name_len = 0;
 	switch_size_t count = 0;
 	switch_size_t i = 0;
 	switch_size_t out = 0;
+	int slot = 0;
+	int drop = 0;
 
-	if (!plan || !mode) {
+	if (!plan || !mode || !token || handshake_fd <= STDERR_FILENO) {
 		return 0;
 	}
 
@@ -1599,40 +1862,72 @@ static int test_opal_exec_plan_build(test_opal_exec_plan_t * plan, const char *a
 		;
 	}
 
-	/* +2 for the appended marker and the NULL terminator. */
-	if (!(plan->envp = (char **) calloc(count + 2, sizeof(char *)))) {
+	/* +TEST_OPAL_EXEC_OWNED_NAMES for the appended triple, +1 for the NULL
+	 * terminator.  The drop loop below can only ever shorten the copy, so this is
+	 * an upper bound rather than an exact size. */
+	if (!(plan->envp = (char **) calloc(count + TEST_OPAL_EXEC_OWNED_NAMES + 1, sizeof(char *)))) {
 		test_opal_exec_plan_release(plan);
 		return 0;
 	}
 
-	name_len = strlen(TEST_OPAL_HELPER_ENV);
-	marker_len = name_len + strlen(mode) + 2;
+	switch_snprintf(fd_text, sizeof(fd_text), "%d", handshake_fd);
 
-	if (!(marker = (char *) malloc(marker_len))) {
-		test_opal_exec_plan_release(plan);
-		return 0;
+	added[0] = test_opal_env_entry(TEST_OPAL_HELPER_ENV, mode);
+	added[1] = test_opal_env_entry(TEST_OPAL_HELPER_FD_ENV, fd_text);
+	added[2] = test_opal_env_entry(TEST_OPAL_HELPER_TOKEN_ENV, token);
+
+	for (slot = 0; slot < TEST_OPAL_EXEC_OWNED_NAMES; slot++) {
+		if (!added[slot]) {
+			goto fail;
+		}
 	}
-
-	switch_snprintf(marker, marker_len, "%s=%s", TEST_OPAL_HELPER_ENV, mode);
 
 	for (i = 0; i < count; i++) {
-		if (!strncmp(environ[i], TEST_OPAL_HELPER_ENV "=", name_len + 1)) {
+		drop = 0;
+
+		for (slot = 0; slot < TEST_OPAL_EXEC_OWNED_NAMES; slot++) {
+			name_len = strlen(owned[slot]);
+
+			/* Name match only: compare up to the name and require the very next
+			 * byte to be the '=', so FST_MOD_OPAL_HELPER_FD cannot be mistaken for
+			 * a longer name that merely starts with it. */
+			if (!strncmp(environ[i], owned[slot], name_len) && environ[i][name_len] == '=') {
+				drop = 1;
+				break;
+			}
+		}
+
+		if (drop) {
 			continue;
 		}
 
 		if (!(plan->envp[out] = strdup(environ[i]))) {
-			free(marker);
-			test_opal_exec_plan_release(plan);
-			return 0;
+			goto fail;
 		}
 
 		out++;
 	}
 
-	plan->envp[out++] = marker;
+	/* Ownership of each appended entry transfers to the plan as it is stored, so
+	 * the failure path below cannot double-free one that already landed. */
+	for (slot = 0; slot < TEST_OPAL_EXEC_OWNED_NAMES; slot++) {
+		plan->envp[out++] = added[slot];
+		added[slot] = NULL;
+	}
+
 	plan->envp[out] = NULL;
 
 	return 1;
+
+  fail:
+
+	for (slot = 0; slot < TEST_OPAL_EXEC_OWNED_NAMES; slot++) {
+		switch_safe_free(added[slot]);
+	}
+
+	test_opal_exec_plan_release(plan);
+
+	return 0;
 }
 
 /*
@@ -1705,20 +2000,35 @@ static int test_opal_readconfig_child_body(void)
  * SWITCH_STATUS_FALSE when the fork or the wait failed or the helper died on a
  * signal - in which case *sig names the signal.
  *
+ * *helper_pid is reported so the caller can address the working directory the
+ * helper's own core created for itself, which is named after that pid.  It is set
+ * as soon as the fork succeeds, so it is available on the failure paths too - and
+ * those are precisely the paths on which that directory must be PRESERVED rather
+ * than removed, because it holds the helper's own account of what went wrong.
+ *
  * The deadline exists so that no failure mode of the helper can hang the suite:
  * one that wedges before its alarm can fire, or that inherited an ignored
  * SIGALRM, is killed and reaped here.
  */
-static switch_status_t test_opal_run_readconfig_isolated(const char *argv0, int *code, int *sig)
+static switch_status_t test_opal_run_readconfig_isolated(const char *argv0, int *code, int *sig, pid_t *helper_pid)
 {
 	test_opal_exec_plan_t plan;
+	switch_uuid_t uuid;
+	char token[SWITCH_UUID_FORMATTED_LENGTH + 1] = "";
+	char record[SWITCH_UUID_FORMATTED_LENGTH + 128] = "";
 	pid_t pid = -1;
 	pid_t reaped = 0;
+	int handshake[2];
+	int devnull = -1;
+	int record_len = 0;
 	int status = 0;
 	int waited_ms = 0;
 
+	handshake[0] = handshake[1] = -1;
+
 	*code = -1;
 	*sig = 0;
+	*helper_pid = -1;
 
 	/* NEVER NEST.  A helper that somehow reached this point would spawn a helper
 	 * of its own, and so on, each generation arming a fresh watchdog - so the
@@ -1730,10 +2040,64 @@ static switch_status_t test_opal_run_readconfig_isolated(const char *argv0, int 
 		return SWITCH_STATUS_FALSE;
 	}
 
-	/* Built BEFORE the fork: the child must not need the allocator. */
-	if (!test_opal_exec_plan_build(&plan, argv0, TEST_OPAL_HELPER_READCONFIG)) {
+	/*
+	 * THE PROVENANCE THE HELPER WILL CHECK, created before anything else, because
+	 * the exec plan has to carry the descriptor number and the token into the new
+	 * image's environment.  See test_opal_helper_provenance_ok() for what the other
+	 * side does with them and why a marker on its own is not enough.
+	 */
+	if (pipe(handshake) != 0) {
 		return SWITCH_STATUS_FALSE;
 	}
+
+	/* A handshake conducted over one of the three standard descriptors would be
+	 * reading the suite's own console.  The helper refuses such a number outright,
+	 * so refuse to create one here rather than spawning a helper that could not
+	 * possibly authenticate. */
+	if (handshake[0] <= STDERR_FILENO || handshake[1] <= STDERR_FILENO) {
+		close(handshake[0]);
+		close(handshake[1]);
+		return SWITCH_STATUS_FALSE;
+	}
+
+	memset(&uuid, 0, sizeof(uuid));
+	switch_uuid_get(&uuid);
+	switch_uuid_format(token, &uuid);
+
+	record_len = switch_snprintf(record, sizeof(record), "%s %s %s\n",
+								 TEST_OPAL_HELPER_RECORD_TAG, TEST_OPAL_HELPER_READCONFIG, token);
+
+	/*
+	 * Written, and the write end CLOSED, BEFORE the fork.  Both halves of that
+	 * matter.  Writing first means the record is already in the pipe buffer when the
+	 * new image starts, so the helper never waits on this process and the two need
+	 * no ordering between them at all.  Closing the write end first means the helper
+	 * sees end-of-file the instant it has consumed the record, so its read
+	 * terminates on data rather than on a timeout, and a record longer than expected
+	 * is impossible rather than merely unlikely.  The record is under a hundred
+	 * bytes against a pipe buffer of at least 4 KiB, so this write cannot block.
+	 */
+	if (record_len <= 0 || record_len >= (int) sizeof(record)
+		|| !test_opal_write_all(handshake[1], record, (switch_size_t) record_len)) {
+		close(handshake[0]);
+		close(handshake[1]);
+		return SWITCH_STATUS_FALSE;
+	}
+
+	close(handshake[1]);
+	handshake[1] = -1;
+
+	/* Built BEFORE the fork: the child must not need the allocator. */
+	if (!test_opal_exec_plan_build(&plan, argv0, TEST_OPAL_HELPER_READCONFIG, handshake[0], token)) {
+		close(handshake[0]);
+		return SWITCH_STATUS_FALSE;
+	}
+
+	/* Opened in the PARENT, so that redirecting the helper's console output needs
+	 * nothing but dup2() in the child.  A failure here is not fatal: the
+	 * redirection is output hygiene, not correctness, and the verdict travels in
+	 * the exit code either way. */
+	devnull = open("/dev/null", O_WRONLY);
 
 	/* Flush before forking so no buffered parent output can be duplicated into
 	 * the child image.  The exec discards those buffers anyway, but flushing here
@@ -1744,6 +2108,13 @@ static switch_status_t test_opal_run_readconfig_isolated(const char *argv0, int 
 
 	if (pid < 0) {
 		test_opal_exec_plan_release(&plan);
+
+		if (devnull >= 0) {
+			close(devnull);
+		}
+
+		close(handshake[0]);
+
 		return SWITCH_STATUS_FALSE;
 	}
 
@@ -1751,22 +2122,54 @@ static switch_status_t test_opal_run_readconfig_isolated(const char *argv0, int 
 		/*
 		 * ASYNC-SIGNAL-SAFE REGION - DO NOT ADD ANYTHING TO THIS BLOCK.
 		 *
-		 * Exactly three calls, all on POSIX's async-signal-safe list: alarm(),
-		 * execve() and - only where execve failed - _exit().  Nothing here
-		 * allocates, locks, logs or constructs, which is the entire reason this
-		 * fork is safe in a process whose core threads are already running.
+		 * Exactly four call sites and no others, all on POSIX's async-signal-safe
+		 * list: dup2(), alarm() and execve() on the path that works, plus _exit()
+		 * only where execve failed - so three of the four run on a successful spawn.
+		 * Nothing here allocates, locks, logs or constructs, which is the entire
+		 * reason this fork is safe in a process whose core threads are already
+		 * running.  The descriptor dup2() needs was opened by the parent before the
+		 * fork, so the child never calls open() either.
+		 *
+		 * Only STANDARD OUTPUT is discarded, and only because the helper runs the
+		 * same FCTX driver, so its console output would otherwise interleave with
+		 * this run's and corrupt the collected result - concretely, the helper would
+		 * print this very case's name a second time.  Standard error is left alone:
+		 * that is where FST_CORE_BEGIN writes when a core fails to come up at all
+		 * (switch_test.h:296-298), and losing it would turn a diagnosable failure
+		 * into a bare exit code.
+		 *
+		 * The alarm is armed before the exec on purpose: a pending alarm survives an
+		 * exec, so it covers the helper's own bootstrap as well as its body.
 		 *
 		 * _exit(), never exit(): if the exec fails, no inherited atexit handler
 		 * and no inherited stdio buffer may run in this duplicated image.
 		 */
+		if (devnull >= 0) {
+			dup2(devnull, STDOUT_FILENO);
+		}
+
 		alarm(TEST_OPAL_CHILD_ALARM_SECONDS);
 		execve(plan.path, plan.argv, plan.envp);
 		_exit(TEST_OPAL_CHILD_EXEC_FAILED);
 	}
 
+	*helper_pid = pid;
+
 	/* Safe the instant the fork returned: the child holds its own copy of this
 	 * memory, so releasing the parent's cannot affect the exec. */
 	test_opal_exec_plan_release(&plan);
+
+	if (devnull >= 0) {
+		close(devnull);
+		devnull = -1;
+	}
+
+	/* The child inherited the read end across the exec - a pipe descriptor is not
+	 * close-on-exec - so this process has no further use for it.  Closing it here
+	 * also means the helper is the only reader, and that this function leaks no
+	 * descriptor on any path. */
+	close(handshake[0]);
+	handshake[0] = -1;
 
 	while (waited_ms < TEST_OPAL_CHILD_DEADLINE_MS) {
 		reaped = waitpid(pid, &status, WNOHANG);
@@ -1816,6 +2219,87 @@ static switch_status_t test_opal_run_readconfig_isolated(const char *argv0, int 
 
 	return SWITCH_STATUS_FALSE;
 }
+
+/*
+ * Remove the working directory the HELPER's own core created for itself.
+ *
+ * WHY THERE IS ANYTHING TO REMOVE
+ * ------------------------------
+ * FST_CORE_BEGIN derives its log and database directories from the test base
+ * directory plus the running process's pid (switch_test.h:98-104), so every core
+ * bootstrap makes a directory named after its own pid.  The helper is a real
+ * bootstrap in a real process, so it makes one too - a SECOND directory alongside
+ * the one this run already owns, named after a pid that will never recur.
+ *
+ * Left alone, that is one directory of residue per run, accumulating forever in a
+ * source tree, for a process that exited before the case even finished asserting.
+ * The suite that caused it is the only party that knows it is disposable, so the
+ * suite removes it.
+ *
+ * WHAT IS REMOVED, AND ONLY THAT
+ * ------------------------------
+ * The named artefacts the core writes there, and then the directory itself.
+ * rmdir() refuses a non-empty directory, so anything this cleanup does not
+ * enumerate keeps the directory alive and VISIBLE rather than being deleted
+ * unseen - which is the right behaviour towards a tree the test did not author.
+ *
+ * EVERY REMOVAL IS CHECKED, AND THE VERDICT IS RETURNED
+ * ----------------------------------------------------
+ * Discarding these results would make the residue claim above an intention rather
+ * than a property: a cleanup that silently failed would leave a directory behind
+ * every run, the count would creep, and the suite would still report a clean pass.
+ * So each removal is checked, ONLY absence is tolerated - ENOENT means the
+ * artefact was never written, which is a legitimate outcome for the ".tmp" sibling
+ * in particular - and anything else is logged with the exact path and the errno
+ * text before the aggregate verdict comes back to the caller, which asserts on it.
+ *
+ * ONLY AFTER A CLEAN HELPER RUN
+ * -----------------------------
+ * The caller removes nothing when the helper failed, timed out or died on a
+ * signal.  On those paths the directory is the helper's own account of what
+ * happened, and it is named in the diagnostic instead of being deleted.
+ */
+static int test_opal_remove_helper_path(const char *path, int is_dir)
+{
+	int failed = 0;
+
+	failed = is_dir ? (rmdir(path) != 0) : (unlink(path) != 0);
+
+	if (failed && errno != ENOENT) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+						  "helper working directory cleanup failed for %s: %s\n", path, strerror(errno));
+		return 0;
+	}
+
+	return 1;
+}
+
+static switch_status_t test_opal_remove_helper_dir(pid_t helper_pid)
+{
+	char dir[1024] = "";
+	char path[1152] = "";
+	int ok = 1;
+
+	if (helper_pid <= 0) {
+		return SWITCH_STATUS_FALSE;
+	}
+
+	switch_snprintf(dir, sizeof(dir), "%s%s%lu", SWITCH_TEST_BASE_DIR_OVERRIDE, SWITCH_PATH_SEPARATOR, (unsigned long) helper_pid);
+
+	/* &= rather than && throughout: every removal is attempted and every offender
+	 * is named, so one failure cannot hide the next. */
+	switch_snprintf(path, sizeof(path), "%s%s%s", dir, SWITCH_PATH_SEPARATOR, "freeswitch.xml.fsxml");
+	ok &= test_opal_remove_helper_path(path, 0);
+
+	switch_snprintf(path, sizeof(path), "%s%s%s", dir, SWITCH_PATH_SEPARATOR, "freeswitch.xml.fsxml.tmp");
+	ok &= test_opal_remove_helper_path(path, 0);
+
+	/* The directory itself last, for the reason given above. */
+	ok &= test_opal_remove_helper_path(dir, 1);
+
+	return ok ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_FALSE;
+}
+
 
 /*
  * The pool the loaded module is given, and why it cannot be fst_pool.
@@ -2133,6 +2617,8 @@ FST_CORE_BEGIN("conf_opal")
 		FST_TEST_BEGIN(config_absent_read_config_fails)
 		{
 			switch_status_t isolated = SWITCH_STATUS_FALSE;
+			switch_status_t cleaned = SWITCH_STATUS_SUCCESS;
+			pid_t helper_pid = -1;
 			int child_code = -1;
 			int child_signal = 0;
 
@@ -2160,10 +2646,46 @@ FST_CORE_BEGIN("conf_opal")
 			 * This is reached AFTER the setup hook, so the plugin pin and the IAX2
 			 * containment are already installed exactly as they are for any other
 			 * case, and the body re-verifies both before relying on them.
+			 *
+			 * TWO CREDENTIALS ARE REQUIRED, NOT ONE.  The marker names the mode; the
+			 * provenance handshake proves the marker came from the parent of THIS
+			 * run.  Only both together dispatch the helper body, because helper mode
+			 * _exit()s from inside this first case: a top-level run that entered it on
+			 * the strength of an inherited or stale marker alone would run one case,
+			 * exit with that case's status, and be recorded as a clean pass with the
+			 * seven later cases silently never run.
+			 *
+			 * A MARKER WITHOUT VALID PROVENANCE IS THEREFORE A HARD REFUSAL, not a
+			 * fallback to an ordinary run.  Continuing as an ordinary run would be the
+			 * friendlier-looking choice and the wrong one: the marker's presence also
+			 * disarms the spawn below (test_opal_run_readconfig_isolated refuses to
+			 * nest on presence alone), so this case could not do its work anyway, and
+			 * the environment it found itself in is one nothing should silently
+			 * tolerate.  Exiting with a DISTINCT NON-ZERO code makes the
+			 * misconfiguration impossible to miss and impossible to mistake for any
+			 * other outcome; 58 is outside the range a signal or a libc failure
+			 * produces and is neither of automake's reserved 77 (skip) or 99
+			 * (framework error).
+			 *
+			 * The diagnostic goes to STANDARD ERROR rather than through the core
+			 * logger, for the same reason FST_CORE_BEGIN reports a failed core there
+			 * (switch_test.h:296-298): the process is about to _exit(), so a message
+			 * queued for the logging thread might never be written, whereas stderr is
+			 * flushed here and is the one stream the helper path never redirects.
 			 */
-			if (test_opal_in_helper_mode()) {
+			if (test_opal_helper_marker_present()) {
+				if (test_opal_in_helper_mode() && test_opal_helper_provenance_ok()) {
+					fflush(NULL);
+					_exit(test_opal_readconfig_child_body());
+				}
+
+				fprintf(stderr,
+						"%s is set in this environment but carries no valid parent provenance, so this process "
+						"refuses to run as the isolated helper and refuses to continue as an ordinary run. "
+						"Unset %s, %s and %s and run the suite again.\n",
+						TEST_OPAL_HELPER_ENV, TEST_OPAL_HELPER_ENV, TEST_OPAL_HELPER_FD_ENV, TEST_OPAL_HELPER_TOKEN_ENV);
 				fflush(NULL);
-				_exit(test_opal_readconfig_child_body());
+				_exit(TEST_OPAL_CHILD_BAD_PROVENANCE);
 			}
 
 			/* Fatal preconditions, asserted in the PARENT before it spawns anything.
@@ -2187,14 +2709,27 @@ FST_CORE_BEGIN("conf_opal")
 			/* argv[0] is FCTX's own main() parameter and is the fallback image path;
 			 * /proc/self/exe is preferred where it exists.  Passing it in rather than
 			 * reaching for a global keeps the spawn helper free of hidden inputs. */
-			isolated = test_opal_run_readconfig_isolated(argv[0], &child_code, &child_signal);
+			isolated = test_opal_run_readconfig_isolated(argv[0], &child_code, &child_signal, &helper_pid);
 
-			if (isolated != SWITCH_STATUS_SUCCESS || child_code != TEST_OPAL_CHILD_OK) {
+			if (isolated == SWITCH_STATUS_SUCCESS && child_code == TEST_OPAL_CHILD_OK) {
+				/* Clean run: the helper's own pid-named log directory is residue and
+				 * nothing more, so it goes - and the verdict is kept, because a
+				 * cleanup that silently failed would let residue accumulate one
+				 * directory per run while the suite still reported a pass.  On the
+				 * failure branch below no cleanup is attempted at all, and `cleaned'
+				 * keeps its initial SWITCH_STATUS_SUCCESS so the assertion further
+				 * down says nothing about a directory that is being preserved on
+				 * purpose. */
+				cleaned = test_opal_remove_helper_dir(helper_pid);
+			} else {
 				/* Emitted before the assertions so the diagnosis is on the log even
-				 * when the run is later truncated. */
+				 * when the run is later truncated, and naming the helper's preserved
+				 * log directory because that is where its own account of the failure
+				 * is. */
 				switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
-								  "isolated configuration-absent check: status=%d exit=%d signal=%d\n",
-								  (int) isolated, child_code, child_signal);
+								  "isolated configuration-absent check: status=%d exit=%d signal=%d; helper log kept at %s%s%lu\n",
+								  (int) isolated, child_code, child_signal, SWITCH_TEST_BASE_DIR_OVERRIDE, SWITCH_PATH_SEPARATOR,
+								  (unsigned long) helper_pid);
 			}
 
 			/* SWITCH_STATUS_TIMEOUT here means the helper had to be killed at the
@@ -2209,6 +2744,13 @@ FST_CORE_BEGIN("conf_opal")
 			 * unexpected value name its own failure mode in the log line above. */
 			fst_xcheck(child_code == TEST_OPAL_CHILD_OK,
 					   "ReadConfig() must report SWITCH_STATUS_FALSE when no opal.conf can be located");
+
+			/* RESIDUE NEUTRALITY, asserted rather than assumed.  A clean helper run
+			 * must leave this suite with exactly the one pid-named working directory a
+			 * single-core suite leaves; test_opal_remove_helper_dir() has already
+			 * logged the offending path and errno for anything it could not remove. */
+			fst_xcheck(cleaned == SWITCH_STATUS_SUCCESS,
+					   "the helper's pid-named working directory must be removed in full after a clean isolated run");
 
 			/* THE ISOLATION PROPERTY ITSELF.  The parent never built a manager, so
 			 * it still owns no PTLib process - which is what makes the containment
