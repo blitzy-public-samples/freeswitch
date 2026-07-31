@@ -331,9 +331,13 @@ static int xml_curl_json_is_xml_char(unsigned long cp)
 /*
  * JSON: validates a decoded string that is about to be handed to a duplicating builder. The
  * builders measure with strlen(), so a string carrying an embedded NUL would be silently
- * truncated - "alice\u0000admin" becoming the identifier "alice" - which is why length is taken
- * from the caller and the buffer is walked byte by byte rather than trusted. Returns 1 when the
- * string is bounded, well-formed UTF-8 and legal XML character data throughout.
+ * truncated - "alice\u0000admin" becoming the identifier "alice". This validator measures the
+ * same way, with its own strlen(), and so cannot see past such a NUL either: an embedded NUL is
+ * refused upstream instead, by xml_curl_json_validate_unicode_escape() rejecting a \u0000 escape
+ * before cJSON can decode it and by xml_curl_json_read_file() refusing a literal NUL anywhere
+ * inside the recorded body length. What is established here is everything else - the buffer is
+ * walked byte by byte rather than trusted, and 1 is returned only when the string is bounded,
+ * well-formed UTF-8 and legal XML character data throughout.
  *
  * The two-character sequence "<!" is refused outright, and that rule is the reason this one
  * validator guards every builder call site rather than each one guarding itself. The serializer

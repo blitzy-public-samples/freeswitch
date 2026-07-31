@@ -53,8 +53,8 @@
            requested section. Within an element, "@name" is a string attribute and "$" is string
            text; any other member is a child, as a nested object or a non empty array of objects.
            Numbers, booleans and nulls are refused; an element carries either "$" or children,
-           never both; and the top level object carries no "@name", since the module builds the
-           document and section envelope itself.
+           never both; and the top level object carries no "@" attribute member of any name,
+           since the module builds the document and section envelope itself.
 
            A response that is not application/json, or whose body falls outside that profile, is
            logged as a warning and parsed as XML instead. When omitted, responses are decoded as

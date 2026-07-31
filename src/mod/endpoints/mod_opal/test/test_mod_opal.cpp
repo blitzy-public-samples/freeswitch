@@ -169,9 +169,9 @@
  *   0.0.0.0:4569 UDP - what the containment prevents, and what must never appear.  An
  *             IAX2 listener on the wildcard address would be reachable from off-box for
  *             as long as the process lived (CWE-668).  No case constructs an FSManager
- *             without first fatally requiring that the port is already unavailable to a
- *             wildcard bind, so a run in which containment could not be established
- *             aborts rather than exposing the socket.
+ *             without first requiring that the port is already unavailable to a wildcard
+ *             bind, so a run in which containment could not be established ends as
+ *             SKIPPED - the Automake skip status, 77 - rather than exposing the socket.
  *
  * What the listener cases assert.  FSManager::Initialise() reports a StartListener()
  * failure only through PTRACE and propagates no status (mod_opal.cpp:287-291), so a
@@ -1223,12 +1223,12 @@ static void test_opal_iax2_guard_release(void)
  * answers immediately, otherwise one is taken now and the answer is whether that
  * succeeded.  There is no third answer, because a port held by somebody else stops
  * qualifying the moment that holder closes its socket and nothing informs the caller
- * when it does.  Every case that constructs an FSManager requires this fatally
- * beforehand.
+ * when it does.  Every case that constructs an FSManager consults this beforehand, through
+ * test_opal_require_containment_or_skip() below.
  *
  * The one place ownership legitimately moves is the isolated helper: the parent releases
- * the guard before spawning it, the helper takes it as its own fatal precondition, and
- * the parent takes it back after reaping.  No FSManager exists anywhere in that window,
+ * the guard before spawning it, the helper takes it as its own precondition and builds
+ * nothing without it, and the parent takes it back after reaping.  No FSManager exists anywhere in that window,
  * so whenever a manager exists the process that built it is the one holding the port.
  */
 static int test_opal_iax2_containment_in_effect(void)
@@ -1238,6 +1238,74 @@ static int test_opal_iax2_containment_in_effect(void)
 	}
 
 	return test_opal_iax2_guard_acquire() == SWITCH_STATUS_SUCCESS;
+}
+
+/*
+ * Automake's skip status.  A test binary that ends with this status is recorded as SKIPPED
+ * rather than failed - 0 is a pass, 77 a skip, 99 a hard framework error - and 77 is the only
+ * non-pass outcome this tree sanctions.  No FST wrapper reaches it: fst_requires() and
+ * fst_requires_module() both expand to fct_req() (switch_test.h:149 and :154), which breaks
+ * out of the case and records a FAILURE (switch_fct.h:3668-3669), so a skip has to be the
+ * process's own exit status.
+ */
+#define TEST_OPAL_AUTOMAKE_SKIP 77
+
+/*
+ * End the run as SKIPPED because a condition this suite cannot arrange for itself is absent.
+ * Never returns.
+ *
+ * The condition it exists for is the IAX2 guard.  Containment is a socket THIS PROCESS holds
+ * on the IAX2 default UDP port, so a port already owned by something else cannot be taken
+ * however correct the code under test is; on a shared host that is a routine condition, not a
+ * defect, and failing the cases for it would report a fault that is not there.  Leaving
+ * instead of asserting keeps the two distinguishable: a red case means mod_opal misbehaved, a
+ * skip means the host could not be arranged.  It is also the safe direction, because the run
+ * stops BEFORE any FSManager is constructed, which is what keeps the wildcard IAX2 listener
+ * the containment exists to prevent from ever coming into being.
+ *
+ * _exit() rather than exit(), for the three reasons the isolated helper uses it as well: no
+ * atexit handler runs, no sanitizer at-exit leak report is produced over a core that is still
+ * up, and no core teardown is attempted - so the status the harness observes is exactly this
+ * one and nothing between here and the kernel can overwrite it.
+ *
+ * The diagnostic goes to stderr rather than only through switch_log_printf(), because the
+ * core's logger is asynchronous and a queued line is not guaranteed to have drained by the
+ * time this hands the status back.  stderr is the one stream nothing in this suite redirects.
+ * Everything buffered is flushed FIRST so that an already-queued explanation - the guard's own
+ * ERROR line, which names the port and the remedy - is not stranded behind this message.
+ */
+static void test_opal_skip_run(const char *reason)
+{
+	fflush(NULL);
+
+	fprintf(stderr, "SKIP (exit %d): mod_opal test suite: %s\n", TEST_OPAL_AUTOMAKE_SKIP,
+			reason ? reason : "an environment condition this suite cannot arrange");
+	fprintf(stderr, "SKIP (exit %d): the suite must hold UDP %s:%d itself for the whole of every case that "
+			"constructs an FSManager; release that port and run the suite again.\n",
+			TEST_OPAL_AUTOMAKE_SKIP, TEST_OPAL_GUARD_ADDRESS, (int) IAX2EndPoint::DefaultUdpPort);
+
+	fflush(stderr);
+
+	_exit(TEST_OPAL_AUTOMAKE_SKIP);
+}
+
+/*
+ * Containment or skip - what every case that constructs an FSManager calls before it does so.
+ *
+ * Returns only when this process holds the IAX2 default port.  It is deliberately not an
+ * assertion: the predicate it wraps re-establishes the containment live, so a false answer
+ * means the port is owned elsewhere, which is a property of the host rather than of the module
+ * under test.  Consulted per case, not once for the suite, so no re-ordering can leave a
+ * manager built without it.
+ */
+static void test_opal_require_containment_or_skip(void)
+{
+	if (test_opal_iax2_containment_in_effect()) {
+		return;
+	}
+
+	test_opal_skip_run("the IAX2 default UDP port could not be taken on loopback, so the containment an "
+					   "FSManager's unconditional IAX2 listener requires cannot be established");
 }
 
 /*
@@ -1805,7 +1873,8 @@ static int test_opal_exec_plan_build(test_opal_exec_plan_t * plan, const char *a
  * before the spawn so that this could succeed - and the check below confirms the socket is
  * held by THIS process rather than inferring an exclusion from somebody else's.  A helper
  * that could not take the port builds nothing and reports
- * TEST_OPAL_CHILD_NO_CONTAINMENT, which the parent surfaces as a failed case.
+ * TEST_OPAL_CHILD_NO_CONTAINMENT, which the parent turns into the run's skip verdict
+ * rather than into a failure of its subject.
  *
  * The branch is driven twice over the same manager, which makes the repeatability of the
  * failure path the property under observation and is the cheapest proof that nothing on
@@ -2261,6 +2330,12 @@ static FSManager *test_opal_module_manager(void)
  * framework re-enters the fixture suite once per declared case
  * (switch_fct.h:3507-3516), so no failure anywhere can prevent the last case from
  * running its own sweep.
+ *
+ * The one exit that does bypass this sweep needs it least.  An environmental skip
+ * leaves the process outright through test_opal_skip_run(), and everything this
+ * sweep reclaims - the provider, the log capture, the two processes, the pool and
+ * the port guard - is reclaimed by the kernel when that address space is
+ * discarded.  A skip also hands nothing to a later case, because it ends the run.
  */
 static void test_opal_suite_state_cleanup(void)
 {
@@ -2302,8 +2377,10 @@ static void test_opal_suite_state_cleanup(void)
  * bearing:
  *
  *   1. config_absent_read_config_fails - first, so its verdict cannot be an artefact of a
- *      successful parse or load having left module state behind.  It asserts both
- *      containment properties itself as fatal preconditions;
+ *      successful parse or load having left module state behind.  It checks both
+ *      containment properties itself rather than inheriting them - the plugin-path pin
+ *      fatally, the IAX2 port guard through the skip wrapper - which also makes it the
+ *      point at which an occupied port ends the run before any other case has begun;
  *   2. toolkit_side_effects_are_contained - examines those same properties in detail ahead
  *      of every other case, so the IAX2 endpoint is observed at the earliest moment it
  *      could matter;
@@ -2350,9 +2427,10 @@ FST_CORE_BEGIN("conf_opal")
 			 * outside any test body, so a failed check would have nothing to
 			 * attribute itself to.  These calls are the early installation, not
 			 * the guarantee.  The guarantee is enforced where it matters - every
-			 * case that constructs an FSManager fatally requires
-			 * test_opal_iax2_containment_in_effect(), which re-establishes the
-			 * containment live, and test_opal_acquire_process() returns NULL
+			 * case that constructs an FSManager calls
+			 * test_opal_require_containment_or_skip() first, which re-establishes
+			 * the containment live and ends the run as SKIPPED when the port
+			 * cannot be taken, and test_opal_acquire_process() returns NULL
 			 * unless the pin verifies at that instant.
 			 */
 			(void) test_opal_pin_plugin_path();
@@ -2382,6 +2460,10 @@ FST_CORE_BEGIN("conf_opal")
 		 * from fst_pool, which FST_TEARDOWN_BEGIN destroys on the way in before
 		 * this body would ever run.
 		 *
+		 * An environmental skip strands nothing at all, whatever a case was holding
+		 * when it happened: test_opal_skip_run() leaves the process, so the kernel
+		 * performs the only reclamation still required.
+		 *
 		 * A sweep here would also be actively wrong, not merely redundant: the
 		 * load case hands a loaded module, its process and its pool to the
 		 * shutdown case on purpose, and a teardown running after every case would
@@ -2404,8 +2486,9 @@ FST_CORE_BEGIN("conf_opal")
 		 * Declared first so its verdict cannot be an artefact of anything else: no
 		 * configuration has been injected, no successful parse has happened and no module
 		 * has been loaded.  Both containment properties are established by the setup hook,
-		 * which FCTX runs ahead of every case body, and both are asserted here as fatal
-		 * preconditions rather than inherited from the case that examines them in detail.
+		 * which FCTX runs ahead of every case body, and both are checked here rather than
+		 * inherited from the case that examines them in detail - the plugin-path pin as a
+		 * fatal precondition, the IAX2 port guard through the skip wrapper.
 		 *
 		 * This is the one case that cannot run in the principal process.
 		 * FSManager::ReadConfig() creates a request-parameters event unconditionally and
@@ -2488,23 +2571,27 @@ FST_CORE_BEGIN("conf_opal")
 				_exit(TEST_OPAL_CHILD_BAD_PROVENANCE);
 			}
 
-			/* Fatal preconditions, asserted in the PARENT before it spawns anything.
+			/* Preconditions established in the PARENT before it spawns anything.
 			 *
 			 * The child inherits this environment, and it is the process that brings
 			 * a PProcess up and constructs the manager, so an unpinned parent would
-			 * hand that hazard straight to it.  Asserted per case, not just once, so
-			 * no re-ordering can leave a manager built without the pin.
+			 * hand that hazard straight to it.  The pin is a fatal assertion because
+			 * it is entirely this suite's own doing - nothing outside the process can
+			 * take it away - and it is asserted per case, not just once, so no
+			 * re-ordering can leave a manager built without it.
 			 *
-			 * The containment requirement is asserted here for a different reason
-			 * than in every other case: this case builds no manager, so what it needs
-			 * to establish is not an exclusion to construct under but that the port
-			 * is takeable by this suite AT ALL before it gives the port up for the
-			 * handover below.  Proving that first is what makes the release safe:
-			 * without it, a run in which the port was permanently unavailable would
-			 * release nothing, spawn a helper that could not take it either, and
-			 * report the failure one layer further away from its cause. */
+			 * The containment is consulted here for a different reason than in every
+			 * other case: this case builds no manager, so what it needs to establish
+			 * is not an exclusion to construct under but that the port is takeable by
+			 * this suite AT ALL before it gives the port up for the handover below.
+			 * Proving that first is what makes the release safe: without it, a run in
+			 * which the port was permanently unavailable would release nothing, spawn
+			 * a helper that could not take it either, and report the outcome one layer
+			 * further away from its cause.  Being the first declared case, this is also
+			 * where an occupied port is discovered before any other case has run, and
+			 * an occupied port ends the run as SKIPPED rather than failing it. */
 			fst_requires(test_opal_plugin_path_is_pinned());
-			fst_requires(test_opal_iax2_containment_in_effect());
+			test_opal_require_containment_or_skip();
 
 			/*
 			 * NOTE what is deliberately NOT done here: the parent does not acquire a
@@ -2526,15 +2613,18 @@ FST_CORE_BEGIN("conf_opal")
 			 *
 			 * So ownership moves.  The parent has already proved the port is takeable by
 			 * this suite and releases it here; the helper's setup hook takes it, and the
-			 * helper's body requires it fatally before acquiring a PProcess or constructing
+			 * helper's body checks it before acquiring a PProcess or constructing
 			 * anything, so a helper that failed to take it reports
 			 * TEST_OPAL_CHILD_NO_CONTAINMENT and builds no manager.
 			 *
 			 * The window in which the port is free contains no manager at all: the parent
 			 * constructs none - asserted at the end of this case, where it still owns no
 			 * PTLib process - and the helper constructs one only after taking the port.  A
-			 * third party that grabs the port inside that window fails the helper's own
-			 * precondition and fails this case loudly, which is the correct outcome.
+			 * third party that grabs the port inside that window is therefore never a
+			 * safety problem, only a lost opportunity to observe: it stops the helper at
+			 * its own containment check before anything is built, and the parent turns
+			 * that verdict into a skip below rather than into a failure this suite's
+			 * subject did not cause.
 			 */
 			test_opal_iax2_guard_release();
 
@@ -2583,6 +2673,20 @@ FST_CORE_BEGIN("conf_opal")
 					   "the isolated configuration-absent check must run to completion in its own process");
 			fst_xcheck(child_signal == 0, "the isolated configuration-absent check must not be terminated by a signal");
 
+			/* An occupied port is not a verdict on the module.  A third party that took
+			 * the IAX2 default port inside the handover window stopped the helper at its
+			 * own containment check before it built anything, which says nothing about
+			 * ReadConfig() - so the run reports the Automake skip status rather than
+			 * failing a case for a condition of the host.  Placed after the two checks
+			 * above, so a helper killed at the deadline or by a signal is still a
+			 * failure, and after the ERROR line above, so the diagnosis reaches the log
+			 * first.  Every OTHER non-zero helper code stays a failure below. */
+			if (isolated == SWITCH_STATUS_SUCCESS && child_signal == 0
+				&& child_code == TEST_OPAL_CHILD_NO_CONTAINMENT) {
+				test_opal_skip_run("the isolated helper could not take the IAX2 default UDP port during the "
+								   "handover window, so it could not construct the FSManager this case observes");
+			}
+
 			fst_xcheck(child_code == TEST_OPAL_CHILD_OK,
 					   "ReadConfig() must report SWITCH_STATUS_FALSE when no opal.conf can be located");
 
@@ -2594,15 +2698,24 @@ FST_CORE_BEGIN("conf_opal")
 					   "the helper's pid-named working directory must be removed in full after a clean isolated run");
 
 			/*
-			 * THE HANDOVER COMPLETED.  Asserting this is what makes the release above
-			 * safe to have done: the port is owned by this process again, so every
-			 * case declared after this one - each of which constructs a manager -
+			 * THE HANDOVER COMPLETED.  Establishing this is what makes the release
+			 * above safe to have done: the port is owned by this process again, so
+			 * every case declared after this one - each of which constructs a manager -
 			 * inherits a real exclusion rather than a port the helper might have left
-			 * bound or a third party might have taken during the window.  It also
-			 * proves the helper left nothing behind on the port, which is a property
-			 * of the helper worth knowing independently of its verdict.
+			 * bound or a third party might have taken during the window.
+			 *
+			 * A failure to regain it cannot be the helper's doing: it has been reaped,
+			 * its address space is gone, and a UDP socket leaves no lingering state to
+			 * wait out - so the only way the port is still unavailable at this point is
+			 * that something else on the host owns it now.  That is the same condition
+			 * the guard reports everywhere else, so it ends the run as SKIPPED, and it
+			 * ends it HERE, before any case that would otherwise construct a manager
+			 * without the exclusion it needs.
 			 */
-			fst_xcheck(guard_regained, "the IAX2 port guard must be back in this process's ownership once the helper has been reaped");
+			if (!guard_regained) {
+				test_opal_skip_run("the IAX2 default UDP port could not be re-taken once the isolated helper had "
+								   "been reaped, so a later case would construct an FSManager without containment");
+			}
 
 			/* THE ISOLATION PROPERTY ITSELF.  The parent never built a manager, so
 			 * it still owns no PTLib process - which is what makes the containment
@@ -2657,7 +2770,7 @@ FST_CORE_BEGIN("conf_opal")
 			/* the plugin search path was pinned before any PProcess existed */
 			fst_requires(test_opal_plugin_path_is_pinned());
 
-			fst_requires(test_opal_iax2_containment_in_effect());
+			test_opal_require_containment_or_skip();
 
 			if (switch_find_local_ip(local_ip, sizeof(local_ip), &local_mask, AF_INET) == SWITCH_STATUS_SUCCESS
 				&& *local_ip && strcmp(local_ip, TEST_OPAL_GUARD_ADDRESS)) {
@@ -2716,10 +2829,12 @@ FST_CORE_BEGIN("conf_opal")
 			const OpalEndPoint *iax2_endpoint = NULL;
 
 			fst_requires(test_opal_acquire_process() != NULL);
-			/* Fatal precondition: the IAX2 wildcard listener must be unable to
-			 * bind before a manager is constructed.  Asserted per case, not just
-			 * once, so no re-ordering can leave a manager built without it. */
-			fst_requires(test_opal_iax2_containment_in_effect());
+			/* The IAX2 wildcard listener must be unable to bind before a manager is
+			 * constructed.  Consulted per case, not just once, so no re-ordering can
+			 * leave a manager built without it; a port this suite cannot take is a
+			 * condition of the host, so the run reports the Automake skip status
+			 * rather than failing the case. */
+			test_opal_require_containment_or_skip();
 
 			{
 				FSManager manager;
@@ -2787,10 +2902,12 @@ FST_CORE_BEGIN("conf_opal")
 			switch_status_t status = SWITCH_STATUS_FALSE;
 
 			fst_requires(test_opal_acquire_process() != NULL);
-			/* Fatal precondition: the IAX2 wildcard listener must be unable to
-			 * bind before a manager is constructed.  Asserted per case, not just
-			 * once, so no re-ordering can leave a manager built without it. */
-			fst_requires(test_opal_iax2_containment_in_effect());
+			/* The IAX2 wildcard listener must be unable to bind before a manager is
+			 * constructed.  Consulted per case, not just once, so no re-ordering can
+			 * leave a manager built without it; a port this suite cannot take is a
+			 * condition of the host, so the run reports the Automake skip status
+			 * rather than failing the case. */
+			test_opal_require_containment_or_skip();
 			fst_requires(test_opal_bind_config_document(TEST_OPAL_CONFIG_XML_SETTINGS) == SWITCH_STATUS_SUCCESS);
 
 			{
@@ -2863,10 +2980,12 @@ FST_CORE_BEGIN("conf_opal")
 			switch_status_t armed = SWITCH_STATUS_FALSE;
 
 			fst_requires(test_opal_acquire_process() != NULL);
-			/* Fatal precondition: the IAX2 wildcard listener must be unable to
-			 * bind before a manager is constructed.  Asserted per case, not just
-			 * once, so no re-ordering can leave a manager built without it. */
-			fst_requires(test_opal_iax2_containment_in_effect());
+			/* The IAX2 wildcard listener must be unable to bind before a manager is
+			 * constructed.  Consulted per case, not just once, so no re-ordering can
+			 * leave a manager built without it; a port this suite cannot take is a
+			 * condition of the host, so the run reports the Automake skip status
+			 * rather than failing the case. */
+			test_opal_require_containment_or_skip();
 
 			/* Half one: a <listener> with no name attribute takes the default. */
 			bound = test_opal_bind_config_document(TEST_OPAL_CONFIG_XML_UNNAMED_LISTENER);
@@ -3030,10 +3149,12 @@ FST_CORE_BEGIN("conf_opal")
 			switch_status_t pooled = SWITCH_STATUS_FALSE;
 
 			fst_requires(test_opal_acquire_process() != NULL);
-			/* Fatal precondition: the IAX2 wildcard listener must be unable to
-			 * bind before a manager is constructed.  Asserted per case, not just
-			 * once, so no re-ordering can leave a manager built without it. */
-			fst_requires(test_opal_iax2_containment_in_effect());
+			/* The IAX2 wildcard listener must be unable to bind before a manager is
+			 * constructed.  Consulted per case, not just once, so no re-ordering can
+			 * leave a manager built without it; a port this suite cannot take is a
+			 * condition of the host, so the run reports the Automake skip status
+			 * rather than failing the case. */
+			test_opal_require_containment_or_skip();
 
 			bound = test_opal_bind_config();
 			fst_xcheck(bound == SWITCH_STATUS_SUCCESS,
@@ -3141,10 +3262,12 @@ FST_CORE_BEGIN("conf_opal")
 		 * It opens by proving that the case before it left no configuration
 		 * provider registered.  The framework re-enters the fixture suite once per
 		 * declared case and a fatal check only breaks the body it appears in, so
-		 * this case always runs even when an earlier one exited early - which makes
-		 * it the right place to state that invariant, and the only place a
-		 * regression that orphaned a binding would be caught by name rather than
-		 * silently answering some later lookup.
+		 * this case always runs even when an earlier one exited early - the sole
+		 * exception being an environmental skip, which ends the process and so
+		 * leaves no binding behind for anything to find.  That makes this the right
+		 * place to state the invariant, and the only place a regression that
+		 * orphaned a binding would be caught by name rather than silently answering
+		 * some later lookup.
 		 *
 		 * And it closes with the suite's sweep, unconditionally.  Every
 		 * precondition here is therefore non-fatal with a guarded dereference: the
@@ -3218,12 +3341,14 @@ FST_CORE_BEGIN("conf_opal")
 			 *
 			 * Nothing above it is fatal, so this runs on every path through the
 			 * case, and because it is the last declared case it runs even when an
-			 * earlier case exited early.  It reclaims everything that can outlive a
-			 * single case - the provider, the log capture, the module's process, the
-			 * suite's own process and the module-lifetime pool - in the one order
-			 * that is safe, and each step is idempotent, so repeating work the case
-			 * has already done above costs nothing.  Shutdown was the last thing to
-			 * touch pool-backed module state, which is why the pool goes last.
+			 * earlier case exited early; only an environmental skip bypasses it,
+			 * and that discards the address space instead of leaving state behind.
+			 * It reclaims everything that can outlive a single case - the provider,
+			 * the log capture, the module's process, the suite's own process and the
+			 * module-lifetime pool - in the one order that is safe, and each step is
+			 * idempotent, so repeating work the case has already done above costs
+			 * nothing.  Shutdown was the last thing to touch pool-backed module
+			 * state, which is why the pool goes last.
 			 *
 			 * The three checks that follow are the positive statement that the suite
 			 * exits owning nothing: no PTLib process, no module pool, and - already

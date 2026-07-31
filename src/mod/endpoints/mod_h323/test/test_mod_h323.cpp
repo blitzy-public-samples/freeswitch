@@ -220,9 +220,13 @@ static void fst_h323_record_string(char *dst, switch_size_t size, const PString 
  * GetGatekeeper() unconditionally (mod_h323.cpp:684-685), and this double registers
  * nothing, so GetGatekeeper() is NULL and TRUE would segfault.  FALSE enters the
  * loop, whose first m_stop_gk check returns cleanly (mod_h323.cpp:671-674) -- before
- * any h_timer() sleep, before RemoveGatekeeper(), and before that dereference.  The
- * default arguments reproduce h323ep.h:354-358 so every call shape the production
- * code may use still compiles.
+ * any h_timer() sleep, before RemoveGatekeeper(), and before that dereference.
+ *
+ * The default arguments cover the second and third parameters only, where the real
+ * declaration defaults all three (h323ep.h:354-358).  The asymmetry costs nothing,
+ * because the sole call site passes all three arguments (mod_h323.cpp:664): every
+ * call shape the production code actually uses still compiles, and an address-less
+ * request has nothing for this double to record.
  */
 static PBoolean fst_h323_use_gatekeeper(const PString & address, const PString & identifier = PString::Empty(),
 										const PString & localAddress = PString::Empty())
@@ -1915,13 +1919,13 @@ static switch_status_t fst_h323_run_readconfig_isolated(const char *argv0, int *
  * a second directory behind; removing it means the run leaves exactly the one directory
  * a single-core suite leaves.
  *
- * The contents are known and small: FST_CORE_BEGIN passes no SCF_USE_SQL
- * (switch_test.h:313-314), so no database is opened and the only artefact is the
- * preprocessed configuration the XML reader writes as "<conf-file>.fsxml", with a
- * sibling ".tmp" should a write have been interrupted (src/switch_xml.c:1743-1748).  Both
- * names are removed explicitly and then the directory itself, so the cleanup is bounded
- * by name rather than recursive -- anything unexpected keeps the directory alive and
- * visible.
+ * The contents are known and small: FST_CORE_BEGIN passes no SCF_USE_SQL - that is
+ * FST_CORE_DB_BEGIN, the variant this suite does not use (switch_test.h:315-316) - so no
+ * database is opened and the only artefact is the preprocessed configuration the XML
+ * reader writes as "<conf-file>.fsxml", with a sibling ".tmp" should a write have been
+ * interrupted (src/switch_xml.c:1743-1748).  Both names are removed explicitly and then
+ * the directory itself, so the cleanup is bounded by name rather than recursive --
+ * anything unexpected keeps the directory alive and visible.
  *
  * It runs only when the helper reported success; on any other outcome those files are the
  * primary evidence for what went wrong, so they are preserved and the caller reports
@@ -2114,9 +2118,18 @@ static void fst_h323_module_pool_destroy(void)
  * test body (fct_req expands to `if (!ok) { break; }`, switch_fct.h:3668-3669), and FCTX
  * re-enters the whole fixture-suite body once per declared case, running only the case
  * whose number matches (switch_fct.h:3507-3516).  So a fatal check in one case can skip
- * that case's own tail but never a later case -- which is why the last case is a
- * dependable safety net, and why no case may make a fatal check after mutating state
- * that outlives it.
+ * that case's own tail but never a later case, which is why the last case is a dependable
+ * safety net.
+ *
+ * Two properties of the cases as written bound what such a skipped tail can leave behind,
+ * and both hold by construction rather than by convention.  First, no fatal check stands
+ * between a SUCCESSFUL bind and its matching unbind: where a bind is itself the subject of
+ * a fatal check, that check can only break when the bind failed, and a failed bind
+ * registers nothing, so no case can strand a provider for a later one to trip over.
+ * Second, the state a fatal check CAN strand is the shared PProcess - the gk-address-empty
+ * and codec-prefs cases each acquire it and only then check the module interface fatally -
+ * and releasing exactly that is what this sweep is for.  The sweep is always reached,
+ * because the last declared case makes no fatal check at all.
  *
  * Order is load-bearing: unbind the provider first, so nothing that follows can trigger
  * a configuration lookup that re-enters it; shut the module down next, since that is the
