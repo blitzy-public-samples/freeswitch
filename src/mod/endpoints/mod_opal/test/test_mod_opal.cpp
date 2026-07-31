@@ -120,8 +120,9 @@
  * opens a random port or depends on the wall clock.
  *
  * Threads, stated as two separate facts because they are two separate things.
- * mod_opal declares no FreeSWITCH runtime entry point - it passes NULL as the
- * third argument to SWITCH_MODULE_DEFINITION (mod_opal.cpp:100) - so no case
+ * mod_opal declares no FreeSWITCH runtime entry point - SWITCH_MODULE_DEFINITION
+ * takes (name, load, shutdown, runtime) (switch_types.h:2650) and
+ * mod_opal.cpp:100 passes NULL as that fourth (runtime) argument - so no case
  * here can start a module runtime thread, because there is none to start.  The
  * OPAL toolkit is a separate matter, and it does start threads of its own:
  *
