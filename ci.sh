@@ -69,7 +69,14 @@ configure_freeswitch()
 				-e '/applications\/mod_http_cache/s/^#//g' \
 				-e '/formats\/mod_opusfile/s/^#//g' \
 				-e '/languages\/mod_lua/s/^#//g' \
+				-e '/xml_int\/mod_xml_curl/s/^#//g' \
 				modules.conf
+
+			# Enable optional endpoint modules only when their toolkit is present,
+			# so an absent H.323/OPAL toolkit leaves them disabled rather than
+			# failing the build
+			pkg-config --exists opal && sed -i -e '/endpoints\/mod_opal/s/^#//g' modules.conf
+			pkg-config --exists ptlib && sed -i -e '/endpoints\/mod_h323/s/^#//g' modules.conf
 
 			export ASAN_OPTIONS=log_path=stdout:disable_coredump=0:unmap_shadow_on_exit=1:fast_unwind_on_malloc=0
 
