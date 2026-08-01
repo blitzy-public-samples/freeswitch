@@ -265,6 +265,21 @@ static void fst_xc_uuid_format(char *buffer, const switch_uuid_t *uuid);
 #define FST_XC_TEMP_CANARY "canary"
 
 /*
+ * Cookie jar paths used by the case that drives the jar safety gate.  One name per
+ * shape the gate has to tell apart, because the gate's answer depends on what the
+ * name already is: nothing at all, a private regular file of ours, a symlink, a
+ * file other users can write, or a file belonging to somebody else.
+ */
+#define FST_XC_TEMP_COOKIE_NEW "cookiejar-new"
+#define FST_XC_TEMP_COOKIE_KEEP "cookiejar-keep"
+#define FST_XC_TEMP_COOKIE_LINK "cookiejar-link"
+#define FST_XC_TEMP_COOKIE_LOOSE "cookiejar-loose"
+#define FST_XC_TEMP_COOKIE_ALIEN "cookiejar-alien"
+
+/* Directory fixture used to drive the gate's rule about the directory holding a jar. */
+#define FST_XC_TEMP_COOKIE_DIR "cookiejar-dir"
+
+/*
  * -------------------------------------------------------------------------
  * PRIVATE PER-CASE TEMPORARY DIRECTORY
  * -------------------------------------------------------------------------
@@ -370,7 +385,8 @@ static int fst_xc_temp_dir_destroy(void)
 {
 	static const char *names[] = {
 		FST_XC_TEMP_BODY, FST_XC_TEMP_XML, FST_XC_TEMP_DIRECTORY_XML, FST_XC_TEMP_DIALPLAN_XML, FST_XC_TEMP_RESPONSE_XML,
-		FST_XC_TEMP_CANARY, NULL
+		FST_XC_TEMP_COOKIE_LINK, FST_XC_TEMP_CANARY, FST_XC_TEMP_COOKIE_NEW, FST_XC_TEMP_COOKIE_KEEP, FST_XC_TEMP_COOKIE_LOOSE,
+		FST_XC_TEMP_COOKIE_ALIEN, NULL
 	};
 	char path[1024] = "";
 	char entry[256] = "";
@@ -1474,6 +1490,34 @@ static const char fst_xc_conf_template[] =
 	"</document>";
 
 /*
+ * The xml_curl.conf injected for the binding-notice confidentiality case.
+ *
+ * One binding, and a gateway URL that plants the same token in all three places a
+ * real provisioning URL carries a secret: the userinfo password, a path segment and
+ * a query value.  A single token in three positions is deliberately stronger than
+ * three separate ones, because one absence assertion then covers every position at
+ * once, and any one of them reaching a log line trips it.
+ *
+ * The authority is a loopback address and a port nothing listens on.  do_config()
+ * only records the URL and registers the binding, so nothing is ever contacted; the
+ * distinctive port is there to be recognised in the redacted rendering, which is
+ * what proves the notice still identifies the gateway it registered.
+ */
+static const char fst_xc_notice_conf[] =
+	"<document type=\"freeswitch/xml\">"
+	"<section name=\"configuration\">"
+	"<configuration name=\"xml_curl.conf\" description=\"cURL XML Gateway\">"
+	"<bindings>"
+	"<binding name=\"notice_binding\">"
+	"<param name=\"gateway-url\" value=\"http://provisioner:n0t1ce-canary@127.0.0.1:19011/tenants/n0t1ce-canary/directory"
+	"?apikey=n0t1ce-canary\" bindings=\"directory\"/>"
+	"</binding>"
+	"</bindings>"
+	"</configuration>"
+	"</section>"
+	"</document>";
+
+/*
  * The two documents those bindings resolve to.  Both are written out by the case
  * rather than read from the tree, and both are deliberately free of anything the
  * configuration preprocessor removes -- it deletes every whole line holding
@@ -1688,6 +1732,72 @@ static void fst_xc_unlink_preprocessed(void)
 
 	switch_snprintf(path, sizeof(path), "%s%s%s.tmp.xml.fsxml", SWITCH_GLOBAL_dirs.log_dir, SWITCH_PATH_SEPARATOR, fst_xc_transport.last_uuid);
 	unlink(path);
+}
+
+/*
+ * -------------------------------------------------------------------------
+ * COUNTING WHAT ONE CALL LOGS
+ * -------------------------------------------------------------------------
+ * The two confidentiality cases at the tail of the suite do not drive a fetch, so
+ * they cannot use the protocol above -- but the ordering that protocol depends on is
+ * the same, and just as load-bearing: drain, watch, arm, act, drain again, read,
+ * disarm.  One wrapper per subject keeps that order in a single place instead of
+ * repeating it at every sub-case, and keeps each sub-case down to the two lines that
+ * say what it is actually asserting.
+ *
+ * Both return how many log lines the call emitted that contain the needle, or -1 when
+ * a barrier did not complete -- which the caller reports, rather than reading counters
+ * the log thread may not have finished writing.  The watch is cleared on the way out
+ * so that a following window cannot inherit it, and the call's own result is handed
+ * back through the out-parameter so that "it logged nothing" and "it did nothing" can
+ * never be confused for one another.
+ */
+static int fst_xc_count_config_log(const char *needle, switch_status_t *status)
+{
+	int hits = -1;
+
+	if (!fst_xc_log_barrier()) {
+		*status = SWITCH_STATUS_FALSE;
+		return -1;
+	}
+
+	fst_xc_log_watch_absent(needle);
+	fst_xc_log_arm();
+
+	*status = do_config();
+
+	if (fst_xc_log_barrier()) {
+		hits = fst_xc_log_count(FST_XC_LOG_IDX_ABSENT);
+	}
+
+	fst_xc_log_disarm();
+	fst_xc_log_watch_absent(NULL);
+
+	return hits;
+}
+
+static int fst_xc_count_jar_log(const char *needle, const char *path, const char *url, int *accepted)
+{
+	int hits = -1;
+
+	if (!fst_xc_log_barrier()) {
+		*accepted = -1;
+		return -1;
+	}
+
+	fst_xc_log_watch_absent(needle);
+	fst_xc_log_arm();
+
+	*accepted = xml_curl_cookie_jar_is_usable(path, url);
+
+	if (fst_xc_log_barrier()) {
+		hits = fst_xc_log_count(FST_XC_LOG_IDX_ABSENT);
+	}
+
+	fst_xc_log_disarm();
+	fst_xc_log_watch_absent(NULL);
+
+	return hits;
 }
 
 FST_CORE_BEGIN("conf")
@@ -3716,8 +3826,10 @@ FST_CORE_BEGIN("conf")
 		FST_TEST_END()
 
 		/*
-		 * Declared last: this is the only case that mutates module-wide state, so
-		 * nothing that runs after it can be affected by what it leaves behind.
+		 * Declared at the tail of the suite, together with the binding-notice case
+		 * below: these two are the only cases that mutate module-wide state, and each
+		 * releases it again before it returns, so nothing that runs after them can be
+		 * affected by what they leave behind.
 		 */
 		FST_TEST_BEGIN(response_format_configuration_parsing)
 		{
@@ -3891,6 +4003,295 @@ FST_CORE_BEGIN("conf")
 			fst_check(switch_xml_unbind_search_function_ptr(fst_xc_conf_search) == SWITCH_STATUS_SUCCESS);
 			fst_check(mod_xml_curl_shutdown() == SWITCH_STATUS_SUCCESS);
 			fst_xc_module_state_cleanup();
+		}
+		FST_TEST_END()
+
+		/*
+		 * The notice do_config() writes once per registered binding must not persist the
+		 * gateway URL verbatim.
+		 *
+		 * A provisioning URL routinely carries a secret: an HTTP userinfo password, a
+		 * tenant token in a path segment, an API key in the query.  This notice is written
+		 * as the module loads and then stays in the log for as long as the log is kept, so
+		 * an unredacted rendering is a durable disclosure of a live credential to everyone
+		 * who can read the log -- and rotating the credential afterwards does not undo it.
+		 *
+		 * Two passes over the same one-binding configuration, because an absence assertion
+		 * on its own would also be satisfied by a notice that said nothing at all.  The
+		 * first pass asserts the exact redacted rendering is present, which proves the
+		 * notice is still emitted and still names the gateway that was registered; the
+		 * second asserts the planted token is absent from every line the same call
+		 * produced.  Only the two together are the property being claimed.
+		 *
+		 * The recorded binding count is asserted in each pass as well.  It is incremented
+		 * where do_config() hands the binding to the core, immediately above the notice, so
+		 * a run that never got that far cannot be mistaken for a clean one.
+		 *
+		 * A barrier that did not complete makes the helper return -1, which fails the
+		 * comparison that follows it, so an unread log queue cannot pass unnoticed either.
+		 */
+		FST_TEST_BEGIN(log_hygiene_binding_notice_redacts_gateway_url)
+		{
+			static const char canary[] = "n0t1ce-canary";
+			static const char rendered[] = "http://[redacted]@127.0.0.1:19011/[redacted]";
+			switch_status_t status = SWITCH_STATUS_FALSE;
+			int hits = 0;
+
+			fst_requires(fst_xc_log_capture_start());
+
+			/*
+			 * Neither pass is written as a loop iteration on purpose.  fst_requires()
+			 * abandons a case body with break, so inside a loop it would leave the loop
+			 * rather than the case and everything after it would still run.
+			 *
+			 * Pass one: the redacted rendering is present exactly once.
+			 */
+			fst_xc_module_conf = strdup(fst_xc_notice_conf);
+			fst_requires(fst_xc_module_conf != NULL);
+			fst_requires(fst_xc_module_pool_create());
+			fst_xcheck(switch_xml_bind_search_function_ret(fst_xc_conf_search, switch_xml_parse_section_string("configuration"),
+														   (void *) fst_xc_module_conf, NULL) == SWITCH_STATUS_SUCCESS,
+					   "the configuration provider must register");
+
+			/* every assertion from here to the release below is non-fatal: module-wide
+			   state has been lent out, and the release has to be reached */
+			fst_xc_observed_binding_count = 0;
+			hits = fst_xc_count_config_log(rendered, &status);
+
+			fst_xcheck(hits >= 0, "the log queue must drain before the counters are read");
+			fst_xcheck(status == SWITCH_STATUS_SUCCESS, "the configuration carrying the canary URL must parse");
+			fst_check_int_equals(fst_xc_observed_binding_count, 1);
+			fst_xcheck(hits == 1, "the notice must still identify the gateway by scheme and authority, with the rest redacted");
+
+			fst_xc_module_state_cleanup();
+
+			/* Pass two: no part of the URL beyond the authority reaches any line. */
+			fst_xc_module_conf = strdup(fst_xc_notice_conf);
+			fst_requires(fst_xc_module_conf != NULL);
+			fst_requires(fst_xc_module_pool_create());
+			fst_xcheck(switch_xml_bind_search_function_ret(fst_xc_conf_search, switch_xml_parse_section_string("configuration"),
+														   (void *) fst_xc_module_conf, NULL) == SWITCH_STATUS_SUCCESS,
+					   "the configuration provider must register a second time");
+
+			fst_xc_observed_binding_count = 0;
+			hits = fst_xc_count_config_log(canary, &status);
+
+			fst_xcheck(status == SWITCH_STATUS_SUCCESS, "the configuration carrying the canary URL must parse again");
+			fst_check_int_equals(fst_xc_observed_binding_count, 1);
+			fst_xcheck(hits == 0, "the userinfo, the path and the query of a gateway URL must never reach a log line");
+
+			fst_xc_module_state_cleanup();
+
+			fst_xcheck(fst_xc_log_capture_stop(), "the counting logger must unbind and release cleanly");
+		}
+		FST_TEST_END()
+
+		/*
+		 * A cookie jar is opened for writing by libcurl and rewritten after every lookup,
+		 * so the name the configuration supplies decides what gets overwritten.  The gate
+		 * in front of it has to tell five shapes apart, and this case drives all five
+		 * directly -- the two setopt calls it guards are interposed in this translation
+		 * unit, so what a jar is has to be asserted at the gate rather than through it.
+		 *
+		 * The refusals are the security property: a symlink must not be written through, a
+		 * directory or special file must not be opened at all, a file other users can write
+		 * must not be trusted, and a file belonging to somebody else must not be touched.
+		 * The acceptances are what keeps the property from being achieved by refusing
+		 * everything: an ordinary private jar of ours still works, and one that does not
+		 * exist yet is still created -- for this user alone, under a permissive umask, which
+		 * is the condition under which a jar created with the process default would be
+		 * world readable.
+		 *
+		 * Every refusal is also asserted to be diagnosable and to disclose nothing: the
+		 * warning is counted, the URL it names is checked for the planted token, and then
+		 * checked for the authority so that "logged nothing" cannot satisfy the absence.
+		 *
+		 * The umask is changed around one call only, and restored immediately: it is
+		 * process-wide, and the point of setting it is that the mode asserted afterwards
+		 * can then only have come from the gate's own open().
+		 */
+		FST_TEST_BEGIN(cookie_jar_path_is_validated)
+		{
+			static const char url[] = "http://provisioner:j4r-canary@127.0.0.1:19012/tenants/j4r-canary/directory?apikey=j4r-canary";
+			static const char refusal[] = "Refusing cookie file";
+			static const char reason_type[] = "it is not a regular file";
+			static const char reason_owner[] = "it belongs to another user";
+			static const char reason_mode[] = "other users can write it";
+			static const char reason_dir[] = "the directory holding it is writable by other users and not sticky";
+			char jar[1024] = "";
+			char canary[1024] = "";
+			char shared[1024] = "";
+			struct stat st;
+			mode_t saved_umask = 0;
+			int accepted = -1;
+			int hits = 0;
+			int fd = -1;
+
+			fst_requires(fst_xc_log_capture_start());
+
+			/* a jar that does not exist yet is created, and created for this user only */
+			fst_xc_temp_path(FST_XC_TEMP_COOKIE_NEW, jar, sizeof(jar));
+			saved_umask = umask(0022);
+			hits = fst_xc_count_jar_log(refusal, jar, url, &accepted);
+			umask(saved_umask);
+
+			fst_xcheck(hits >= 0, "the log queue must drain before the counters are read");
+			fst_xcheck(accepted == 1, "a jar that does not exist yet must be usable");
+			fst_check_int_equals(hits, 0);
+
+			/*
+			 * Every observation of a jar below is guarded rather than required.  A gate that
+			 * accepted a name without creating it would leave the stat buffer unset, so the
+			 * checks cannot simply run; but abandoning the case here would also hide the
+			 * refusals further down, and a single run should name every property that broke.
+			 */
+			if (lstat(jar, &st) == 0) {
+				fst_xcheck(S_ISREG(st.st_mode), "the created jar must be a regular file");
+				fst_check_int_equals((int) (st.st_mode & 0777), (int) (S_IRUSR | S_IWUSR));
+			} else {
+				fst_fail("a jar the gate reported usable must exist afterwards");
+			}
+
+			/* an ordinary private jar of ours is accepted, and left exactly as it was */
+			fst_xc_temp_path(FST_XC_TEMP_COOKIE_KEEP, jar, sizeof(jar));
+			fst_requires(fst_xc_write_file(jar, "jar", 3));
+			hits = fst_xc_count_jar_log(refusal, jar, url, &accepted);
+
+			fst_xcheck(accepted == 1, "an existing private jar of ours must be usable");
+			fst_check_int_equals(hits, 0);
+
+			if (lstat(jar, &st) == 0) {
+				fst_check_int_equals((int) st.st_size, 3);
+				fst_check_int_equals((int) (st.st_mode & 0777), (int) (S_IRUSR | S_IWUSR));
+			} else {
+				fst_fail("an existing jar must not be removed by the check that accepted it");
+			}
+
+			/* a symlink is refused, it is left in place, and its target keeps its contents */
+			fst_xc_temp_path(FST_XC_TEMP_CANARY, canary, sizeof(canary));
+			fst_requires(fst_xc_write_file(canary, "untouched", 9));
+			fst_xc_temp_path(FST_XC_TEMP_COOKIE_LINK, jar, sizeof(jar));
+			fst_requires(symlink(canary, jar) == 0);
+			hits = fst_xc_count_jar_log(reason_type, jar, url, &accepted);
+
+			fst_xcheck(accepted == 0, "a jar that is a symlink must be refused");
+			fst_check_int_equals(hits, 1);
+
+			if (lstat(jar, &st) == 0) {
+				fst_xcheck(S_ISLNK(st.st_mode), "the planted symlink must be left as it was, not replaced by a regular file");
+			} else {
+				fst_fail("the planted symlink must still be there");
+			}
+
+			if ((fd = open(canary, O_RDONLY, 0)) > -1) {
+				char buf[64] = "";
+				switch_ssize_t got = read(fd, buf, sizeof(buf) - 1);
+
+				close(fd);
+				fst_check_int_equals((int) got, 9);
+				fst_xcheck(!strcmp(buf, "untouched"), "the symlink target must be untouched");
+			} else {
+				fst_fail("the symlink target must still be readable");
+			}
+
+			/*
+			 * The same refusal, twice more: the warning must not carry the token planted in
+			 * the URL's userinfo, path and query, and it must still carry the authority --
+			 * otherwise a warning that named nothing would satisfy the absence on its own.
+			 */
+			hits = fst_xc_count_jar_log("j4r-canary", jar, url, &accepted);
+			fst_check_int_equals(accepted, 0);
+			fst_xcheck(hits == 0, "a refusal must not disclose any part of the gateway URL beyond its authority");
+
+			hits = fst_xc_count_jar_log("127.0.0.1:19012", jar, url, &accepted);
+			fst_check_int_equals(accepted, 0);
+			fst_xcheck(hits == 1, "a refusal must still say which binding it applies to");
+
+			/*
+			 * A directory is refused as an entry in its own right.  It is created private and
+			 * inside this case's own directory so that the rule about the directory *holding*
+			 * a jar cannot fire first and make this sub-case pass for the wrong reason -- which
+			 * is why each refusal below names the rule it expects rather than merely counting
+			 * warnings.
+			 */
+			fst_xc_temp_path(FST_XC_TEMP_COOKIE_DIR, shared, sizeof(shared));
+			fst_requires(switch_dir_make(shared, SWITCH_FPROT_UREAD | SWITCH_FPROT_UWRITE | SWITCH_FPROT_UEXECUTE, NULL)
+						 == SWITCH_STATUS_SUCCESS);
+			hits = fst_xc_count_jar_log(reason_type, shared, url, &accepted);
+
+			fst_xcheck(accepted == 0, "a jar that is a directory must be refused");
+			fst_check_int_equals(hits, 1);
+			fst_xcheck(rmdir(shared) == 0, "the directory fixture must be removable");
+
+			/* a jar other users can write is refused, however it came to be that way */
+			fst_xc_temp_path(FST_XC_TEMP_COOKIE_LOOSE, jar, sizeof(jar));
+			fst_requires(fst_xc_write_file(jar, "jar", 3));
+			fst_requires(chmod(jar, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH) == 0);
+			hits = fst_xc_count_jar_log(reason_mode, jar, url, &accepted);
+
+			fst_xcheck(accepted == 0, "a jar other users can write must be refused");
+			fst_check_int_equals(hits, 1);
+
+			/*
+			 * A jar belonging to somebody else is refused.  Only a run that can create one
+			 * can observe this, which is to say a run with an effective uid of zero; the
+			 * branch is skipped rather than faked otherwise, because a fake owner would
+			 * assert the test's own arithmetic instead of the gate's.
+			 */
+			if (geteuid() == 0) {
+				fst_xc_temp_path(FST_XC_TEMP_COOKIE_ALIEN, jar, sizeof(jar));
+				fst_xcheck(fst_xc_write_file(jar, "jar", 3) == 1, "the foreign-owner fixture must be created");
+				fst_xcheck(chown(jar, (uid_t) 65534, (gid_t) 65534) == 0, "the foreign-owner fixture must change hands");
+				hits = fst_xc_count_jar_log(reason_owner, jar, url, &accepted);
+
+				fst_xcheck(accepted == 0, "a jar belonging to another user must be refused");
+				fst_check_int_equals(hits, 1);
+			}
+
+			/*
+			 * A jar in a directory other users can write without the sticky bit is refused
+			 * whatever the entry itself looks like, because there the name can be renamed
+			 * away and re-created between the check and libcurl's open.  The directory is
+			 * created inside this case's private one, so no other user can actually reach
+			 * it; the mode bits alone are what the gate reads, which is what makes the
+			 * outcome deterministic.  It is removed here rather than by the teardown sweep,
+			 * which removes files and would report a directory as residue -- and would
+			 * report it for real if the gate had created the jar inside it after all.
+			 */
+			fst_requires(switch_dir_make(shared, SWITCH_FPROT_UREAD | SWITCH_FPROT_UWRITE | SWITCH_FPROT_UEXECUTE, NULL)
+						 == SWITCH_STATUS_SUCCESS);
+			fst_requires(chmod(shared, 0777) == 0);
+			switch_snprintf(jar, sizeof(jar), "%s%s%s", shared, SWITCH_PATH_SEPARATOR, FST_XC_TEMP_COOKIE_NEW);
+			hits = fst_xc_count_jar_log(reason_dir, jar, url, &accepted);
+
+			fst_xcheck(accepted == 0, "a jar whose directory would let the name be replaced must be refused");
+			fst_check_int_equals(hits, 1);
+			fst_xcheck(lstat(jar, &st) != 0, "a refused jar must not have been created");
+			fst_xcheck(rmdir(shared) == 0, "the shared-directory fixture must be removable, so nothing was created inside it");
+
+			/* the same directory with the sticky bit set is usable again, which is what keeps
+			   the rule above from being an outright ban on shared directories */
+			fst_requires(switch_dir_make(shared, SWITCH_FPROT_UREAD | SWITCH_FPROT_UWRITE | SWITCH_FPROT_UEXECUTE, NULL)
+						 == SWITCH_STATUS_SUCCESS);
+			fst_requires(chmod(shared, 01777) == 0);
+			hits = fst_xc_count_jar_log(refusal, jar, url, &accepted);
+
+			fst_xcheck(accepted == 1, "a sticky shared directory must not defeat an otherwise private jar");
+			fst_check_int_equals(hits, 0);
+			fst_xcheck(unlink(jar) == 0, "the jar created in the sticky fixture must be removable");
+			fst_xcheck(rmdir(shared) == 0, "the sticky-directory fixture must be removable");
+
+			/*
+			 * An empty path is refused without a diagnostic.  The fetch path cannot reach
+			 * the gate with one -- the member is only set from a parameter that carried a
+			 * value -- so a warning here would be noise about a configuration that does not
+			 * exist, and the caller's own guard is what makes the answer observable.
+			 */
+			hits = fst_xc_count_jar_log(refusal, "", url, &accepted);
+			fst_xcheck(accepted == 0, "an empty jar path must be refused");
+			fst_check_int_equals(hits, 0);
+
+			fst_xcheck(fst_xc_log_capture_stop(), "the counting logger must unbind and release cleanly");
 		}
 		FST_TEST_END()
 

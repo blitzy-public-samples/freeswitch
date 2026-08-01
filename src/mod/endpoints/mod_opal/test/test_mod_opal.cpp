@@ -2076,7 +2076,6 @@ static switch_status_t test_opal_run_readconfig_isolated(const char *argv0, int 
 
 	if (devnull >= 0) {
 		close(devnull);
-		devnull = -1;
 	}
 
 	/* The child inherited the read end across the exec - a pipe descriptor is not

@@ -69,6 +69,8 @@ h323_toolkit_available()
 	local -a flags=(-I/usr/include/openh323 -DPTRACING=1 -D_REENTRANT -fno-exceptions)
 	local probe_dir
 	local status=1
+	local libdir
+	local linked
 
 	pkg-config --exists ptlib || return 1
 
@@ -88,6 +90,54 @@ h323_toolkit_available()
 	if "${compiler[@]}" "${flags[@]}" "$probe_dir/probe.cpp" -o "$probe_dir/probe" \
 		-L/usr/lib -lopenh323 -lpt -lrt > /dev/null 2>&1; then
 		status=0
+
+		# CVE-2013-1864: PTLib's PXML parser expanded internal entities with no
+		# ceiling before 2.10.10, so a "billion laughs" document makes any consumer
+		# allocate until it is killed.  The check below is behavioural instead of a
+		# version comparison, because a version comparison is wrong in both
+		# directions here: distributions and vendors backport the fix without
+		# renaming the library, and a .pc file can advertise a version that is not
+		# the one the loader resolves.  Asking the library to honour a deliberately
+		# tiny entity ceiling answers the only question that matters, and answers it
+		# with a benign document rather than a hostile one.
+		libdir=$(pkg-config --variable=libdir ptlib 2> /dev/null)
+
+		cat > "$probe_dir/entity.cpp" <<- 'PROBE'
+			#include <ptlib.h>
+			#include <ptclib/pxml.h>
+			int main(void)
+			{
+			  PXML xml;
+			  xml.SetMaxEntityLength(8);
+			  /* Four expansions of a ten character entity are far past a ceiling of
+			     eight, so a library that bounds expansion has to refuse this document.
+			     One with no ceiling parses it and reports success, which is the
+			     vulnerable behaviour. */
+			  return xml.Load(PString("<?xml version='1.0'?><!DOCTYPE d [<!ENTITY e '0123456789'>]><d>&e;&e;&e;&e;</d>")) ? 1 : 0;
+			}
+		PROBE
+
+		if ! "${compiler[@]}" "${flags[@]}" "$probe_dir/entity.cpp" -o "$probe_dir/entity" \
+			-L/usr/lib -lpt -lrt > /dev/null 2>&1; then
+			echo "ci.sh: the PTLib being linked exposes no XML entity ceiling, so CVE-2013-1864 cannot be ruled out; endpoints/mod_h323 stays disabled" >&2
+			status=1
+		elif ! LD_LIBRARY_PATH="$libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" timeout 60 "$probe_dir/entity" > /dev/null 2>&1; then
+			echo "ci.sh: the PTLib being linked ignores its XML entity ceiling (CVE-2013-1864); endpoints/mod_h323 stays disabled" >&2
+			status=1
+		fi
+
+		# The advisory is about the library that is actually loaded, so record which
+		# libpt this link resolved and refuse a linkage that cannot be established:
+		# an unverifiable linkage cannot be cleared of the advisory either.
+		linked=$(LD_LIBRARY_PATH="$libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ldd "$probe_dir/probe" 2> /dev/null |
+			sed -n 's|^[[:space:]]*libpt\.so[^[:space:]]*[[:space:]]*=>[[:space:]]*\(/[^[:space:]]*\).*|\1|p')
+
+		if [ -z "$linked" ]; then
+			echo "ci.sh: cannot establish which libpt endpoints/mod_h323 would load; it stays disabled" >&2
+			status=1
+		elif [ "$status" = 0 ]; then
+			echo "ci.sh: endpoints/mod_h323 will link $linked (ptlib $(pkg-config --modversion ptlib 2> /dev/null)), which bounds XML entity expansion"
+		fi
 	fi
 
 	rm -rf "$probe_dir"

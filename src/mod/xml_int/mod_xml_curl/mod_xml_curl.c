@@ -1300,6 +1300,120 @@ static switch_xml_t xml_curl_json_decode_response(const char *filename, const ch
 	return xml;
 }
 
+/*
+ * SECURITY: decides whether a configured cookie jar path may be handed to libcurl.
+ *
+ * libcurl opens the jar for writing at the end of every transfer. That open follows symbolic links
+ * and creates a missing file with whatever the process umask happens to be, so an unvalidated path
+ * lets any local user who can create that name choose which file FreeSWITCH truncates, and leaves a
+ * freshly created jar readable by everyone even though it holds session cookies for the provisioning
+ * gateway. Neither outcome is acceptable for a file the module writes as a side effect of a lookup,
+ * and the shipped sample historically pointed at a predictable name in the shared temporary
+ * directory, which is exactly the precondition such an attack needs.
+ *
+ * The gate is conservative and says nothing at all on success:
+ *   - the directory holding the jar must not be writable by other users unless it carries the sticky
+ *     bit, because otherwise the name can be renamed away and re-created between this check and
+ *     libcurl's open, which would make every check below unreliable rather than merely incomplete;
+ *   - an existing jar that is a regular file owned by this process and writable by nobody else is
+ *     accepted untouched, so a working deployment keeps working and its mode is never altered;
+ *   - a symbolic link, a directory, a device, a FIFO, a file owned by another user, or a file any
+ *     other user can write is refused;
+ *   - a missing jar is created here, with O_EXCL and no-follow semantics at mode 0600, so libcurl
+ *     later truncates a file that is already private instead of creating a public one;
+ *   - a path that cannot be classified at all is refused.
+ *
+ * The directory rule is deliberately not "owner only". A jar belongs in a service directory such as
+ * the one $${db_dir} names, and those are conventionally readable and traversable by others; demanding
+ * mode 0700 there would refuse the location the shipped sample recommends and turn a hardening into an
+ * outage. Requiring the sticky bit where the directory is shared is the weakest rule that still makes
+ * the entry itself un-swappable, and it is what makes a correctly configured shared directory usable
+ * while the historical sample's predictable name in a world-writable one is not.
+ *
+ * A refusal costs cookie persistence for this binding and nothing else - the caller still performs
+ * the fetch - which is the same graceful degradation the response decode path uses.
+ *
+ * Windows has neither the link semantics nor the ownership model this check is written against, and
+ * its per-user temporary directory is not shared the way /tmp is, so the check is a no-op there and
+ * behaviour on that platform is byte-for-byte what it was.
+ */
+static int xml_curl_cookie_jar_is_usable(const char *path, const char *url)
+{
+#ifdef WIN32
+	return !zstr(path);
+#else
+	char safe_path[256] = "";
+	char safe_url[256] = "";
+	char dir[1024] = "";
+	const char *reason = NULL;
+	char *slash = NULL;
+	struct stat st;
+
+	if (zstr(path)) {
+		return 0;
+	}
+
+	/* The directory first, because if the entry can be swapped nothing learned about it afterwards
+	   means anything. stat() and not lstat() here: a symbolic link to a safe directory is safe. */
+	if (strlen(path) >= sizeof(dir)) {
+		reason = "its path is too long to be validated";
+	} else {
+		switch_copy_string(dir, path, sizeof(dir));
+
+		if ((slash = strrchr(dir, '/'))) {
+			/* keep the root slash itself, otherwise the parent name would become empty */
+			if (slash == dir) {
+				dir[1] = '\0';
+			} else {
+				*slash = '\0';
+			}
+		} else {
+			switch_copy_string(dir, ".", sizeof(dir));
+		}
+
+		if (stat(dir, &st) != 0) {
+			reason = "the directory holding it could not be read";
+		} else if (!S_ISDIR(st.st_mode)) {
+			reason = "the path holding it is not a directory";
+		} else if ((st.st_mode & (S_IWGRP | S_IWOTH)) != 0 && !(st.st_mode & S_ISVTX)) {
+			reason = "the directory holding it is writable by other users and not sticky, so the name could be replaced after it is checked";
+		}
+	}
+
+	/* Then the entry itself. lstat() rather than stat(): the question is what the name is, not what
+	   it points at. */
+	if (!reason) {
+		int fd;
+
+		if (lstat(path, &st) == 0) {
+			if (!S_ISREG(st.st_mode)) {
+				reason = "it is not a regular file, so a symbolic link, directory or special file would be written through";
+			} else if (st.st_uid != geteuid()) {
+				reason = "it belongs to another user";
+			} else if ((st.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+				reason = "other users can write it, so its contents cannot be trusted";
+			} else {
+				return 1;
+			}
+		} else if (errno != ENOENT) {
+			reason = "its status could not be read";
+		} else if ((fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, S_IRUSR | S_IWUSR)) < 0) {
+			reason = "it does not exist and could not be created privately";
+		} else {
+			close(fd);
+			return 1;
+		}
+	}
+
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+					  "Refusing cookie file [%s] for the binding at [%s] because %s; cookies will not be persisted for this binding\n",
+					  xml_curl_json_sanitize_token(path, safe_path, sizeof(safe_path)),
+					  xml_curl_json_redact_url(url, safe_url, sizeof(safe_url)), reason);
+
+	return 0;
+#endif
+}
+
 
 
 
@@ -1495,7 +1609,13 @@ static switch_xml_t xml_url_fetch(const char *section, const char *tag_name, con
 			switch_curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYHOST, 2);
 		}
 
-		if (binding->cookie_file) {
+		/* SECURITY: validate the jar path before libcurl is allowed to open it. The two setopt calls
+		   below are unchanged; the only difference is that they are now reached exclusively for a
+		   path that is safe to truncate and to create. The check lives here, at fetch time, rather
+		   than in do_config(): the cookie-file parameter keeps its existing name, default and
+		   semantics, and a jar that is replaced by a symbolic link after the module loaded is caught
+		   just the same. */
+		if (binding->cookie_file && xml_curl_cookie_jar_is_usable(binding->cookie_file, binding->url)) {
 			switch_curl_easy_setopt(curl_handle, CURLOPT_COOKIEJAR, binding->cookie_file);
 			switch_curl_easy_setopt(curl_handle, CURLOPT_COOKIEFILE, binding->cookie_file);
 		}
@@ -1641,6 +1761,7 @@ static switch_status_t do_config(void)
 		char *cookie_file = NULL;
 		hash_node_t *hash_node;
 		long auth_scheme = CURLAUTH_BASIC;
+		char safe_url[256] = "";		/* SECURITY: redacted rendering of the gateway URL, for logging only */
 		need_vars_map = 0;
 		vars_map = NULL;
 
@@ -1827,8 +1948,17 @@ static switch_status_t do_config(void)
 			binding->response_format = switch_core_strdup(globals.pool, response_format);
 		}
 
+		/* SECURITY: a gateway URL legitimately carries HTTP userinfo and query parameters, and both
+		   are routinely credential bearing. This registration notice is written once per binding at
+		   module load, so an unredacted rendering would persist a provisioning secret to the log file
+		   for the lifetime of that log. Render it through the same helper the response diagnostics
+		   use - the helper only needs a URL and is not JSON specific despite its name - so that the
+		   scheme and authority remain diagnosable while userinfo, path, query and fragment do not
+		   reach the log. Everything else about the message, including the binding name and the
+		   section list, is unchanged. */
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "Binding [%s] XML Fetch Function [%s] [%s]\n",
-						  zstr(bname) ? "N/A" : bname, binding->url, binding->bindings ? binding->bindings : "all");
+						  zstr(bname) ? "N/A" : bname, xml_curl_json_redact_url(binding->url, safe_url, sizeof(safe_url)),
+						  binding->bindings ? binding->bindings : "all");
 		switch_xml_bind_search_function(xml_url_fetch, switch_xml_parse_section_string(binding->bindings), binding);
 		x++;
 		binding = NULL;

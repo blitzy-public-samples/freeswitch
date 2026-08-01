@@ -39,8 +39,16 @@
            "SSLv3" and "TLSv1". Otherwise libcurl will auto-negotiate the version. -->
       <!-- <param name="ssl-version" value="TLSv1"/> -->
 
-      <!-- optional: enables cookies and stores them in the specified file. -->
-      <!-- <param name="cookie-file" value="$${temp_dir}/cookie-mod_xml_curl.txt"/> -->
+      <!-- optional: enables cookies and stores them in the specified file. Keep the jar in a
+           directory other users cannot write, such as $${db_dir}, because the file is rewritten
+           after every lookup; a world writable directory is only acceptable if it carries the
+           sticky bit, and a predictable name in a shared temporary directory is not suitable at
+           all, since any local user could pre-create it. The module refuses a jar that is a
+           symbolic link, a special file, owned by another user, writable by other users, or held
+           in a directory that would let the name be replaced, logging a warning and skipping
+           cookie persistence for that binding instead. A jar that does not exist yet is created
+           for the FreeSWITCH user only. -->
+      <!-- <param name="cookie-file" value="$${db_dir}/xml_curl-cookies.txt"/> -->
 
       <!-- one or more of these imply you want to pick the exact variables that are transmitted -->
       <!--<param name="enable-post-var" value="Unique-ID"/>-->
@@ -55,6 +63,14 @@
            Numbers, booleans and nulls are refused; an element carries either "$" or children,
            never both; and the top level object carries no "@" attribute member of any name,
            since the module builds the document and section envelope itself.
+
+           The profile is bounded as well, so a runaway or hostile response cannot exhaust memory.
+           A document may nest 32 levels deep and may carry 50000 values in total; one object may
+           carry 256 members, one array 256 elements, and one parent 256 children of any single
+           name; the whole document may build 20000 elements and attributes; one string value may
+           be 8192 bytes and one name 128 bytes. Exceeding any of these is refused like any other
+           shape error. The existing response-max-bytes parameter still caps the response body
+           itself, for JSON exactly as it does for XML.
 
            A response that is not application/json, or whose body falls outside that profile, is
            logged as a warning and parsed as XML instead. When omitted, responses are decoded as
