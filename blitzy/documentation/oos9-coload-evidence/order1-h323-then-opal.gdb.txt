@@ -1,0 +1,320 @@
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+ERROR: Failed to set SCHED_FIFO scheduler (Operation not permitted)
+[New Thread 0x7ffff55f96c0 (LWP 370437)]
+[New Thread 0x7ffff50136c0 (LWP 370438)]
+[New Thread 0x7ffff4f536c0 (LWP 370538)]
+[New Thread 0x7ffff4e516c0 (LWP 370541)]
+[New Thread 0x7ffff4c2a6c0 (LWP 370547)]
+[New Thread 0x7fffeffff6c0 (LWP 370558)]
+[Thread 0x7fffeffff6c0 (LWP 370558) exited]
+[New Thread 0x7ffff40b16c0 (LWP 370581)]
+[New Thread 0x7ffff40746c0 (LWP 370585)]
+[New Thread 0x7fffef59e6c0 (LWP 370604)]
+[New Thread 0x7fffef5616c0 (LWP 370605)]
+[New Thread 0x7fffef5246c0 (LWP 370608)]
+[New Thread 0x7fffef4e76c0 (LWP 370610)]
+[New Thread 0x7fffef4aa6c0 (LWP 370611)]
+[New Thread 0x7fffeffff6c0 (LWP 370613)]
+[New Thread 0x7fffef46d6c0 (LWP 370615)]
+[Thread 0x7fffeffff6c0 (LWP 370613) exited]
+[New Thread 0x7fffeec6c6c0 (LWP 370617)]
+[New Thread 0x7fffeffff6c0 (LWP 370616)]
+[Thread 0x7fffef46d6c0 (LWP 370615) exited]
+[New Thread 0x7fffee1566c0 (LWP 370619)]
+[New Thread 0x7fffee0546c0 (LWP 370620)]
+[New Thread 0x7fffee0176c0 (LWP 370622)]
+[New Thread 0x7fffedfda6c0 (LWP 370623)]
+[New Thread 0x7fffedee36c0 (LWP 372033)]
+[New Thread 0x7fffede766c0 (LWP 372040)]
+[New Thread 0x7fffedd6e6c0 (LWP 372049)]
+[New Thread 0x7fffedb546c0 (LWP 372539)]
+[New Thread 0x7fffedb176c0 (LWP 372542)]
+[New Thread 0x7fffed8e36c0 (LWP 372589)]
+[New Thread 0x7fff985a26c0 (LWP 372990)]
+[New Thread 0x7fff985656c0 (LWP 372993)]
+[New Thread 0x7fff985286c0 (LWP 372995)]
+[Thread 0x7fff985a26c0 (LWP 372990) exited]
+[Thread 0x7fff985656c0 (LWP 372993) exited]
+[New Thread 0x7fff985a26c0 (LWP 372996)]
+[Thread 0x7fff985286c0 (LWP 372995) exited]
+[New Thread 0x7fff985286c0 (LWP 372999)]
+[Thread 0x7fff985a26c0 (LWP 372996) exited]
+[Thread 0x7fff985286c0 (LWP 372999) exited]
+[New Thread 0x7fff985286c0 (LWP 373020)]
+[New Thread 0x7fff985a26c0 (LWP 373021)]
+[New Thread 0x7fff985656c0 (LWP 373022)]
+[New Thread 0x7fff9846f6c0 (LWP 373025)]
+[New Thread 0x7fff984326c0 (LWP 373026)]
+[New Thread 0x7fff983f56c0 (LWP 373027)]
+[New Thread 0x7fffef46d6c0 (LWP 373122)]
+[New Thread 0x7fff9822e6c0 (LWP 373163)]
+[Thread 0x7fff9822e6c0 (LWP 373163) exited]
+[New Thread 0x7fff9822e6c0 (LWP 373171)]
+[Thread 0x7fffef46d6c0 (LWP 373122) exited]
+[New Thread 0x7fff980676c0 (LWP 373521)]
+[New Thread 0x7fff7b3d66c0 (LWP 373522)]
+[Thread 0x7fff9822e6c0 (LWP 373171) exited]
+[New Thread 0x7fffef46d6c0 (LWP 375290)]
+[Thread 0x7fffef46d6c0 (LWP 375290) exited]
+[New Thread 0x7fffef46d6c0 (LWP 375294)]
+[Thread 0x7fffef46d6c0 (LWP 375294) exited]
+[New Thread 0x7fff9822e6c0 (LWP 377669)]
+[Thread 0x7fff9822e6c0 (LWP 377669) exited]
+[New Thread 0x7fff9822e6c0 (LWP 377686)]
+[Thread 0x7ffff4f536c0 (LWP 370538) exited]
+
+Thread 48 "freeswitch" received signal SIGSEGV, Segmentation fault.
+[Switching to Thread 0x7fff9822e6c0 (LWP 377686)]
+0x00007fff7a34f349 in PThreadLocalStorage<PTraceInfo::ThreadLocalInfo>::Get() const () from /opt/opalvoip/lib/libpt.so.2.12-beta10
+
+===== INFERIOR STOPPED =====
+Last stopped for thread 48 (Thread 0x7fff9822e6c0 (LWP 377686)).
+	Using the running image of child process 370318.
+Program stopped at 0x7fff7a34f349.
+It stopped with signal SIGSEGV, Segmentation fault.
+
+===== FAULTING FRAME =====
+#0  0x00007fff7a34f349 in PThreadLocalStorage<PTraceInfo::ThreadLocalInfo>::Get() const () from /opt/opalvoip/lib/libpt.so.2.12-beta10
+
+===== BACKTRACE (faulting thread) =====
+#0  0x00007fff7a34f349 in PThreadLocalStorage<PTraceInfo::ThreadLocalInfo>::Get() const () from /opt/opalvoip/lib/libpt.so.2.12-beta10
+#1  0x00007fff7a34b8c9 in PTraceInfo::InternalBegin(bool, unsigned int, char const*, int, PObject const*, char const*) () from /opt/opalvoip/lib/libpt.so.2.12-beta10
+#2  0x00007fff7a34be84 in PTrace::Begin(unsigned int, char const*, int, PObject const*, char const*) () from /opt/opalvoip/lib/libpt.so.2.12-beta10
+#3  0x00007fff7a322122 in PProcess::Construct() () from /opt/opalvoip/lib/libpt.so.2.12-beta10
+#4  0x00007fff7a34b3b1 in PProcess::PProcess(char const*, char const*, unsigned short, unsigned short, PProcess::CodeStatus, unsigned short, bool, bool) () from /opt/opalvoip/lib/libpt.so.2.12-beta10
+#5  0x00007fff983ab787 in PLibraryProcess::PLibraryProcess (buildNum=..., statusCode=..., minorVersionNum=..., majorVersionNum=..., name=..., manuf=..., this=...) at /opt/opalvoip/include/ptlib/pprocess.h:764
+#6  FSProcess::FSProcess (this=...) at mod_opal.cpp:239
+#7  mod_opal_load (module_interface=..., pool=...) at mod_opal.cpp:116
+#8  0x00007ffff7bf07ea in switch_loadable_module_load_file (new_module=..., global=..., filename=..., path=...) at src/switch_loadable_module.c:1720
+#9  switch_loadable_module_load_module_ex (dir=..., fname=..., runtime=..., global=..., err=..., type=..., event_hash=...) at src/switch_loadable_module.c:1827
+#10 0x00007ffff7bf29da in switch_loadable_module_load_module (dir=..., fname=..., runtime=..., err=...) at src/switch_loadable_module.c:1781
+#11 0x00007fffedde0037 in load_function (session=..., stream=..., cmd=...) at mod_commands.c:2736
+#12 load_function (cmd=..., session=..., stream=...) at mod_commands.c:2721
+#13 0x00007ffff7bf67eb in switch_api_execute (cmd=..., arg=..., session=..., stream=...) at src/switch_loadable_module.c:2968
+#14 0x00007ffff7b6b400 in switch_console_execute (xcmd=..., rec=..., istream=...) at src/switch_console.c:393
+#15 0x00007ffff7b6b24b in switch_console_execute (xcmd=..., rec=..., istream=...) at src/switch_console.c:359
+#16 0x00007ffff4015963 in api_exec (thread=..., obj=...) at mod_event_socket.c:1548
+#17 0x00007ffff4019ff7 in parse_command (listener=..., event=..., reply=..., reply_len=...) at mod_event_socket.c:2318
+#18 0x00007ffff401b3a1 in listener_run (thread=..., obj=...) at mod_event_socket.c:2761
+#19 0x00007ffff7949d64 in start_thread (arg=...) at ./nptl/pthread_create.c:448
+#20 0x00007ffff79dd3fc in __GI___clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+
+===== INFO SHAREDLIBRARY =====
+From                To                  Syms Read   Shared Object Library
+0x00007ffff7fbf000  0x00007ffff7fecf75  Yes         /lib64/ld-linux-x86-64.so.2
+0x00007ffff7b50e10  0x00007ffff7eb9b47  Yes         /usr/local/freeswitch/lib/libfreeswitch.so.1
+0x00007ffff78ce7c0  0x00007ffff7a668d9  Yes         /lib/x86_64-linux-gnu/libc.so.6
+0x00007ffff789e580  0x00007ffff78a2830  Yes (*)     /lib/x86_64-linux-gnu/libuuid.so.1
+0x00007ffff77486c0  0x00007ffff785e21a  Yes (*)     /lib/x86_64-linux-gnu/libsqlite3.so.0
+0x00007ffff7664800  0x00007ffff76f84ee  Yes (*)     /lib/x86_64-linux-gnu/libfreetype.so.6
+0x00007ffff7583180  0x00007ffff76284ce  Yes (*)     /lib/x86_64-linux-gnu/libcurl.so.4
+0x00007ffff74c0300  0x00007ffff753bf01  Yes (*)     /lib/x86_64-linux-gnu/libpcre2-8.so.0
+0x00007ffff7492280  0x00007ffff74b5eef  Yes (*)     /lib/x86_64-linux-gnu/libspeex.so.1
+0x00007ffff74712c0  0x00007ffff748a73c  Yes (*)     /lib/x86_64-linux-gnu/libspeexdsp.so.1
+0x00007ffff743a080  0x00007ffff7457ce0  Yes (*)     /lib/x86_64-linux-gnu/libedit.so.2
+0x00007ffff7426320  0x00007ffff742b8c8  Yes (*)     /lib/libtpl.so.0
+0x00007ffff7313440  0x00007ffff73b4d32  Yes (*)     /lib/x86_64-linux-gnu/libspandsp.so.4
+0x00007ffff7166870  0x00007ffff7292596  Yes (*)     /lib/libsofia-sip-ua.so.0
+0x00007ffff70c2500  0x00007ffff70eb4ac  Yes (*)     /lib/x86_64-linux-gnu/libpng16.so.16
+0x00007ffff6fd5940  0x00007ffff7081c3d  Yes (*)     /lib/x86_64-linux-gnu/libssl.so.3
+0x00007ffff6a816c0  0x00007ffff6e0dfa2  Yes (*)     /lib/x86_64-linux-gnu/libcrypto.so.3
+0x00007ffff67b9600  0x00007ffff68fddc2  Yes (*)     /lib/x86_64-linux-gnu/libstdc++.so.6
+0x00007ffff6611540  0x00007ffff669b602  Yes         /lib/x86_64-linux-gnu/libm.so.6
+0x00007ffff65d7780  0x00007ffff65f9dc5  Yes (*)     /lib/x86_64-linux-gnu/libgcc_s.so.1
+0x00007ffff6568740  0x00007ffff65ba0f5  Yes (*)     /lib/x86_64-linux-gnu/libodbc.so.2
+0x00007ffff6544280  0x00007ffff6556840  Yes (*)     /lib/x86_64-linux-gnu/libz.so.1
+0x00007ffff652e280  0x00007ffff653c2f3  Yes (*)     /lib/x86_64-linux-gnu/libbz2.so.1.0
+0x00007ffff651d1c0  0x00007ffff6524dfa  Yes (*)     /lib/x86_64-linux-gnu/libbrotlidec.so.1
+0x00007ffff64f6200  0x00007ffff650bb7a  Yes (*)     /lib/x86_64-linux-gnu/libnghttp2.so.14
+0x00007ffff64d0400  0x00007ffff64d39c9  Yes (*)     /lib/x86_64-linux-gnu/libidn2.so.0
+0x00007ffff64b2dc0  0x00007ffff64c3a36  Yes (*)     /lib/x86_64-linux-gnu/librtmp.so.1
+0x00007ffff6469140  0x00007ffff649dd82  Yes (*)     /lib/x86_64-linux-gnu/libssh2.so.1
+0x00007ffff644d3e0  0x00007ffff644efa0  Yes (*)     /lib/x86_64-linux-gnu/libpsl.so.5
+0x00007ffff64014c0  0x00007ffff643b4fd  Yes (*)     /lib/x86_64-linux-gnu/libgssapi_krb5.so.2
+0x00007ffff63a17c0  0x00007ffff63dc85a  Yes (*)     /lib/x86_64-linux-gnu/libldap.so.2
+0x00007ffff6382380  0x00007ffff6389991  Yes (*)     /lib/x86_64-linux-gnu/liblber.so.2
+0x00007ffff62ba400  0x00007ffff63695f2  Yes (*)     /lib/x86_64-linux-gnu/libzstd.so.1
+0x00007ffff628f880  0x00007ffff62a2771  Yes (*)     /lib/x86_64-linux-gnu/libtinfo.so.6
+0x00007ffff626cdc0  0x00007ffff6277e16  Yes (*)     /lib/x86_64-linux-gnu/libbsd.so.0
+0x00007ffff61dd040  0x00007ffff623081b  Yes (*)     /lib/x86_64-linux-gnu/libtiff.so.6
+0x00007ffff6152580  0x00007ffff61a1900  Yes (*)     /lib/x86_64-linux-gnu/libjpeg.so.8
+0x00007ffff61444e0  0x00007ffff6148a57  Yes (*)     /lib/x86_64-linux-gnu/libltdl.so.7
+0x00007ffff61200a0  0x00007ffff612078a  Yes (*)     /lib/x86_64-linux-gnu/libbrotlicommon.so.1
+0x00007ffff5f48980  0x00007ffff5f8bb4d  Yes (*)     /lib/x86_64-linux-gnu/libunistring.so.5
+0x00007ffff5d61c80  0x00007ffff5ea677d  Yes (*)     /lib/x86_64-linux-gnu/libgnutls.so.30
+0x00007ffff5ce8d00  0x00007ffff5cfd1cd  Yes (*)     /lib/x86_64-linux-gnu/libhogweed.so.6
+0x00007ffff5c8b280  0x00007ffff5cc3395  Yes (*)     /lib/x86_64-linux-gnu/libnettle.so.8
+0x00007ffff5c03240  0x00007ffff5c67292  Yes (*)     /lib/x86_64-linux-gnu/libgmp.so.10
+0x00007ffff5b4df80  0x00007ffff5bae3ce  Yes (*)     /lib/x86_64-linux-gnu/libkrb5.so.3
+0x00007ffff5b043c0  0x00007ffff5b1ed9b  Yes (*)     /lib/x86_64-linux-gnu/libk5crypto.so.3
+0x00007ffff5afc3c0  0x00007ffff5afcfd1  Yes (*)     /lib/x86_64-linux-gnu/libcom_err.so.2
+0x00007ffff5af0640  0x00007ffff5af5ad9  Yes (*)     /lib/x86_64-linux-gnu/libkrb5support.so.0
+0x00007ffff5ad5980  0x00007ffff5ae5128  Yes (*)     /lib/x86_64-linux-gnu/libsasl2.so.2
+0x00007ffff5ac2180  0x00007ffff5acac6d  Yes (*)     /lib/x86_64-linux-gnu/libmd.so.0
+0x00007ffff59e93c0  0x00007ffff5aa73e9  Yes (*)     /lib/x86_64-linux-gnu/libwebp.so.7
+0x00007ffff59b5400  0x00007ffff59d895b  Yes (*)     /lib/x86_64-linux-gnu/liblzma.so.5
+0x00007ffff58f0400  0x00007ffff59a662f  Yes (*)     /lib/x86_64-linux-gnu/libLerc.so.4
+0x00007ffff58dd140  0x00007ffff58e5fc9  Yes (*)     /lib/x86_64-linux-gnu/libjbig.so.0
+0x00007ffff58c50c0  0x00007ffff58d3c08  Yes (*)     /lib/x86_64-linux-gnu/libdeflate.so.0
+0x00007ffff5752c80  0x00007ffff5825290  Yes (*)     /lib/x86_64-linux-gnu/libp11-kit.so.0
+0x00007ffff57054c0  0x00007ffff57136b8  Yes (*)     /lib/x86_64-linux-gnu/libtasn1.so.6
+0x00007ffff56fd260  0x00007ffff56fe4e0  Yes (*)     /lib/x86_64-linux-gnu/libkeyutils.so.1
+0x00007ffff56ea6c0  0x00007ffff56f39b9  Yes         /lib/x86_64-linux-gnu/libresolv.so.2
+0x00007ffff56db1c0  0x00007ffff56e2aa9  Yes (*)     /lib/x86_64-linux-gnu/libsharpyuv.so.0
+0x00007ffff56cd480  0x00007ffff56d343a  Yes (*)     /lib/x86_64-linux-gnu/libffi.so.8
+0x00007ffff7aeb600  0x00007ffff7aed986  Yes         /usr/local/freeswitch/mod/mod_pgsql.so
+0x00007ffff43d2c80  0x00007ffff43fa383  Yes (*)     /lib/x86_64-linux-gnu/libpq.so.5
+0x00007ffff4425480  0x00007ffff4426cc2  Yes         /usr/local/freeswitch/mod/mod_console.so
+0x00007ffff40336a0  0x00007ffff4034ba4  Yes         /usr/local/freeswitch/mod/mod_logfile.so
+0x00007ffff402b900  0x00007ffff402de16  Yes         /usr/local/freeswitch/mod/mod_enum.so
+0x00007fffef7aba40  0x00007fffef7e8767  Yes (*)     /lib/x86_64-linux-gnu/libldns.so.3
+0x00007ffff40247c0  0x00007ffff4025c5a  Yes         /usr/local/freeswitch/mod/mod_cdr_csv.so
+0x00007ffff4014360  0x00007ffff401c10c  Yes         /usr/local/freeswitch/mod/mod_event_socket.so
+0x00007fffef6f4d30  0x00007fffef768833  Yes         /usr/local/freeswitch/mod/mod_sofia.so
+0x00007ffff4004f00  0x00007ffff400a6be  Yes         /usr/local/freeswitch/mod/mod_loopback.so
+0x00007fffedf99560  0x00007fffedf9a192  Yes         /usr/local/freeswitch/mod/mod_rtc.so
+0x00007fffedf7a580  0x00007fffedf8e3e7  Yes         /usr/local/freeswitch/mod/mod_verto.so
+0x00007fffedf3a2f0  0x00007fffedf57c68  Yes         /lib/libks2.so.2
+0x00007fffede9ce40  0x00007fffedea0b4d  Yes         /usr/local/freeswitch/mod/mod_signalwire.so
+0x00007fffede7eb60  0x00007fffede8ebc6  Yes         /lib/libsignalwire_client2.so.2
+0x00007fffeddd13d0  0x00007fffedde864a  Yes         /usr/local/freeswitch/mod/mod_commands.so
+0x00007fffedd7aab0  0x00007fffeddb6433  Yes         /usr/local/freeswitch/mod/mod_conference.so
+0x00007fffedf6b500  0x00007fffedf6d0bb  Yes         /usr/local/freeswitch/mod/mod_db.so
+0x00007fffedd0f680  0x00007fffedd24ba5  Yes         /usr/local/freeswitch/mod/mod_dptools.so
+0x00007fffedcfc520  0x00007fffedd01cfc  Yes         /usr/local/freeswitch/mod/mod_expr.so
+0x00007fffedce43e0  0x00007fffedcf362e  Yes         /usr/local/freeswitch/mod/mod_fifo.so
+0x00007fffedaccf00  0x00007fffedad4ac9  Yes         /usr/local/freeswitch/mod/mod_hash.so
+0x00007fffedaaa400  0x00007fffedabecdc  Yes         /usr/local/freeswitch/mod/mod_voicemail.so
+0x00007fffeda3d660  0x00007fffeda3ebbb  Yes         /usr/local/freeswitch/mod/mod_esf.so
+0x00007fffeda33b60  0x00007fffeda36cc3  Yes         /usr/local/freeswitch/mod/mod_fsv.so
+0x00007fffeda2a860  0x00007fffeda2db55  Yes         /usr/local/freeswitch/mod/mod_valet_parking.so
+0x00007fffeda181c0  0x00007fffeda22401  Yes         /usr/local/freeswitch/mod/mod_httapi.so
+0x00007fffeda0d680  0x00007fffeda10226  Yes         /usr/local/freeswitch/mod/mod_dialplan_xml.so
+0x00007fffeda06560  0x00007fffeda07525  Yes         /usr/local/freeswitch/mod/mod_dialplan_asterisk.so
+0x00007fffed8ec600  0x00007fffed8fe963  Yes         /usr/local/freeswitch/mod/mod_spandsp.so
+0x00007fffed8a3100  0x00007fffed8a34de  Yes         /usr/local/freeswitch/mod/mod_g723_1.so
+0x00007fffed89e100  0x00007fffed89e4ec  Yes         /usr/local/freeswitch/mod/mod_g729.so
+0x00007fffed898400  0x00007fffed899ada  Yes         /usr/local/freeswitch/mod/mod_amr.so
+0x00007fffed8640e0  0x00007fffed87fc4a  Yes (*)     /lib/x86_64-linux-gnu/libopencore-amrnb.so.0
+0x00007fffed8931a0  0x00007fffed8936fe  Yes         /usr/local/freeswitch/mod/mod_b64.so
+0x00007fffed859600  0x00007fffed85ebba  Yes         /usr/local/freeswitch/mod/mod_opus.so
+0x00007fffed4f52e0  0x00007fffed555f55  Yes (*)     /lib/x86_64-linux-gnu/libopus.so.0
+0x00007fffed4dc4a0  0x00007fffed4e8c2d  Yes         /usr/local/freeswitch/mod/mod_av.so
+0x00007fffed23c880  0x00007fffed41d04b  Yes (*)     /lib/x86_64-linux-gnu/libavformat.so.61
+0x00007fff9eb31140  0x00007fff9f6d8fd5  Yes (*)     /lib/x86_64-linux-gnu/libavcodec.so.61
+0x00007fffed149300  0x00007fffed1d9b3d  Yes (*)     /lib/x86_64-linux-gnu/libswscale.so.8
+0x00007fffec037a80  0x00007fffec0f72fe  Yes (*)     /lib/x86_64-linux-gnu/libavutil.so.59
+0x00007fff9ea8b340  0x00007fff9eaa147c  Yes (*)     /lib/x86_64-linux-gnu/libswresample.so.5
+0x00007fffec00b660  0x00007fffec018cd2  Yes (*)     /lib/x86_64-linux-gnu/libdvdnav.so.4
+0x00007fff9ea68640  0x00007fff9ea7ecab  Yes (*)     /lib/x86_64-linux-gnu/libdvdread.so.8
+0x00007fff9e91dd40  0x00007fff9ea1e2cb  Yes (*)     /lib/x86_64-linux-gnu/libxml2.so.16
+0x00007fff9e8b9600  0x00007fff9e8eb5f6  Yes (*)     /lib/x86_64-linux-gnu/libgme.so.0
+0x00007fff9e69a240  0x00007fff9e8188b0  Yes (*)     /lib/x86_64-linux-gnu/libopenmpt.so.0
+0x00007fff9e6724c0  0x00007fff9e680a19  Yes (*)     /lib/x86_64-linux-gnu/libchromaprint.so.1
+0x00007fff9e61cd40  0x00007fff9e65ce9c  Yes (*)     /lib/x86_64-linux-gnu/libbluray.so.2
+0x00007fff9e603c40  0x00007fff9e60f420  Yes (*)     /lib/x86_64-linux-gnu/librabbitmq.so.4
+0x00007fff9e5d7f40  0x00007fff9e5f4a3c  Yes (*)     /lib/x86_64-linux-gnu/librist.so.4
+0x00007fff9e5183c0  0x00007fff9e5ada41  Yes (*)     /lib/x86_64-linux-gnu/libsrt-gnutls.so.1.5
+0x00007fff9e4937c0  0x00007fff9e4e0e15  Yes (*)     /lib/x86_64-linux-gnu/libssh.so.4
+0x00007fff9e3fbc20  0x00007fff9e4615c4  Yes (*)     /lib/x86_64-linux-gnu/libzmq.so.5
+0x00007fff9e029380  0x00007fff9e3954a1  Yes (*)     /lib/x86_64-linux-gnu/libvpx.so.9
+0x00007fff9e015440  0x00007fff9e01d8d6  Yes (*)     /lib/x86_64-linux-gnu/libwebpmux.so.3
+0x00007fff9ddec280  0x00007fff9dfad1be  Yes (*)     /lib/x86_64-linux-gnu/libdav1d.so.7
+0x00007fff9d91a060  0x00007fff9dc17a4f  Yes (*)     /lib/x86_64-linux-gnu/librsvg-2.so.2
+0x00007fff9d81a140  0x00007fff9d84fb92  Yes (*)     /lib/x86_64-linux-gnu/libgobject-2.0.so.0
+0x00007fff9d6d2040  0x00007fff9d775a32  Yes (*)     /lib/x86_64-linux-gnu/libglib-2.0.so.0
+0x00007fff9d55c040  0x00007fff9d64fa37  Yes (*)     /lib/x86_64-linux-gnu/libcairo.so.2
+0x00007fff9d4b8200  0x00007fff9d517c2b  Yes (*)     /lib/x86_64-linux-gnu/libzvbi.so.0
+0x00007fff9d496240  0x00007fff9d49b89d  Yes (*)     /lib/x86_64-linux-gnu/libsnappy.so.1
+0x00007fff9cf25480  0x00007fff9d343df9  Yes (*)     /lib/x86_64-linux-gnu/libaom.so.3
+0x00007fff9bef9640  0x00007fff9bf43fed  Yes (*)     /lib/x86_64-linux-gnu/libcodec2.so.1.2
+0x00007fff9bee0120  0x00007fff9beea75f  Yes (*)     /lib/x86_64-linux-gnu/libgsm.so.1
+0x00007fff9bbde9c0  0x00007fff9be83b14  Yes (*)     /lib/x86_64-linux-gnu/libjxl.so.0.11
+0x00007fffed88d2c0  0x00007fffed88e7f1  Yes (*)     /lib/x86_64-linux-gnu/libjxl_threads.so.0.11
+0x00007fff9bb604c0  0x00007fff9bb90782  Yes (*)     /lib/x86_64-linux-gnu/libmp3lame.so.0
+0x00007fff9baee600  0x00007fff9bb463ae  Yes (*)     /lib/x86_64-linux-gnu/libopenjp2.so.7
+0x00007fff9b7fb060  0x00007fff9ba5feda  Yes (*)     /lib/x86_64-linux-gnu/librav1e.so.0.7
+0x00007fff9b7cc1c0  0x00007fff9b7d1cd8  Yes (*)     /lib/x86_64-linux-gnu/libshine.so.3
+0x00007fff9af1b480  0x00007fff9b58d004  Yes (*)     /lib/x86_64-linux-gnu/libSvtAv1Enc.so.2
+0x00007fff9aec5300  0x00007fff9aef11a8  Yes (*)     /lib/x86_64-linux-gnu/libtheoraenc.so.1
+0x00007fff9aea3480  0x00007fff9aebef74  Yes (*)     /lib/x86_64-linux-gnu/libtheoradec.so.1
+0x00007fff9ae7d2a0  0x00007fff9ae8b3b5  Yes (*)     /lib/x86_64-linux-gnu/libtwolame.so.0
+0x00007fff9ae4e540  0x00007fff9ae66ea7  Yes (*)     /lib/x86_64-linux-gnu/libvorbis.so.0
+0x00007fff9adb40c0  0x00007fff9adb6997  Yes (*)     /lib/x86_64-linux-gnu/libvorbisenc.so.2
+0x00007fff9aa774c0  0x00007fff9ac6b497  Yes (*)     /lib/x86_64-linux-gnu/libx264.so.164
+0x00007fff997d26c0  0x00007fff9a9d4da1  Yes (*)     /lib/x86_64-linux-gnu/libx265.so.215
+0x00007fff99634260  0x00007fff996bc689  Yes (*)     /lib/x86_64-linux-gnu/libxvidcore.so.4
+0x00007fff995fe640  0x00007fff9961d0b1  Yes (*)     /lib/x86_64-linux-gnu/libva.so.2
+0x00007fff9959bdc0  0x00007fff995e4dd9  Yes (*)     /lib/x86_64-linux-gnu/libvpl.so.2
+0x00007fffec004300  0x00007fffec004962  Yes (*)     /lib/x86_64-linux-gnu/libva-drm.so.2
+0x00007fff9958e6a0  0x00007fff99590427  Yes (*)     /lib/x86_64-linux-gnu/libva-x11.so.2
+0x00007fff99587480  0x00007fff995882a7  Yes (*)     /lib/x86_64-linux-gnu/libvdpau.so.1
+0x00007fff9944d140  0x00007fff994e07de  Yes (*)     /lib/x86_64-linux-gnu/libX11.so.6
+0x00007fff99421780  0x00007fff9942ca2f  Yes (*)     /lib/x86_64-linux-gnu/libdrm.so.2
+0x00007fff9940b3c0  0x00007fff9941480f  Yes (*)     /lib/x86_64-linux-gnu/libOpenCL.so.1
+0x00007fff993a34c0  0x00007fff993c7b22  Yes (*)     /lib/x86_64-linux-gnu/libsoxr.so.0
+0x00007fff9933c240  0x00007fff9938278c  Yes (*)     /lib/x86_64-linux-gnu/libmpg123.so.0
+0x00007fff9932d6c0  0x00007fff993320e0  Yes (*)     /lib/x86_64-linux-gnu/libvorbisfile.so.3
+0x00007fff992e1fc0  0x00007fff99310a3e  Yes (*)     /lib/x86_64-linux-gnu/libfontconfig.so.1
+0x00007fff992cf280  0x00007fff992d4607  Yes (*)     /lib/x86_64-linux-gnu/libudfread.so.0
+0x00007fff99247540  0x00007fff992a3fbf  Yes (*)     /lib/x86_64-linux-gnu/libmbedcrypto.so.16
+0x00007fff9922a180  0x00007fff9922db3b  Yes (*)     /lib/x86_64-linux-gnu/libcjson.so.1
+0x00007fff991da2c0  0x00007fff99215530  Yes (*)     /lib/x86_64-linux-gnu/libsodium.so.23
+0x00007fff99188b60  0x00007fff991ae69e  Yes (*)     /lib/x86_64-linux-gnu/libpgm-5.3.so.0
+0x00007fff9907fbc0  0x00007fff990c4541  Yes (*)     /lib/x86_64-linux-gnu/libnorm.so.1
+0x00007fff98edeb80  0x00007fff98ff4391  Yes (*)     /lib/x86_64-linux-gnu/libgio-2.0.so.0
+0x00007fff98e750c0  0x00007fff98e8ed1d  Yes (*)     /lib/x86_64-linux-gnu/libgdk_pixbuf-2.0.so.0
+0x00007fff98e63100  0x00007fff98e6438a  Yes (*)     /lib/x86_64-linux-gnu/libcairo-gobject.so.2
+0x00007fff98e53680  0x00007fff98e596f1  Yes (*)     /lib/x86_64-linux-gnu/libpangocairo-1.0.so.0
+0x00007fff98dea380  0x00007fff98e262c6  Yes (*)     /lib/x86_64-linux-gnu/libpango-1.0.so.0
+0x00007fff98dcc180  0x00007fff98dcf51c  Yes (*)     /lib/x86_64-linux-gnu/libatomic.so.1
+0x00007fff98dba600  0x00007fff98dc4bce  Yes (*)     /lib/x86_64-linux-gnu/libXext.so.6
+0x00007fff98dac480  0x00007fff98db2882  Yes (*)     /lib/x86_64-linux-gnu/libXrender.so.1
+0x00007fff98d856c0  0x00007fff98d9845e  Yes (*)     /lib/x86_64-linux-gnu/libxcb.so.1
+0x00007fff98d6e120  0x00007fff98d72f34  Yes (*)     /lib/x86_64-linux-gnu/libxcb-render.so.0
+0x00007fff98d650e0  0x00007fff98d65b27  Yes (*)     /lib/x86_64-linux-gnu/libxcb-shm.so.0
+0x00007fff98c58300  0x00007fff98d4a057  Yes (*)     /lib/x86_64-linux-gnu/libpixman-1.so.0
+0x00007fff98c37580  0x00007fff98c4611c  Yes (*)     /lib/x86_64-linux-gnu/libjxl_cms.so.0.11
+0x00007fff98c2b380  0x00007fff98c3091b  Yes (*)     /lib/x86_64-linux-gnu/libhwy.so.1
+0x00007fff98b87180  0x00007fff98bd5128  Yes (*)     /lib/x86_64-linux-gnu/libbrotlienc.so.1
+0x00007fff98b7e120  0x00007fff98b80619  Yes (*)     /lib/x86_64-linux-gnu/libogg.so.0
+0x00007fff98a80fa0  0x00007fff98aa2420  Yes         /lib/x86_64-linux-gnu/libmvec.so.1
+0x00007fff98a6f820  0x00007fff98a751e4  Yes (*)     /lib/x86_64-linux-gnu/libnuma.so.1
+0x00007fff98a66300  0x00007fff98a68a4a  Yes (*)     /lib/x86_64-linux-gnu/libXfixes.so.3
+0x00007fff98a60040  0x00007fff98a6011f  Yes (*)     /lib/x86_64-linux-gnu/libX11-xcb.so.1
+0x00007fff98a590e0  0x00007fff98a5a376  Yes (*)     /lib/x86_64-linux-gnu/libxcb-dri3.so.0
+0x00007fff98a09f40  0x00007fff98a46912  Yes (*)     /lib/x86_64-linux-gnu/libgomp.so.1
+0x00007fff989d5240  0x00007fff989f2b5b  Yes (*)     /lib/x86_64-linux-gnu/libexpat.so.1
+0x00007fff989cc500  0x00007fff989cd5e2  Yes (*)     /lib/x86_64-linux-gnu/libgmodule-2.0.so.0
+0x00007fff989823c0  0x00007fff989b87cb  Yes (*)     /lib/x86_64-linux-gnu/libmount.so.1
+0x00007fff98948080  0x00007fff9896760b  Yes (*)     /lib/x86_64-linux-gnu/libselinux.so.1
+0x00007fff989289c0  0x00007fff98936651  Yes (*)     /lib/x86_64-linux-gnu/libpangoft2-1.0.so.0
+0x00007fff987edf80  0x00007fff988e8df2  Yes (*)     /lib/x86_64-linux-gnu/libharfbuzz.so.0
+0x00007fff987c4100  0x00007fff987c70b8  Yes (*)     /lib/x86_64-linux-gnu/libfribidi.so.0
+0x00007fff987b9340  0x00007fff987bcd97  Yes (*)     /lib/x86_64-linux-gnu/libthai.so.0
+0x00007fff987b2360  0x00007fff987b3122  Yes (*)     /lib/x86_64-linux-gnu/libXau.so.6
+0x00007fff987ab1c0  0x00007fff987acbb6  Yes (*)     /lib/x86_64-linux-gnu/libXdmcp.so.6
+0x00007fff9874c6c0  0x00007fff9878f77f  Yes (*)     /lib/x86_64-linux-gnu/liblcms2.so.2
+0x00007fff9870dd80  0x00007fff98731e4c  Yes (*)     /lib/x86_64-linux-gnu/libblkid.so.1
+0x00007fff986e2240  0x00007fff986ff780  Yes (*)     /lib/x86_64-linux-gnu/libgraphite2.so.3
+0x00007fff986d8240  0x00007fff986db71b  Yes (*)     /lib/x86_64-linux-gnu/libdatrie.so.1
+0x00007fffed852640  0x00007fffed853f72  Yes         /usr/local/freeswitch/mod/mod_sndfile.so
+0x00007fff9863ea00  0x00007fff986a4696  Yes (*)     /lib/x86_64-linux-gnu/libsndfile.so.1
+0x00007fff985b3a40  0x00007fff98629237  Yes (*)     /lib/x86_64-linux-gnu/libFLAC.so.14
+0x00007fff986d2220  0x00007fff986d27ca  Yes         /usr/local/freeswitch/mod/mod_native_file.so
+0x00007fff985a5620  0x00007fff985a6481  Yes         /usr/local/freeswitch/mod/mod_png.so
+0x00007fffedefeda0  0x00007fffedf0309e  Yes         /usr/local/freeswitch/mod/mod_local_stream.so
+0x00007fffedef7380  0x00007fffedef7a37  Yes         /usr/local/freeswitch/mod/mod_tone_stream.so
+0x00007fff984b7f20  0x00007fff984dc9d5  Yes         /usr/local/freeswitch/mod/mod_lua.so
+0x00007fff98476b40  0x00007fff9849ec24  Yes (*)     /lib/x86_64-linux-gnu/liblua5.3.so.0
+0x00007fffedef1440  0x00007fffedef2fe1  Yes         /usr/local/freeswitch/mod/mod_say_en.so
+0x00007ffff4fb6360  0x00007ffff4fc874b  Yes         /usr/local/freeswitch/mod/mod_h323.so
+0x00007fff7bb4c430  0x00007fff7bdabb75  Yes (*)     /lib/libh323_linux_x86_64_.so.1.28.0
+0x00007fff7b55b440  0x00007fff7b621c72  Yes (*)     /lib/libpt.so.2.10.9
+0x00007ffff4f895d0  0x00007ffff4f8dc3d  Yes (*)     /usr/lib/ptlib-2.10.9/devices/sound/oss_pwplugin.so
+0x00007ffff4f6e710  0x00007ffff4f75145  Yes (*)     /usr/lib/ptlib-2.10.9/devices/videoinput/v4l2_pwplugin.so
+0x00007fff983a4dc0  0x00007fff983b07c5  Yes         /usr/local/freeswitch/mod/mod_opal.so
+0x00007fff7aba7d50  0x00007fff7b0e5d34  Yes         /opt/opalvoip/lib/libopal.so.3.12-beta10
+0x00007fff7a280850  0x00007fff7a3610db  Yes (*)     /opt/opalvoip/lib/libpt.so.2.12-beta10
+(*): Shared library is missing debugging information.

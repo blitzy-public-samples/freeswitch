@@ -1,0 +1,1 @@
+<document type="freeswitch/xml"><section name="directory"><domain name="example.com"><params/><variables><variable name="user_context" value="default"/></variables><groups><group name="reserved"><users/></group><group name="pointers"><users><user id="1005" type="pointer"/><user id="1006" type="pointer"/></users></group></groups></domain></section></document>

@@ -154,6 +154,31 @@ SWITCH_MODULE_DEFINITION(mod_h323, mod_h323_load, mod_h323_shutdown, NULL);
 
 SWITCH_MODULE_LOAD_FUNCTION(mod_h323_load)
 {
+	/* OOS-9 mutual exclusion - the single reason this production file is edited.
+	 *
+	 * mod_h323 links PTLib 2.10.9 (libpt.so.2.10.9) while mod_opal links PTLib
+	 * 2.12-beta10 (libpt.so.2.12-beta10), so co-loading them leaves two PTLib
+	 * runtimes contending for the one PProcess singleton a process can have, and
+	 * whichever module loads second SIGSEGVs inside PProcess::Construct() while
+	 * building its FSProcess - deterministically, in either load order.  Both
+	 * crash frames are in frozen third-party code, so refusing the second load is
+	 * the safe degradation: the sibling keeps serving calls, this module is merely
+	 * unavailable here, and the remedy is one endpoint per FreeSWITCH instance.
+	 *
+	 * The refusal belongs in module code because that is where the fault was
+	 * empirically found: under gdb the faulting stack carries a mod_*_load frame
+	 * and the second module logs its own entry line first, while a dlopen-only
+	 * probe never faults - see blitzy/documentation/oos9-coload-determination.md.
+	 * It must be the FIRST statement, because new FSProcess() below is what
+	 * creates the conflicting singleton. */
+	if (switch_loadable_module_exists("mod_opal") == SWITCH_STATUS_SUCCESS) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+			"Refusing to load mod_h323: mod_opal is already loaded in this process, and their conflicting PProcess "
+			"singletons - one per PTLib runtime, libpt.so.2.10.9 for mod_h323 against libpt.so.2.12-beta10 for "
+			"mod_opal - crash the process (OOS-9). Run the two endpoints in separate FreeSWITCH instances.\n");
+		return SWITCH_STATUS_FALSE;
+	}
+
 	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_CONSOLE, "Starting loading mod_h323\n");
 
 	*module_interface = switch_loadable_module_create_module_interface(pool, modname);

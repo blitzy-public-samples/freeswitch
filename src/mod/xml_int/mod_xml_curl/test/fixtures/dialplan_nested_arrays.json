@@ -1,0 +1,197 @@
+{
+  "dialplan": {
+    "context": {
+      "@name": "default",
+      "extension": [
+        {
+          "@name": "global",
+          "@continue": "true",
+          "condition": [
+            {
+              "@field": "call_debug",
+              "@expression": "^true$",
+              "@break": "never",
+              "action": [
+                {
+                  "@application": "info"
+                },
+                {
+                  "@application": "log",
+                  "@data": "INFO channel debug is enabled"
+                },
+                {
+                  "@application": "set",
+                  "@data": "call_debug_logged=true"
+                }
+              ]
+            },
+            {
+              "@field": "default_password",
+              "@expression": "^1234$",
+              "@break": "never",
+              "action": [
+                {
+                  "@application": "log",
+                  "@data": "CRIT Open vars.xml and change the default_password."
+                },
+                {
+                  "@application": "log",
+                  "@data": "CRIT Once changed type 'reloadxml' at the console."
+                },
+                {
+                  "@application": "sleep",
+                  "@data": "10000"
+                }
+              ]
+            },
+            {
+              "@field": "rtp_has_crypto",
+              "@expression": "^(AES_CM_128_HMAC_SHA1_32|AES_CM_128_HMAC_SHA1_80)$",
+              "@break": "never",
+              "action": [
+                {
+                  "@application": "set",
+                  "@data": "rtp_secure_media=true"
+                },
+                {
+                  "@application": "export",
+                  "@data": "rtp_secure_media=true"
+                },
+                {
+                  "@application": "log",
+                  "@data": "INFO offering srtp on the outbound leg"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "@name": "tod_holiday",
+          "@continue": "true",
+          "condition": [
+            {
+              "@wday": "2-6",
+              "@hour": "9-18",
+              "@break": "never",
+              "action": [
+                {
+                  "@application": "set",
+                  "@data": "open=true"
+                },
+                {
+                  "@application": "set",
+                  "@data": "business_hours=weekday"
+                },
+                {
+                  "@application": "log",
+                  "@data": "INFO weekday business hours"
+                }
+              ]
+            },
+            {
+              "@wday": "7",
+              "@hour": "10-14",
+              "@break": "never",
+              "action": [
+                {
+                  "@application": "set",
+                  "@data": "open=true"
+                },
+                {
+                  "@application": "set",
+                  "@data": "business_hours=saturday"
+                },
+                {
+                  "@application": "log",
+                  "@data": "INFO saturday business hours"
+                }
+              ]
+            },
+            {
+              "@mday": "25",
+              "@mon": "12",
+              "@break": "never",
+              "action": [
+                {
+                  "@application": "set",
+                  "@data": "open=false"
+                },
+                {
+                  "@application": "set",
+                  "@data": "business_hours=holiday"
+                },
+                {
+                  "@application": "log",
+                  "@data": "INFO christmas day closure"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "@name": "features",
+          "@continue": "true",
+          "condition": [
+            {
+              "@field": "record_stereo",
+              "@expression": "^true$",
+              "@break": "never",
+              "action": [
+                {
+                  "@application": "set",
+                  "@data": "record_stereo=true"
+                },
+                {
+                  "@application": "set",
+                  "@data": "RECORD_STEREO=true"
+                },
+                {
+                  "@application": "log",
+                  "@data": "INFO stereo recording enabled"
+                }
+              ]
+            },
+            {
+              "@field": "sip_via_protocol",
+              "@expression": "^(tls|wss)$",
+              "@break": "never",
+              "action": [
+                {
+                  "@application": "set",
+                  "@data": "sip_secure_media=true"
+                },
+                {
+                  "@application": "export",
+                  "@data": "sip_secure_media=true"
+                },
+                {
+                  "@application": "log",
+                  "@data": "INFO signalling arrived over tls"
+                }
+              ]
+            },
+            {
+              "@field": "accountcode",
+              "@expression": "^(\\d{4})$",
+              "@break": "never",
+              "action": [
+                {
+                  "@application": "set",
+                  "@data": "accountcode=$1"
+                },
+                {
+                  "@application": "export",
+                  "@data": "accountcode=$1"
+                },
+                {
+                  "@application": "log",
+                  "@data": "INFO billing account tagged"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,72 @@
+{
+  "dialplan": {
+    "context": {
+      "@name": "default",
+      "extension": [
+        {
+          "@name": "soporte_es",
+          "condition": {
+            "@field": "destination_number",
+            "@expression": "^(5000)$",
+            "action": [
+              {
+                "@application": "set",
+                "@data": "effective_caller_id_name=Atenci\u00f3n al Cliente"
+              },
+              {
+                "@application": "set",
+                "@data": "voicemail_greeting=Buz\u00f3n de voz"
+              },
+              {
+                "@application": "transfer",
+                "@data": "1000 XML default"
+              }
+            ]
+          }
+        },
+        {
+          "@name": "kundendienst_de",
+          "condition": {
+            "@field": "destination_number",
+            "@expression": "^(5001)$",
+            "action": [
+              {
+                "@application": "set",
+                "@data": "effective_caller_id_name=Kundendienst M\u00fcller"
+              },
+              {
+                "@application": "set",
+                "@data": "call_rate_currency=\u20ac"
+              },
+              {
+                "@application": "transfer",
+                "@data": "1001 XML default"
+              }
+            ]
+          }
+        },
+        {
+          "@name": "support_jp",
+          "condition": {
+            "@field": "destination_number",
+            "@expression": "^(5002)$",
+            "action": [
+              {
+                "@application": "set",
+                "@data": "effective_caller_id_name=\ud842\udfb7\u7530 \u592a\u90ce"
+              },
+              {
+                "@application": "set",
+                "@data": "effective_caller_id_number=5002"
+              },
+              {
+                "@application": "bridge",
+                "@data": "user/1002@example.com"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

@@ -2360,6 +2360,56 @@ static void test_opal_suite_state_cleanup(void)
 
 /*
  * ---------------------------------------------------------------------------
+ * OOS-9 co-load guard: the sibling stand-in
+ * ---------------------------------------------------------------------------
+ *
+ * mod_opal_load() refuses to load when mod_h323 is already in the process, because the
+ * two modules link different PTLib runtimes and the second FSProcess constructed
+ * SIGSEGVs on the conflicting PProcess singleton (mod_opal.cpp, top of mod_opal_load;
+ * evidence in blitzy/documentation/oos9-coload-determination.md).
+ *
+ * The refusal is asserted through the module-load API against a sibling that is genuinely
+ * present, which is what the guard's predicate actually reads:
+ * switch_loadable_module_exists() answers from loadable_modules.module_hash
+ * (switch_loadable_module.c:1846-1863), and switch_loadable_module_build_dynamic()
+ * (switch_loadable_module.h:169) registers a module in that hash under the filename it is
+ * handed - the same key switch_loadable_module_process() uses for a dlopen'd module
+ * (switch_loadable_module.c:1830).  Registering this two-function stand-in under
+ * "mod_h323" therefore makes the sibling present to the guard EXACTLY as the real module
+ * would be, while linking no second PTLib into this binary.
+ *
+ * That distinction is the whole reason the stand-in exists.  Loading the real mod_h323
+ * here is precisely the crash the guard prevents: it would map libpt.so.2.10.9 beside
+ * this binary's libpt.so.2.12-beta10 and kill the test process before it could assert
+ * anything.  So the negative branch is asserted hermetically against the predicate, and
+ * the end-to-end refusal of the real module - the ERROR line, the surviving process and a
+ * still-UP instance - is proven in the runtime evidence archived with the determination
+ * (blitzy/documentation/oos9-coload-evidence/), not here.
+ *
+ * The stand-in is deliberately inert: it creates a module interface, because
+ * switch_loadable_module_build_dynamic() dereferences one, and does nothing else.  Its
+ * shutdown routine succeeds so that switch_loadable_module_unload_module() can remove it
+ * again and hand its pool back.  Both carry C language linkage so their types match
+ * switch_module_load_t and switch_module_shutdown_t (switch_types.h:2608-2610) exactly.
+ */
+#define TEST_OPAL_SIBLING_MODULE "mod_h323"
+
+SWITCH_BEGIN_EXTERN_C
+static switch_status_t test_opal_sibling_stub_load(switch_loadable_module_interface_t **module_interface, switch_memory_pool_t *pool)
+{
+	*module_interface = switch_loadable_module_create_module_interface(pool, TEST_OPAL_SIBLING_MODULE);
+
+	return *module_interface != NULL ? SWITCH_STATUS_SUCCESS : SWITCH_STATUS_MEMERR;
+}
+
+static switch_status_t test_opal_sibling_stub_shutdown(void)
+{
+	return SWITCH_STATUS_SUCCESS;
+}
+SWITCH_END_EXTERN_C
+
+/*
+ * ---------------------------------------------------------------------------
  * The suite
  * ---------------------------------------------------------------------------
  *
@@ -2405,10 +2455,12 @@ static void test_opal_suite_state_cleanup(void)
  *      Initialise(), and therefore the only case with a listener thread.  It takes the
  *      PTLib process singleton over from the suite and deliberately leaves the module
  *      loaded;
- *   8. module_shutdown_succeeds - last, so it observes a fully initialised module and its
- *      result is asserted rather than discarded, and so that its two extra duties come
- *      last: proving the case before it orphaned no configuration provider, and running
- *      the suite's unconditional sweep.
+ *   8. module_shutdown_succeeds - declared after every case that builds module state, so it
+ *      observes a fully initialised module and its result is asserted rather than
+ *      discarded, and so that its two extra duties come last: proving the case before it
+ *      orphaned no configuration provider, and running the suite's unconditional sweep;
+ *   9. coload_guard_refuses_when_sibling_is_loaded - last; the OOS-9 refusal, which needs a
+ *      shut-down module and adds no state for case 8's sweep to release.
  */
 FST_CORE_BEGIN("conf_opal")
 {
@@ -2539,7 +2591,7 @@ FST_CORE_BEGIN("conf_opal")
 			 * provenance handshake proves it came from the parent of this run.  Helper mode
 			 * _exit()s from inside this first case, so a top-level run that entered it on an
 			 * inherited or stale marker alone would run one case, exit with that case's
-			 * status, and be recorded as a clean pass with the seven later cases never run.
+			 * status, and be recorded as a clean pass with the eight later cases never run.
 			 *
 			 * A marker without valid provenance is therefore a hard refusal rather than a
 			 * fallback to an ordinary run: the marker's presence also disarms the spawn
@@ -3339,8 +3391,9 @@ FST_CORE_BEGIN("conf_opal")
 			 * THE SUITE'S UNCONDITIONAL SWEEP.
 			 *
 			 * Nothing above it is fatal, so this runs on every path through the
-			 * case, and because it is the last declared case it runs even when an
-			 * earlier case exited early; only an environmental skip bypasses it,
+			 * case, and because it is declared after every case that builds module
+			 * state it runs even when an earlier case exited early; only an
+			 * environmental skip bypasses it,
 			 * and that discards the address space instead of leaving state behind.
 			 * It reclaims everything that can outlive a single case - the provider,
 			 * the log capture, the module's process, the suite's own process and the
@@ -3358,6 +3411,69 @@ FST_CORE_BEGIN("conf_opal")
 			fst_check(test_opal_process == NULL);
 			fst_check(test_opal_module_pool == NULL);
 			fst_check(!PProcess::IsInitialised());
+		}
+		FST_TEST_END()
+
+		/*
+		 * CASE 9 - the OOS-9 co-load refusal, declared last.
+		 *
+		 * Last for two reasons.  It needs a module that is NOT loaded, which is exactly
+		 * what case 8 leaves behind, and it must not perturb the eight cases before it:
+		 * the sibling stand-in it registers would make the load case refuse if it ever
+		 * outlived this case.  Being last also means the stand-in cannot strand
+		 * anything, since the only assertion after its removal is the removal itself,
+		 * and no check here is fatal.
+		 *
+		 * What is asserted is the guard's contract as the refine directive states it:
+		 * the predicate reports the sibling's absence and presence correctly, a load
+		 * attempted with the sibling present returns SWITCH_STATUS_FALSE, the module
+		 * interface is never created, and no FSProcess is constructed - which is the
+		 * property that matters, because constructing one is what crashes.  The
+		 * refusal's ERROR line names the PProcess conflict and both libpt versions; it
+		 * is written by the guard itself and read back in the archived runtime proof.
+		 *
+		 * fst_pool is the pool handed to the refused load deliberately: the guard
+		 * returns before switch_loadable_module_create_module_interface() is reached, so
+		 * nothing is ever allocated from it, and using the per-case pool keeps this case
+		 * clear of the module-lifetime pool that case 8's sweep destroyed.
+		 *
+		 * See the sibling stand-in above for why the real mod_h323 is not loaded here
+		 * and where the end-to-end proof lives instead.
+		 */
+		FST_TEST_BEGIN(coload_guard_refuses_when_sibling_is_loaded)
+		{
+			switch_loadable_module_interface_t *module_interface = NULL;
+			switch_status_t status = SWITCH_STATUS_FALSE;
+			const char *err = NULL;
+
+			/* The positive control.  Nothing in this binary has ever registered the
+			 * sibling, so the guard's predicate must report absence - which is why the
+			 * load case was allowed to proceed. */
+			fst_check(switch_loadable_module_exists(TEST_OPAL_SIBLING_MODULE) == SWITCH_STATUS_FALSE);
+
+			/* Registration is a statement whose status is checked afterwards, never the
+			 * expression of a fatal check: a fatal check here would break out of the
+			 * body and leave the stand-in registered. */
+			status = switch_loadable_module_build_dynamic((char *) TEST_OPAL_SIBLING_MODULE,
+														 test_opal_sibling_stub_load, NULL,
+														 test_opal_sibling_stub_shutdown, SWITCH_FALSE);
+			fst_xcheck(status == SWITCH_STATUS_SUCCESS, "the mod_h323 stand-in must register before the co-load guard is exercised");
+
+			if (status == SWITCH_STATUS_SUCCESS) {
+				fst_check(switch_loadable_module_exists(TEST_OPAL_SIBLING_MODULE) == SWITCH_STATUS_SUCCESS);
+
+				status = mod_opal_load(&module_interface, fst_pool);
+
+				fst_xcheck(status == SWITCH_STATUS_FALSE, "mod_opal must refuse to load while mod_h323 is present (OOS-9)");
+				fst_check(module_interface == NULL);
+				fst_check(!PProcess::IsInitialised());
+
+				/* Cleanup tail: remove the stand-in and confirm the predicate answers
+				 * absence again, so the refusal is provably a function of the sibling's
+				 * presence rather than of anything permanent this case did. */
+				fst_check(switch_loadable_module_unload_module("", TEST_OPAL_SIBLING_MODULE, SWITCH_FALSE, &err) == SWITCH_STATUS_SUCCESS);
+				fst_check(switch_loadable_module_exists(TEST_OPAL_SIBLING_MODULE) == SWITCH_STATUS_FALSE);
+			}
 		}
 		FST_TEST_END()
 	}

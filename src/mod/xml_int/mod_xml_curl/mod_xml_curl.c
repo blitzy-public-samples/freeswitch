@@ -61,8 +61,12 @@ struct xml_binding {
 	int timeout;
 	switch_size_t curl_max_bytes;
 	/* JSON: opt-in response representation for this binding. NULL selects the XML decoder;
-	   keep this append-only field last so no other member offset moves. */
+	   an append-only field, so no pre-existing member offset moves. */
 	char *response_format;
+	/* OBSERVABILITY: the configured binding name, carried so the fallback event can say which
+	   binding degraded. Append-only and last, so no existing member offset moves; NULL when the
+	   configuration named none. */
+	char *name;
 };
 
 static int keep_files_around = 0;
@@ -201,6 +205,31 @@ static size_t file_callback(void *ptr, size_t size, size_t nmemb, void *data)
  * XML_CURL_JSON_MAX_NAME_BYTES plus the byte a BadgerFish '@' prefix adds.
  */
 #define XML_CURL_JSON_MAX_TRANSFORMED_NAME_BYTES (XML_CURL_JSON_MAX_NODES * (XML_CURL_JSON_MAX_NAME_BYTES + 1))
+
+/*
+ * OBSERVABILITY: the machine-readable twin of the JSON fallback WARNING. A total fallback is a
+ * silent degradation of provisioning fidelity - the lookup still resolves, so nothing fails, and an
+ * operator only learns of it by reading logs. Firing a custom event beside the WARNING makes the
+ * degradation something an ESL consumer can subscribe to and alert on without log scraping.
+ *
+ * The subclass name follows the module::event_name convention switch_event.h recommends, so it is
+ * unambiguous on the wire: `events plain CUSTOM xml_curl::json_fallback`.
+ *
+ * The event's Fallback-Reason carries a two-valued machine taxonomy over the five human-readable
+ * reasons the WARNING renders: the Content-Type classifier rejection is one class of failure - the
+ * gateway answered in a representation this binding did not ask for - and every other edge is the
+ * other, a body that could not be turned into a BadgerFish document. The WARNING's five prose
+ * reasons are deliberately unchanged: they are the stable log signature the operator runbook
+ * documents, and an alert rule wants a token it can match exactly rather than prose.
+ *
+ * XML_CURL_JSON_FALLBACK_UNNAMED_BINDING is the single deterministic rendering used when the
+ * binding carries no name attribute, so a consumer never has to distinguish an absent header from
+ * an empty one.
+ */
+#define XML_CURL_JSON_FALLBACK_EVENT "xml_curl::json_fallback"
+#define XML_CURL_JSON_FALLBACK_REASON_MALFORMED "malformed-json"
+#define XML_CURL_JSON_FALLBACK_REASON_CONTENT_TYPE "content-type-mismatch"
+#define XML_CURL_JSON_FALLBACK_UNNAMED_BINDING "(unnamed)"
 
 /*
  * JSON: the budget threaded through the recursive translation. One caller-owned structure is what
@@ -1228,6 +1257,45 @@ static const char *xml_curl_json_redact_url(const char *url, char *buf, switch_s
 }
 
 /*
+ * OBSERVABILITY: fires the machine-readable twin of the JSON fallback WARNING, so an ESL consumer
+ * can alert on the degradation instead of scraping logs. Called from exactly one place - beside the
+ * WARNING in xml_curl_json_decode_response() - so the module keeps exactly one fallback signal site.
+ *
+ * FIRE AND FORGET, AND GUARDED. The function returns void and the caller ignores it, because
+ * observability must never change what the module does: every failure edge here - an event that
+ * could not be created, a header that could not be added, a dispatcher that refused the event -
+ * returns having changed nothing, leaves the value xml_curl_json_decode_response() returns exactly
+ * as it was, and leaves the XML parse that follows untouched. switch_event_fire() consumes the
+ * event and NULLs the pointer on every path including refusal, so there is nothing to release here.
+ *
+ * The three headers are the minimum an alert rule needs: which binding degraded, why, and which
+ * gateway answered. Both untrusted operands are rendered through the same bounding helpers the
+ * WARNING uses - the gateway URL through the redaction helper, because a configured gateway-url
+ * legitimately carries userinfo and its path and query routinely carry tokens, and the binding name
+ * through the sanitizer, because it comes from a configuration file. An event header is delivered
+ * verbatim to every subscriber and is commonly logged again downstream, so neither may be passed
+ * through raw.
+ */
+static void xml_curl_json_fire_fallback_event(const char *binding_name, const char *reason, const char *url)
+{
+	switch_event_t *event = NULL;
+	char safe_binding[128] = "";
+	char safe_url[256] = "";
+
+	if (switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM, XML_CURL_JSON_FALLBACK_EVENT) != SWITCH_STATUS_SUCCESS) {
+		return;
+	}
+
+	switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Binding",
+								   zstr(binding_name) ? XML_CURL_JSON_FALLBACK_UNNAMED_BINDING :
+								   xml_curl_json_sanitize_token(binding_name, safe_binding, sizeof(safe_binding)));
+	switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Fallback-Reason", reason);
+	switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Gateway", xml_curl_json_redact_url(url, safe_url, sizeof(safe_url)));
+
+	switch_event_fire(&event);
+}
+
+/*
  * JSON: appends one header to a curl slist without ever losing the list it was given.
  * switch_curl_slist_append() returns NULL when it cannot allocate, and libcurl leaves the
  * original list untouched in that case - so assigning the result straight back to the variable
@@ -1264,9 +1332,13 @@ static int xml_curl_json_append_header(switch_curl_slist_t **list, const char *h
    straight into switch_xml_locate(). Logging any of them verbatim would let a newline forge a
    second log entry or a control sequence reach an operator's terminal. cJSON_GetErrorPtr() is not
    consulted: it is process global while this code runs on many fetch threads at once, so it could
-   report an unrelated thread's error. */
+   report an unrelated thread's error.
+
+   OBSERVABILITY: every failure edge also carries a machine-readable token alongside its prose
+   reason, and `binding_name` names the binding whose fetch degraded. Both exist only to populate the
+   event fired beside the WARNING below; neither changes what this function returns. */
 static switch_xml_t xml_curl_json_decode_response(const char *filename, const char *content_type, switch_size_t max_bytes, const char *url,
-												  const char *section)
+												  const char *section, const char *binding_name)
 {
 	switch_xml_t xml = NULL;
 	char *json_text = NULL;
@@ -1274,17 +1346,26 @@ static switch_xml_t xml_curl_json_decode_response(const char *filename, const ch
 	char safe_content_type[96] = "";
 	char safe_section[64] = "";
 	const char *reason = "unknown translation error";
+	/* OBSERVABILITY: the two-valued taxonomy the event reports. Defaults to the malformed class,
+	   which is what the unreachable default prose above describes: anything that is not the
+	   Content-Type rejection is a body this module could not turn into a document. */
+	const char *event_reason = XML_CURL_JSON_FALLBACK_REASON_MALFORMED;
 
 	if (zstr(filename)) {
 		reason = "no response body was captured";
+		event_reason = XML_CURL_JSON_FALLBACK_REASON_MALFORMED;
 	} else if (zstr(section)) {
 		reason = "the requested provisioning section is unknown";
+		event_reason = XML_CURL_JSON_FALLBACK_REASON_MALFORMED;
 	} else if (!xml_curl_json_is_json_content_type(content_type)) {
 		reason = "response Content-Type is not application/json";
+		event_reason = XML_CURL_JSON_FALLBACK_REASON_CONTENT_TYPE;
 	} else if (!(json_text = xml_curl_json_read_file(filename, max_bytes))) {
 		reason = "response body could not be read in full";
+		event_reason = XML_CURL_JSON_FALLBACK_REASON_MALFORMED;
 	} else if (!(xml = xml_curl_json_to_xml(json_text, section))) {
 		reason = "response body is not a well-formed BadgerFish JSON document for the requested section";
+		event_reason = XML_CURL_JSON_FALLBACK_REASON_MALFORMED;
 	}
 
 	switch_safe_free(json_text);
@@ -1295,6 +1376,12 @@ static switch_xml_t xml_curl_json_decode_response(const char *filename, const ch
 						  xml_curl_json_sanitize_token(section, safe_section, sizeof(safe_section)),
 						  xml_curl_json_redact_url(url, safe_url, sizeof(safe_url)), reason,
 						  xml_curl_json_sanitize_token(content_type, safe_content_type, sizeof(safe_content_type)));
+
+		/* OBSERVABILITY: the same degradation, fired once for machines, co-located with the WARNING
+		   so this block is the module's single fallback signal site. The call cannot fail visibly and
+		   its outcome is deliberately ignored: what this function returns, and the XML parse the
+		   caller runs next, are exactly what they were before the event existed. */
+		xml_curl_json_fire_fallback_event(binding_name, event_reason, url);
 	}
 
 	return xml;
@@ -1660,7 +1747,7 @@ static switch_xml_t xml_url_fetch(const char *section, const char *tag_name, con
 			   requested, and a document outside the canonical contract all converge on the XML
 			   parse below. */
 			if (json_response) {
-				xml = xml_curl_json_decode_response(filename, content_type, binding->curl_max_bytes, binding->url, section);
+				xml = xml_curl_json_decode_response(filename, content_type, binding->curl_max_bytes, binding->url, section, binding->name);
 			}
 
 			/* JSON: parse the response as XML whenever the JSON decode did not produce a document.
@@ -1948,6 +2035,16 @@ static switch_status_t do_config(void)
 			binding->response_format = switch_core_strdup(globals.pool, response_format);
 		}
 
+		/* OBSERVABILITY: the binding's configured name, kept so the fallback event can identify
+		   which binding degraded. Guarded exactly like its siblings above - switch_xml_attr_soft()
+		   yields "" rather than NULL for an absent attribute, so an unnamed binding leaves the
+		   member at the NULL the memset() already wrote and the event renders it as
+		   XML_CURL_JSON_FALLBACK_UNNAMED_BINDING. The string lives in the module pool and is never
+		   freed individually. */
+		if (!zstr(bname)) {
+			binding->name = switch_core_strdup(globals.pool, bname);
+		}
+
 		/* SECURITY: a gateway URL legitimately carries HTTP userinfo and query parameters, and both
 		   are routinely credential bearing. This registration notice is written once per binding at
 		   module load, so an unredacted rendering would persist a provisioning secret to the log file
@@ -1973,6 +2070,7 @@ static switch_status_t do_config(void)
 SWITCH_MODULE_LOAD_FUNCTION(mod_xml_curl_load)
 {
 	switch_api_interface_t *xml_curl_api_interface;
+	switch_status_t subclass_status;
 
 	/* connect my internal structure to the blank pointer passed to me */
 	*module_interface = switch_loadable_module_create_module_interface(pool, modname);
@@ -1986,6 +2084,21 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_xml_curl_load)
 		return SWITCH_STATUS_FALSE;
 	}
 
+	/* OBSERVABILITY: register the fallback event's subclass so an ESL consumer can discover it by
+	   name. Reserved only once the configuration has been accepted, so the reservation's lifetime
+	   matches the module's and shutdown's release is its exact counterpart.
+	   An already-reserved result is expected rather than exceptional - a listener that subscribed
+	   first reserves the name on this module's behalf, and the white-box test suite drives load and
+	   shutdown directly within one process, possibly more than once - so SWITCH_STATUS_INUSE is
+	   tolerated and no outcome fails the load: emission does not depend on the reservation, so at
+	   worst the event still fires and only its discoverability by name is degraded. */
+	if ((subclass_status = switch_event_reserve_subclass(XML_CURL_JSON_FALLBACK_EVENT)) != SWITCH_STATUS_SUCCESS &&
+		subclass_status != SWITCH_STATUS_INUSE) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+						  "Could not reserve the %s event subclass (status %d); the fallback event still fires\n",
+						  XML_CURL_JSON_FALLBACK_EVENT, (int) subclass_status);
+	}
+
 	SWITCH_ADD_API(xml_curl_api_interface, "xml_curl", "XML Curl", xml_curl_function, XML_CURL_SYNTAX);
 	switch_console_set_complete("add xml_curl debug_on");
 	switch_console_set_complete("add xml_curl debug_off");
@@ -1997,6 +2110,13 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_xml_curl_load)
 SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_xml_curl_shutdown)
 {
 	hash_node_t *ptr = NULL;
+
+	/* OBSERVABILITY: release the fallback event's subclass, the counterpart of the reservation in
+	   mod_xml_curl_load(). The outcome is deliberately not checked: the core keeps the name alive for
+	   a listener that is still subscribed and reports that as a failure, which is the correct
+	   behaviour rather than an error to handle here, and a name this module never reserved is simply
+	   not found. */
+	switch_event_free_subclass(XML_CURL_JSON_FALLBACK_EVENT);
 
 	while (globals.hash_root) {
 		ptr = globals.hash_root;

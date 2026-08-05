@@ -1,0 +1,106 @@
+# OOS-9 Outcome A — runtime proof of the delivered guard
+
+Both load orders, each in a fresh, fully isolated disposable instance (own
+conf/log/db/run/temp/cache copy and its own event-socket port 28021; the installed
+configuration under /usr/local/freeswitch/conf was not modified, and only the pid each
+run started was signalled).  The four observables the refine directive requires are
+labelled inline.
+
+===== OOS-9 Outcome A runtime proof: load mod_h323 into one process, then attempt mod_opal =====
+instance pid: 903019   event socket: 127.0.0.1:28021   isolated prefix: /tmp/blitzy/freeswitch/blitzy-736674cf-ebe1-40c1-b224-21affe971d9d-w-007_bc27f1/blitzy_adhoc_test_w8/live
+
+$ fs_cli -x 'load mod_h323'
++OK Reloading XML
++OK
+
+
+$ fs_cli -x 'module_exists mod_h323'
+true
+
+===== OBSERVABLE 1: the second load is REFUSED (SWITCH_STATUS_FALSE surfaced as a load error) =====
+$ fs_cli -x 'load mod_opal'
++OK Reloading XML
+-ERR [module load file routine returned an error]
+
+
+$ fs_cli -x 'module_exists mod_opal'   (false => the refused module is NOT registered)
+false
+
+===== OBSERVABLE 2: the ERROR line naming the PProcess singleton conflict =====
+2026-08-05 22:58:06.557719 99.23% [ERR] mod_opal.cpp:122 Refusing to load mod_opal: mod_h323 is already loaded in this process, and their conflicting PProcess singletons - one per PTLib runtime, libpt.so.2.12-beta10 for mod_opal against libpt.so.2.10.9 for mod_h323 - crash the process (OOS-9). Run the two endpoints in separate FreeSWITCH instances.
+2026-08-05 22:58:06.557719 99.23% [CRIT] switch_loadable_module.c:1754 Error Loading module /usr/local/freeswitch/mod/mod_opal.so
+
+===== OBSERVABLE 3: the process SURVIVES the refused load =====
+pid 903019 is alive: PASS
+ 903019 S<sl       00:05 freeswitch
+
+===== OBSERVABLE 4: fs_cli -x status still reports UP =====
+$ fs_cli -H 127.0.0.1 -P 28021 -p ClueCon -x status
+UP 0 years, 0 days, 0 hours, 0 minutes, 5 seconds, 465 milliseconds, 769 microseconds
+FreeSWITCH (Version 1.11.2-dev git c3a8573 2026-08-01 12:02:01Z 64bit) is ready
+0 session(s) since startup
+0 session(s) - peak 0, last 5min 0 
+0 session(s) per Sec out of max 30, peak 0, last 5min 0 
+1000 session(s) max
+min idle cpu 0.00/98.80
+Current Stack Size/Max 240K/8192K
+
+
+===== registration state of both endpoints in this process =====
+endpoint,h323,mod_h323,/usr/local/freeswitch/mod/mod_h323.so
+
+===== module load lines from this instance's own log =====
+2026-08-05 22:58:03.337717 100.00% [CONSOLE] mod_h323.cpp:182 Starting loading mod_h323
+2026-08-05 22:58:03.357718 100.00% [CONSOLE] switch_loadable_module.c:1772 Successfully Loaded [mod_h323]
+2026-08-05 22:58:06.557719 99.23% [ERR] mod_opal.cpp:122 Refusing to load mod_opal: mod_h323 is already loaded in this process, and their conflicting PProcess singletons - one per PTLib runtime, libpt.so.2.12-beta10 for mod_opal against libpt.so.2.10.9 for mod_h323 - crash the process (OOS-9). Run the two endpoints in separate FreeSWITCH instances.
+2026-08-05 22:58:06.557719 99.23% [CRIT] switch_loadable_module.c:1754 Error Loading module /usr/local/freeswitch/mod/mod_opal.so
+
+
+===== OOS-9 Outcome A runtime proof: load mod_opal into one process, then attempt mod_h323 =====
+instance pid: 908286   event socket: 127.0.0.1:28021   isolated prefix: /tmp/blitzy/freeswitch/blitzy-736674cf-ebe1-40c1-b224-21affe971d9d-w-007_bc27f1/blitzy_adhoc_test_w8/live
+
+$ fs_cli -x 'load mod_opal'
++OK Reloading XML
++OK
+
+
+$ fs_cli -x 'module_exists mod_opal'
+true
+
+===== OBSERVABLE 1: the second load is REFUSED (SWITCH_STATUS_FALSE surfaced as a load error) =====
+$ fs_cli -x 'load mod_h323'
++OK Reloading XML
+-ERR [module load file routine returned an error]
+
+
+$ fs_cli -x 'module_exists mod_h323'   (false => the refused module is NOT registered)
+false
+
+===== OBSERVABLE 2: the ERROR line naming the PProcess singleton conflict =====
+2026-08-05 22:58:31.795969 98.93% [ERR] mod_h323.cpp:175 Refusing to load mod_h323: mod_opal is already loaded in this process, and their conflicting PProcess singletons - one per PTLib runtime, libpt.so.2.10.9 for mod_h323 against libpt.so.2.12-beta10 for mod_opal - crash the process (OOS-9). Run the two endpoints in separate FreeSWITCH instances.
+2026-08-05 22:58:31.795969 98.93% [CRIT] switch_loadable_module.c:1754 Error Loading module /usr/local/freeswitch/mod/mod_h323.so
+
+===== OBSERVABLE 3: the process SURVIVES the refused load =====
+pid 908286 is alive: PASS
+ 908286 S<sl       00:05 freeswitch
+
+===== OBSERVABLE 4: fs_cli -x status still reports UP =====
+$ fs_cli -H 127.0.0.1 -P 28021 -p ClueCon -x status
+UP 0 years, 0 days, 0 hours, 0 minutes, 5 seconds, 372 milliseconds, 252 microseconds
+FreeSWITCH (Version 1.11.2-dev git c3a8573 2026-08-01 12:02:01Z 64bit) is ready
+0 session(s) since startup
+0 session(s) - peak 0, last 5min 0 
+0 session(s) per Sec out of max 30, peak 0, last 5min 0 
+1000 session(s) max
+min idle cpu 0.00/98.27
+Current Stack Size/Max 240K/8192K
+
+
+===== registration state of both endpoints in this process =====
+endpoint,opal,mod_opal,/usr/local/freeswitch/mod/mod_opal.so
+
+===== module load lines from this instance's own log =====
+2026-08-05 22:58:28.635975 100.00% [CONSOLE] mod_opal.cpp:130 Starting loading mod_opal
+2026-08-05 22:58:28.635975 100.00% [CONSOLE] switch_loadable_module.c:1772 Successfully Loaded [mod_opal]
+2026-08-05 22:58:31.795969 98.93% [ERR] mod_h323.cpp:175 Refusing to load mod_h323: mod_opal is already loaded in this process, and their conflicting PProcess singletons - one per PTLib runtime, libpt.so.2.10.9 for mod_h323 against libpt.so.2.12-beta10 for mod_opal - crash the process (OOS-9). Run the two endpoints in separate FreeSWITCH instances.
+2026-08-05 22:58:31.795969 98.93% [CRIT] switch_loadable_module.c:1754 Error Loading module /usr/local/freeswitch/mod/mod_h323.so

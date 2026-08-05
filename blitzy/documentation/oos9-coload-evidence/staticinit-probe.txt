@@ -1,0 +1,13 @@
+$ gcc -O0 -g -o dlopen_probe dlopen_probe.c -ldl
+
+$ ./dlopen_probe /usr/local/freeswitch/mod/mod_h323.so /usr/local/freeswitch/mod/mod_opal.so
+dlopen OK (static initialisation complete) /usr/local/freeswitch/mod/mod_h323.so
+dlopen OK (static initialisation complete) /usr/local/freeswitch/mod/mod_opal.so
+both modules mapped into ONE process; no fault during static initialisation
+exit=0
+
+$ ./dlopen_probe /usr/local/freeswitch/mod/mod_opal.so /usr/local/freeswitch/mod/mod_h323.so
+dlopen OK (static initialisation complete) /usr/local/freeswitch/mod/mod_opal.so
+dlopen OK (static initialisation complete) /usr/local/freeswitch/mod/mod_h323.so
+both modules mapped into ONE process; no fault during static initialisation
+exit=0
