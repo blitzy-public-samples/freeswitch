@@ -1,0 +1,69 @@
+# Tail of /usr/local/freeswitch/log/freeswitch.log for this run (last 40 lines of the crashed instance)
+# Full run captured 1139 lines; the module-relevant lines and the final 40 are archived.
+# Redaction: this capture is verbatim except that the SignalWire connection token this
+# throwaway instance printed at startup, the STUN-detected external address and the host's
+# LAN address are replaced by the <redacted-...> placeholders below, and trailing whitespace
+# was stripped from the captured lines.  None of the four observables OOS-9 turns on is
+# affected: no redacted line is a module load, a refusal, a fault or a status line.
+
+## grep -nE 'Starting loading|Successfully Loaded \[mod_(h323|opal)\]|initialized' :
+212:2026-08-05 22:34:16.602464 0.00% [NOTICE] switch_loadable_module.c:172 Adding Endpoint 'sofia'
+213:2026-08-05 22:34:16.602504 0.00% [NOTICE] switch_loadable_module.c:172 Adding Endpoint 'rtp'
+228:2026-08-05 22:34:16.605536 0.00% [NOTICE] switch_loadable_module.c:172 Adding Endpoint 'loopback'
+229:2026-08-05 22:34:16.605560 0.00% [NOTICE] switch_loadable_module.c:172 Adding Endpoint 'null'
+232:2026-08-05 22:34:16.607550 0.00% [NOTICE] switch_loadable_module.c:172 Adding Endpoint 'rtc'
+240:2026-08-05 22:34:16.616975 0.00% [NOTICE] switch_loadable_module.c:172 Adding Endpoint 'verto.rtc'
+442:2026-08-05 22:34:17.206180 0.00% [NOTICE] switch_loadable_module.c:172 Adding Endpoint 'error'
+443:2026-08-05 22:34:17.206203 0.00% [NOTICE] switch_loadable_module.c:172 Adding Endpoint 'group'
+444:2026-08-05 22:34:17.206215 0.00% [NOTICE] switch_loadable_module.c:172 Adding Endpoint 'user'
+445:2026-08-05 22:34:17.206223 0.00% [NOTICE] switch_loadable_module.c:172 Adding Endpoint 'pickup'
+660:2026-08-05 22:34:17.304880 0.00% [NOTICE] switch_loadable_module.c:172 Adding Endpoint 'SIP'
+661:2026-08-05 22:34:17.304895 0.00% [NOTICE] switch_loadable_module.c:172 Adding Endpoint 'IAX2'
+669:2026-08-05 22:34:17.328843 0.00% [NOTICE] switch_loadable_module.c:172 Adding Endpoint 'modem'
+1122:2026-08-05 22:34:18.478533 100.00% [CONSOLE] mod_h323.cpp:157 Starting loading mod_h323
+1130:2026-08-05 22:34:18.498531 100.00% [CONSOLE] mod_h323.cpp:174 H323 mod initialized and running
+1131:2026-08-05 22:34:18.498531 100.00% [CONSOLE] switch_loadable_module.c:1772 Successfully Loaded [mod_h323]
+1132:2026-08-05 22:34:18.498531 100.00% [NOTICE] switch_loadable_module.c:172 Adding Endpoint 'h323'
+1139:2026-08-05 22:34:22.158527 98.77% [CONSOLE] mod_opal.cpp:104 Starting loading mod_opal
+
+## final 40 lines (the log ends where the process died):
+|     ____ _             ____                                                                           |
+|    / ___| |_   _  ___ / ___|___  _ __         ___ ___  _ __ ___                                       |
+|   | |   | | | | |/ _ \ |   / _ \| '_ \       / __/ _ \| '_ ` _ \                                      |
+|   | |___| | |_| |  __/ |__| (_) | | | |  _  | (_| (_) | | | | | |                                     |
+|    \____|_|\__,_|\___|\____\___/|_| |_| (_)  \___\___/|_| |_| |_|                                     |
+|                                                                                                       |
+.=======================================================================================================.
+[m
+
+2026-08-05 22:34:17.899123 100.00% [INFO] switch_core.c:2506
+FreeSWITCH Version 1.11.2-dev+git~20260801T120201Z~c3a857358d~64bit (git c3a8573 2026-08-01 12:02:01Z 64bit)
+
+FreeSWITCH Started
+Max Sessions [1000]
+Session Rate [30]
+SQL [Enabled]
+2026-08-05 22:34:18.078547 100.00% [NOTICE] mod_signalwire.c:401 Go to https://signalwire.com to set up your Connector now! Enter connection token <redacted: SignalWire connection token>
+2026-08-05 22:34:18.078547 100.00% [INFO] mod_signalwire.c:1125 Next SignalWire adoption check in 1 minutes
+2026-08-05 22:34:18.098542 100.00% [INFO] switch_stun.c:924 External ip address detected using STUN: <redacted-external-ip>
+2026-08-05 22:34:18.158538 100.00% [INFO] switch_stun.c:924 External ip address detected using STUN: <redacted-external-ip>
+2026-08-05 22:34:18.198539 100.00% [INFO] mod_enum.c:890 ENUM Reloaded
+2026-08-05 22:34:18.198539 100.00% [INFO] switch_time.c:1436 Timezone reloaded 597 definitions
+2026-08-05 22:34:18.478533 100.00% [CONSOLE] mod_h323.cpp:157 Starting loading mod_h323
+2026-08-05 22:34:18.498531 100.00% [DEBUG] mod_h323.cpp:372 ======>FSProcess::Initialise [0x7fff7421d490]
+2026-08-05 22:34:18.498531 100.00% [DEBUG] mod_h323.cpp:608 ======>FSH323EndPoint::FSH323EndPoint [0x7fff742401d0]
+2026-08-05 22:34:18.498531 100.00% [DEBUG] mod_h323.cpp:380 ======>FSManager::Initialise [0x7fff742401d0]
+2026-08-05 22:34:18.498531 100.00% [DEBUG] mod_h323.cpp:462 ======>FSH323EndPoint::ReadConfig [0x7fff742401d0]
+2026-08-05 22:34:18.498531 100.00% [ERR] mod_h323.cpp:485 open of h323.conf failed
+2026-08-05 22:34:18.498531 100.00% [DEBUG] mod_h323.cpp:394 Config capability
+2026-08-05 22:34:18.498531 100.00% [DEBUG] mod_h323.cpp:428 --->fax_asn
+2026-08-05 22:34:18.498531 100.00% [CONSOLE] mod_h323.cpp:174 H323 mod initialized and running
+2026-08-05 22:34:18.498531 100.00% [CONSOLE] switch_loadable_module.c:1772 Successfully Loaded [mod_h323]
+2026-08-05 22:34:18.498531 100.00% [NOTICE] switch_loadable_module.c:172 Adding Endpoint 'h323'
+2026-08-05 22:34:20.098554 99.30% [ERR] sofia.c:3293 Error Creating SIP UA for profile: external-ipv6 (sip:mod_sofia@[::1]:5080;transport=udp,tcp) ATTEMPT 2 (RETRY IN 5 SEC)
+2026-08-05 22:34:20.098554 99.30% [ERR] sofia.c:3293 Error Creating SIP UA for profile: internal-ipv6 (sip:mod_sofia@[::1]:5060;transport=udp,tcp) ATTEMPT 2 (RETRY IN 5 SEC)
+2026-08-05 22:34:21.578543 99.00% [INFO] switch_stun.c:924 External ip address detected using STUN: <redacted-external-ip>
+2026-08-05 22:34:21.618530 99.00% [INFO] switch_stun.c:924 External ip address detected using STUN: <redacted-external-ip>
+2026-08-05 22:34:21.698529 99.00% [INFO] mod_enum.c:890 ENUM Reloaded
+2026-08-05 22:34:21.698529 99.00% [INFO] switch_time.c:1436 Timezone reloaded 597 definitions
+2026-08-05 22:34:22.158527 98.77% [CONSOLE] mod_opal.cpp:104 Starting loading mod_opal

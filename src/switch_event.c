@@ -698,6 +698,28 @@ SWITCH_DECLARE(switch_status_t) switch_event_init(switch_memory_pool_t *pool)
 	if (MAX_DISPATCH < 2) {
 		MAX_DISPATCH = 2;
 	}
+	/* ...and never more than the dispatch bookkeeping arrays can hold.
+	   EVENT_DISPATCH_QUEUE_THREADS and EVENT_DISPATCH_QUEUE_RUNNING are fixed
+	   MAX_DISPATCH_VAL-element arrays, but the expression above is derived
+	   solely from the CPU count, so on a host reporting 2 * MAX_DISPATCH_VAL or
+	   more logical CPUs it yields a larger value.  Both the launch loop in
+	   switch_event_launch_dispatch_threads() and the join loop in
+	   switch_event_shutdown() index those arrays over the whole
+	   [0, MAX_DISPATCH) range, so without this upper clamp they run one or more
+	   elements past the end - the join then hands whatever follows the array to
+	   switch_thread_join() and the process dies during core teardown.  This is
+	   the only place MAX_DISPATCH is ever assigned, so clamping here makes
+	   MAX_DISPATCH <= MAX_DISPATCH_VAL a total invariant for every reader: the
+	   dispatch thread's own self-lookup already relies on it, bounding its
+	   search by MAX_DISPATCH_VAL and refusing to run when no slot matches.
+	   The lower clamp above has always been paired with an implicit upper bound
+	   of MAX_DISPATCH_VAL, because that is MAX_DISPATCH's static initialiser;
+	   this makes that bound explicit and unconditional, and on any host below
+	   the threshold it is a no-op.  Nothing is logged here: switch_event_init()
+	   runs before the logger is accepting messages. */
+	if (MAX_DISPATCH > MAX_DISPATCH_VAL) {
+		MAX_DISPATCH = MAX_DISPATCH_VAL;
+	}
 
 	switch_assert(pool != NULL);
 	THRUNTIME_POOL = RUNTIME_POOL = pool;

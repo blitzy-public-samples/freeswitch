@@ -1,0 +1,30 @@
+PTLib 2.12-beta10 (OPAL stack): compare the option spec pointer against NULL
+
+`spec' is a const char *, and `spec == '\0'` compiled only because '\0' was a
+null pointer constant before C++11: the statement tested whether the pointer was
+null.  Since C++11 the literal is an integer there and the comparison is
+ill-formed, so this translation unit does not build with any current compiler.
+
+The repair states the null comparison the original expression actually performed
+and therefore preserves the behaviour exactly.  It deliberately does NOT change
+the test to `*spec == '\0'`, which is what the message "Empty [] clause" implies
+was intended: this patch set exists to make the pinned source compile on a
+current toolchain, not to fix upstream bugs, and changing the condition would
+make PArgList reject option specifications it accepts today.
+
+Applies to: 10503462abe31a6c288a39f6f894a5ceb367abbc (branch v2_12)
+Upstream:   https://git.code.sf.net/p/opalvoip/ptlib
+
+diff --git a/src/ptlib/common/osutils.cxx b/src/ptlib/common/osutils.cxx
+index 7098c5f..fa18322 100644
+--- a/src/ptlib/common/osutils.cxx
++++ b/src/ptlib/common/osutils.cxx
+@@ -1401,7 +1401,7 @@ bool PArgList::Parse(const char * spec, PBoolean optionsBeforeParams)
+           return false;
+         opts.m_section = PString(spec, end-spec);
+         spec = end+1;
+-        if (InternalSpecificationError(spec == '\0', "Empty [] clause in specification."))
++        if (InternalSpecificationError(spec == NULL, "Empty [] clause in specification."))
+           return false;
+       }
+ 

@@ -1,0 +1,17 @@
+{
+  "document": {
+    "@type": "freeswitch/xml",
+    "section": {
+      "@name": "directory",
+      "user": {
+        "@id": "1000",
+        "params": {
+          "param": {
+            "@name": "badgerfish-violation",
+            "@value": "ENVELOPE_ATTRIBUTES_EMITTED"
+          }
+        }
+      }
+    }
+  }
+}

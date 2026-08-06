@@ -48,11 +48,18 @@ switch_core_media
 switch_sip
 switch_rtp_pcap
 test_tts_format
+switch_stun
+test_mod_verto
 .deps/
 Makefile
 conf/*/
 conf_playsay/*/
 conf_async/*/
+# Every remaining per-run fixture directory the suites create, named after the
+# pid: conf_rtp, conf_sip, conf_stun, conf_test, conf_tts_format, conf_verto and
+# any future sibling.  Only four of the roots were listed, so a full `make check'
+# left the other six as untracked directories.
+conf*/[0-9]*/
 x64
 win32
 *.vcxproj.user

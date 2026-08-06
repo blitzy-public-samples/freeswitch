@@ -1,0 +1,47 @@
+# Archived transcript of the OOS-9 static-initialisation probe (staticinit-probe.c, this directory).
+# Re-runnable verbatim: the source, the compile command and the binary name below are the ones
+# committed here.  Exactly two module paths are required, so the two-module verdict can only be
+# printed by a run that really mapped two modules - the first invocation below proves the refusal.
+#
+# One environment note, so a re-run cannot be misread.  The probe dlopens the INSTALLED modules,
+# which link the installed libfreeswitch.  Against a plain build the compile command below is
+# enough.  Against a sanitizer build - what ci.sh's unit-test arm configures - the same command
+# yields 'undefined symbol: __asan_option_detect_stack_use_after_return' at dlopen, because an
+# uninstrumented program cannot load an instrumented library.  That is a toolchain mismatch, not
+# a co-load fault: adding -fsanitize=address reproduces the verdict exactly, as the final block
+# below shows.  Both forms were run for this record.
+
+$ gcc -Wall -Wextra -Werror -O0 -g -o staticinit-probe staticinit-probe.c -ldl
+
+$ ./staticinit-probe /usr/local/freeswitch/mod/mod_h323.so
+usage: ./staticinit-probe <module-1.so> <module-2.so>
+       exactly 2 module paths are required: this probe reports whether TWO
+       modules survive static initialisation in one process
+exit=2
+
+$ ./staticinit-probe /usr/local/freeswitch/mod/mod_h323.so /usr/local/freeswitch/mod/mod_opal.so
+dlopen OK (static initialisation complete) /usr/local/freeswitch/mod/mod_h323.so
+dlopen OK (static initialisation complete) /usr/local/freeswitch/mod/mod_opal.so
+both modules mapped into ONE process; no fault during static initialisation
+exit=0
+
+$ ./staticinit-probe /usr/local/freeswitch/mod/mod_opal.so /usr/local/freeswitch/mod/mod_h323.so
+dlopen OK (static initialisation complete) /usr/local/freeswitch/mod/mod_opal.so
+dlopen OK (static initialisation complete) /usr/local/freeswitch/mod/mod_h323.so
+both modules mapped into ONE process; no fault during static initialisation
+exit=0
+
+# Same probe against a sanitizer-built install, to show the verdict is independent of the build:
+$ gcc -Wall -Wextra -Werror -O0 -g -fsanitize=address -o staticinit-probe staticinit-probe.c -ldl
+
+$ ASAN_OPTIONS=detect_leaks=0 ./staticinit-probe /usr/local/freeswitch/mod/mod_h323.so /usr/local/freeswitch/mod/mod_opal.so
+dlopen OK (static initialisation complete) /usr/local/freeswitch/mod/mod_h323.so
+dlopen OK (static initialisation complete) /usr/local/freeswitch/mod/mod_opal.so
+both modules mapped into ONE process; no fault during static initialisation
+exit=0
+
+$ ASAN_OPTIONS=detect_leaks=0 ./staticinit-probe /usr/local/freeswitch/mod/mod_opal.so /usr/local/freeswitch/mod/mod_h323.so
+dlopen OK (static initialisation complete) /usr/local/freeswitch/mod/mod_opal.so
+dlopen OK (static initialisation complete) /usr/local/freeswitch/mod/mod_h323.so
+both modules mapped into ONE process; no fault during static initialisation
+exit=0

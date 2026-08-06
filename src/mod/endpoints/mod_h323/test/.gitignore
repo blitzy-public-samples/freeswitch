@@ -1,0 +1,5 @@
+.dirstamp
+.libs/
+.deps/
+test_mod_h323*.o
+test_mod_h323

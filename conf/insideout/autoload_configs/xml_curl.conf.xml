@@ -16,6 +16,37 @@
       <!-- <param name="ignore-cacert-check" value="true" /> -->
       <!-- one or more of these imply you want to pick the exact variables that are transmitted -->
       <!--<param name="enable-post-var" value="Unique-ID"/>-->
+
+      <!-- optional: for HTTP(S) gateway urls, decode a BadgerFish JSON provisioning response
+           instead of XML. With value "json" the module sends Accept: application/json. A "file:"
+           gateway url is read off disk before any request, so it is always XML.
+
+           The accepted shape is a restricted profile: one JSON object whose single key names the
+           requested section. Within an element, "@name" is a string attribute and "$" is string
+           text; any other member is a child, as a nested object or a non empty array of objects.
+           Numbers, booleans and nulls are refused; an element carries either "$" or children,
+           never both; and the top level object carries no "@" attribute member of any name,
+           since the module builds the document and section envelope itself.
+
+           The profile is bounded as well, so a runaway or hostile response cannot exhaust memory.
+           A document may nest 32 levels deep and may carry 50000 values in total; one object may
+           carry 256 members, one array 256 elements, and one parent 256 children across every
+           name; the whole document may build 20000 elements and attributes; one string value may
+           be 8192 bytes and one name 128 bytes. Exceeding any of these is refused like any other
+           shape error. The existing response-max-bytes parameter still caps the response body
+           itself, for JSON exactly as it does for XML.
+
+           A response that is not application/json, or whose body falls outside that profile, is
+           logged as a warning and parsed as XML instead, and the same degradation also fires the
+           custom event xml_curl::json_fallback, so it can be alerted on without log scraping.
+           When omitted, responses are decoded as XML.
+
+           The operator runbook at src/mod/xml_int/mod_xml_curl/README.response-format.md
+           documents this contract in full: both fallback reasons and their log and event
+           signatures, the eleven resource ceilings, the "file:" boundary, the TLS hardening
+           parameters, cookie jar placement, the mod_h323 / mod_opal co-load prohibition, and the
+           standalone validator that proves a gateway's JSON conforms before it is deployed. -->
+      <!-- <param name="response-format" value="json"/> -->
     </binding>
   </bindings>
 </configuration>

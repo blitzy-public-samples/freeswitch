@@ -283,4 +283,14 @@ images/test_text.png
 src/mod/codecs/mod_amrwb/test/test_amrwb
 src/mod/endpoints/mod_sofia/test/sipp-based-tests
 
+# The remaining collected test programs, whose libtool wrapper scripts `make'
+# produces alongside the ones already listed above.  They were the only
+# TESTS-declaring modules whose wrapper had no entry anywhere, so building the
+# tree - which is the only way to run `make check' at all - left them showing up
+# as untracked and invited someone to commit a binary by accident.
+src/mod/codecs/mod_amr/test/test_amr
+src/mod/codecs/mod_openh264/test/test_mod_openh264
+src/mod/endpoints/mod_sofia/test/test_603plus
+src/mod/formats/mod_opusfile/test/test_opusfile
+
 .DS_Store

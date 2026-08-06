@@ -1,0 +1,71 @@
+{
+  "dialplan": {
+    "context": {
+      "@name": "public",
+      "extension": [
+        {
+          "@name": "tone_announce",
+          "condition": {
+            "@field": "destination_number",
+            "@expression": "^9195$",
+            "@break": "never",
+            "action": [
+              {
+                "@application": "answer"
+              },
+              {
+                "@application": "playback",
+                "$": "tone_stream://%(2000,4000,440,480)"
+              },
+              {
+                "@application": "sleep",
+                "@data": "1000"
+              }
+            ],
+            "anti-action": {
+              "@application": "respond",
+              "@data": "486"
+            }
+          }
+        },
+        {
+          "@name": "detect_inband_dtmf",
+          "@continue": "true",
+          "condition": {
+            "@field": "switch_r_sdp",
+            "@expression": "telephone-event",
+            "@break": "never",
+            "action": {
+              "@application": "set",
+              "@data": "rtp_payload_number=101"
+            },
+            "anti-action": {
+              "@application": "start_dtmf"
+            }
+          }
+        },
+        {
+          "@name": "secure_media",
+          "@continue": "true",
+          "condition": [
+            {},
+            {
+              "@field": "sip_via_protocol",
+              "@expression": "^tls$",
+              "@break": "never",
+              "action": [
+                {
+                  "@application": "export",
+                  "$": "sip_secure_media=true"
+                },
+                {
+                  "@application": "info"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

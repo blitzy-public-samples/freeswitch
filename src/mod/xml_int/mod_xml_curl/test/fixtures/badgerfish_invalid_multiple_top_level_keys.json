@@ -1,0 +1,18 @@
+{
+  "directory": {
+    "user": {
+      "@id": "1000",
+      "params": {
+        "param": {
+          "@name": "badgerfish-violation",
+          "@value": "MULTIPLE_TOP_LEVEL_KEYS"
+        }
+      }
+    }
+  },
+  "dialplan": {
+    "context": {
+      "@name": "default"
+    }
+  }
+}

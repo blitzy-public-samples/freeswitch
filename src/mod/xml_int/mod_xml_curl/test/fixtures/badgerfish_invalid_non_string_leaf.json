@@ -1,0 +1,19 @@
+{
+  "configuration": {
+    "configuration": {
+      "@name": "event_socket.conf",
+      "settings": {
+        "param": [
+          {
+            "@name": "badgerfish-violation",
+            "@value": "NON_STRING_LEAF"
+          },
+          {
+            "@name": "listen-port",
+            "@value": 8021
+          }
+        ]
+      }
+    }
+  }
+}

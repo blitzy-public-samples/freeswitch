@@ -1,0 +1,45 @@
+PTLib 2.12-beta10 (OPAL stack): construct the pid-file streams from a char *
+
+libstdc++ resolves std::ifstream's constructor over const char *,
+std::filesystem::path and std::string.  PString converts implicitly to all
+three, so the call is ambiguous under C++17 and later - the default standard for
+GCC 11 and newer - and the three affected statements fail to compile.
+
+Naming the conversion is the minimal repair and preserves the behaviour exactly:
+PString::operator const char *() returns the same buffer the pre-C++17 overload
+resolution used.
+
+Applies to: 10503462abe31a6c288a39f6f894a5ceb367abbc (branch v2_12)
+Upstream:   https://git.code.sf.net/p/opalvoip/ptlib
+
+diff --git a/src/ptlib/unix/svcproc.cxx b/src/ptlib/unix/svcproc.cxx
+index a96d392..295a1eb 100644
+--- a/src/ptlib/unix/svcproc.cxx
++++ b/src/ptlib/unix/svcproc.cxx
+@@ -279,7 +279,7 @@ int PServiceProcess::InitialiseService()
+     pid_t pid;
+ 
+     {
+-      ifstream pidfile(pidfilename);
++      ifstream pidfile((const char *)pidfilename);
+       if (!pidfile.is_open()) {
+         cout << "Could not open pid file: \"" << pidfilename << "\""
+                 " - " << strerror(errno) << endl;
+@@ -422,7 +422,7 @@ int PServiceProcess::InitialiseService()
+   // Run as a daemon, ie fork
+ 
+   if (!pidfilename) {
+-    ifstream pidfile(pidfilename);
++    ifstream pidfile((const char *)pidfilename);
+     if (pidfile.is_open()) {
+       pid_t pid;
+       pidfile >> pid;
+@@ -450,7 +450,7 @@ int PServiceProcess::InitialiseService()
+       cout << "Daemon started with pid " << pid << endl;
+       if (!pidfilename) {
+         // Write out the child pid to magic file in /var/run (at least for linux)
+-        ofstream pidfile(pidfilename);
++        ofstream pidfile((const char *)pidfilename);
+         if (pidfile.is_open())
+           pidfile << pid;
+         else

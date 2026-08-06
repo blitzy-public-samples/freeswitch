@@ -1,0 +1,59 @@
+{
+  "configuration": {
+    "configuration": {
+      "@name": "conference_layouts.conf",
+      "@description": "Audio Conference",
+      "layout-settings": {
+        "layouts": {
+          "layout": [
+            {
+              "@name": "1x1",
+              "image": {
+                "@x": "0",
+                "@y": "0",
+                "@scale": "360",
+                "@floor": "true"
+              }
+            },
+            {
+              "@name": "2x1",
+              "@auto-3d-position": "true",
+              "image": [
+                {
+                  "@x": "0",
+                  "@y": "90",
+                  "@scale": "180"
+                },
+                {
+                  "@x": "180",
+                  "@y": "90",
+                  "@scale": "180"
+                }
+              ]
+            },
+            {
+              "@name": "2x1-zoom",
+              "@auto-3d-position": "true",
+              "image": [
+                {
+                  "@x": "0",
+                  "@y": "0",
+                  "@scale": "180",
+                  "@hscale": "360",
+                  "@zoom": "true"
+                },
+                {
+                  "@x": "180",
+                  "@y": "0",
+                  "@scale": "180",
+                  "@hscale": "360",
+                  "@zoom": "true"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}

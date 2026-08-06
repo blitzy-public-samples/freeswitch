@@ -1,0 +1,94 @@
+{
+  "directory": {
+    "domain": {
+      "@name": "example.com",
+      "params": {
+        "param": {
+          "@name": "jsonrpc-allowed-methods",
+          "@value": "verto"
+        }
+      },
+      "variables": {
+        "variable": [
+          {
+            "@name": "record_stereo",
+            "@value": "true"
+          },
+          {
+            "@name": "default_gateway",
+            "@value": "example.com"
+          },
+          {
+            "@name": "default_areacode",
+            "@value": "918"
+          },
+          {
+            "@name": "transfer_fallback_extension",
+            "@value": "operator"
+          }
+        ]
+      },
+      "groups": {
+        "group": [
+          {
+            "@name": "sales",
+            "users": {
+              "user": [
+                {
+                  "@id": "1000",
+                  "@type": "pointer"
+                },
+                {
+                  "@id": "1001",
+                  "@type": "pointer"
+                },
+                {
+                  "@id": "1002",
+                  "@type": "pointer"
+                }
+              ]
+            }
+          },
+          {
+            "@name": "billing",
+            "users": {
+              "user": [
+                {
+                  "@id": "1005",
+                  "@type": "pointer"
+                },
+                {
+                  "@id": "1006",
+                  "@type": "pointer"
+                },
+                {
+                  "@id": "1007",
+                  "@type": "pointer"
+                }
+              ]
+            }
+          },
+          {
+            "@name": "support",
+            "users": {
+              "user": [
+                {
+                  "@id": "1010",
+                  "@type": "pointer"
+                },
+                {
+                  "@id": "1011",
+                  "@type": "pointer"
+                },
+                {
+                  "@id": "1012",
+                  "@type": "pointer"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  }
+}

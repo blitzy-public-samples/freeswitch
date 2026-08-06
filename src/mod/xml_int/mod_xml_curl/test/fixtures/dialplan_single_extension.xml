@@ -1,0 +1,1 @@
+<document type="freeswitch/xml"><section name="dialplan"><context name="default"><extension name="tod_example" continue="true"><condition wday="2-6" hour="9-18"><action application="set" data="open=true"/></condition></extension></context></section></document>

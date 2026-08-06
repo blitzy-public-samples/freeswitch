@@ -1,0 +1,55 @@
+{
+  "directory": {
+    "user": {
+      "@id": "1000",
+      "params": {
+        "param": [
+          {
+            "@name": "password",
+            "@value": "1234"
+          },
+          {
+            "@name": "vm-password",
+            "@value": "1000"
+          }
+        ]
+      },
+      "variables": {
+        "variable": [
+          {
+            "@name": "toll_allow",
+            "@value": "domestic,international,local"
+          },
+          {
+            "@name": "accountcode",
+            "@value": "1000"
+          },
+          {
+            "@name": "user_context",
+            "@value": "default"
+          },
+          {
+            "@name": "effective_caller_id_name",
+            "@value": "Extension 1000"
+          },
+          {
+            "@name": "effective_caller_id_number",
+            "@value": "1000"
+          },
+          {
+            "@name": "outbound_caller_id_name",
+            "@value": "FreeSWITCH"
+          },
+          {
+            "@name": "outbound_caller_id_number",
+            "@value": "0000000000"
+          },
+          {
+            "@name": "callgroup",
+            "@value": "techsupport"
+          }
+        ]
+      }
+    }
+  }
+}

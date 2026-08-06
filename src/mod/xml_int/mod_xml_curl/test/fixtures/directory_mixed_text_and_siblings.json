@@ -1,0 +1,49 @@
+{
+  "directory": {
+    "domain": {
+      "@name": "example.com",
+      "user": {
+        "@id": "1002",
+        "@number-alias": "1002",
+        "params": {
+          "param": [
+            {
+              "@name": "password",
+              "@value": "1234"
+            },
+            {
+              "@name": "vm-password",
+              "@value": "1002"
+            }
+          ]
+        },
+        "variables": {
+          "variable": [
+            {
+              "@name": "user_context",
+              "@value": "default"
+            },
+            {
+              "@name": "accountcode",
+              "@value": "1002"
+            }
+          ]
+        },
+        "contact": {
+          "@type": "voice",
+          "name": {
+            "@source": "crm",
+            "@locale": "en-US",
+            "$": "Ana Fernandez"
+          },
+          "city": {
+            "$": "Tulsa"
+          },
+          "state": {
+            "$": "OK"
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,47 @@
+{
+  "directory": {
+    "user": {
+      "@id": "1001",
+      "params": {
+        "param": [
+          {
+            "@value": "1234",
+            "@name": "password"
+          },
+          {
+            "@name": "vm-password",
+            "@value": "1001"
+          }
+        ]
+      },
+      "variables": {
+        "variable": [
+          {
+            "@name": "toll_allow",
+            "@value": "domestic,international,local"
+          },
+          {
+            "@name": "accountcode",
+            "@value": "1001"
+          },
+          {
+            "@name": "user_context",
+            "@value": "default"
+          },
+          {
+            "@name": "effective_caller_id_name",
+            "@value": "Ana Fernández"
+          },
+          {
+            "@value": "Sales & Support",
+            "@name": "callgroup"
+          },
+          {
+            "@name": "outbound_caller_id_number",
+            "@value": "0000000000"
+          }
+        ]
+      }
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "gateway": {
+    "user": {
+      "@id": "1000",
+      "params": {
+        "param": {
+          "@name": "badgerfish-violation",
+          "@value": "UNBOUND_SECTION_KEY"
+        }
+      }
+    }
+  }
+}

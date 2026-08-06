@@ -1,0 +1,27 @@
+PTLib 2.12-beta10 (OPAL stack): make the stack-size std::max unambiguous
+
+PTHREAD_STACK_MIN is a long on glibc while stackSize is a PINDEX, so
+std::max(stackSize, 16*PTHREAD_STACK_MIN) has two different deduced types and
+does not compile.  Since glibc 2.34 PTHREAD_STACK_MIN is additionally not a
+constant expression - it expands to sysconf(_SC_THREAD_STACK_MIN) - so the
+mismatch cannot be resolved by the compiler folding it either.
+
+The template argument is stated explicitly and the operand cast, which keeps the
+selected value identical to what the original expression computed.
+
+Applies to: 10503462abe31a6c288a39f6f894a5ceb367abbc (branch v2_12)
+Upstream:   https://git.code.sf.net/p/opalvoip/ptlib
+
+diff --git a/src/ptlib/unix/tlibthrd.cxx b/src/ptlib/unix/tlibthrd.cxx
+index f436f8c..fec8a00 100644
+--- a/src/ptlib/unix/tlibthrd.cxx
++++ b/src/ptlib/unix/tlibthrd.cxx
+@@ -280,7 +280,7 @@ PThread::PThread(PINDEX stackSize,
+                  Priority priorityLevel,
+                  const PString & name)
+   : m_type(deletion == AutoDeleteThread ? e_IsAutoDelete : e_IsManualDelete)
+-  , m_originalStackSize(std::max(stackSize, 16*PTHREAD_STACK_MIN)) // Set a decent (256K) stack size that won't eat all virtual memory
++  , m_originalStackSize(std::max<PINDEX>(stackSize, (PINDEX)(16*PTHREAD_STACK_MIN))) // Set a decent (256K) stack size that won't eat all virtual memory
+   , m_threadName(name)
+   , m_threadId(PNullThreadIdentifier)  // indicates thread has not started
+   , PX_priority(priorityLevel)

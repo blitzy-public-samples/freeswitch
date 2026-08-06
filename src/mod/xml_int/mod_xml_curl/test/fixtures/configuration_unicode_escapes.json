@@ -1,0 +1,75 @@
+{
+  "configuration": {
+    "configuration": {
+      "@name": "conference.conf",
+      "@description": "Audio Conference",
+      "profiles": {
+        "profile": [
+          {
+            "@name": "sala",
+            "param": [
+              {
+                "@name": "domain",
+                "@value": "conference.example.net"
+              },
+              {
+                "@name": "caller-id-name",
+                "@value": "Confer\u00eancia FreeSWITCH\u2122 \ud83d\ude42"
+              },
+              {
+                "@name": "caller-id-number",
+                "@value": "0000000000"
+              },
+              {
+                "@name": "moh-sound",
+                "@value": "local_stream://moh"
+              }
+            ]
+          },
+          {
+            "@name": "huiyi",
+            "param": [
+              {
+                "@name": "domain",
+                "@value": "conference.example.net"
+              },
+              {
+                "@name": "caller-id-name",
+                "@value": "\u89c6\u9891\u4f1a\u8bae"
+              },
+              {
+                "@name": "caller-id-number",
+                "@value": "0000000000"
+              },
+              {
+                "@name": "moh-sound",
+                "@value": "local_stream://moh"
+              }
+            ]
+          },
+          {
+            "@name": "ventas",
+            "param": [
+              {
+                "@name": "domain",
+                "@value": "conference.example.net"
+              },
+              {
+                "@name": "caller-id-name",
+                "@value": "Atenci\u00f3n \u0026 Ventas"
+              },
+              {
+                "@name": "caller-id-number",
+                "@value": "0000000000"
+              },
+              {
+                "@name": "moh-sound",
+                "@value": "local_stream://moh"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}

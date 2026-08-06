@@ -32,6 +32,39 @@
 
 #define 	TEST_SIMU_RTP_MAX_LEN 		4200
 
+/*
+ * Where this suite finds its H.264 fixtures, and where it puts the frames it
+ * decodes.  Both are composed from SWITCH_GLOBAL_dirs rather than written as
+ * "./data/..." and "case1.output.qcif.png", so that neither depends on the
+ * directory the binary happened to be started from.
+ *
+ * That dependency was not theoretical.  Automake's test driver runs
+ * test/test_mod_openh264 from the module root, one level above the fixtures,
+ * where every fopen() below failed and the decode loop broke out on its first
+ * iteration - so the case reported success having decoded nothing.  The tree's
+ * own idiom for this is to hang a relative suffix off a resolved global
+ * (src/mod/applications/mod_av/test/test_avformat.c:61 and :224 do exactly
+ * this), and conf_dir is the global the two SWITCH_TEST_BASE_DIR defines in
+ * Makefile.am make absolute: it is <module>/test/conf, so conf_dir/../data is
+ * the fixture directory from anywhere.
+ *
+ * Decoded PNGs go to log_dir - <module>/test/<pid>/ - because that is a
+ * per-run directory the root .gitignore already covers, whereas the previous
+ * cwd-relative name dropped two untracked files wherever the suite was run.
+ *
+ * The buffers are sized for an absolute path; the former char[128] could not
+ * hold one.
+ */
+#define TEST_OPENH264_PATH_MAX 1024
+
+#define TEST_OPENH264_FIXTURE(buf, stem, n) \
+	switch_snprintf((buf), sizeof(buf), "%s%s..%sdata%s" stem "%d.264", \
+					SWITCH_GLOBAL_dirs.conf_dir, SWITCH_PATH_SEPARATOR, SWITCH_PATH_SEPARATOR, SWITCH_PATH_SEPARATOR, (n))
+
+/* log_dir already carries a trailing separator (switch_test.h:105), so none is added here. */
+#define TEST_OPENH264_OUTPUT(buf, name) \
+	switch_snprintf((buf), sizeof(buf), "%s" name, SWITCH_GLOBAL_dirs.log_dir)
+
 /* Add our command line options. */
 static fctcl_init_t my_cl_options[] = {
 	{"--disable-hw",                 /* long_opt */
@@ -96,9 +129,9 @@ FST_CORE_BEGIN("conf")
 			frame.img = (switch_image_t*)NULL;
 			do {
 				switch_size_t len = TEST_SIMU_RTP_MAX_LEN;
-				char  file_name[128] = { 0 };
+				char  file_name[TEST_OPENH264_PATH_MAX] = { 0 };
 				frame.seq++;
-				switch_snprintf(file_name, 128, "./data/case1.packet%d.264", file_count);
+				TEST_OPENH264_FIXTURE(file_name, "case1.packet", file_count);
 
 				fp = fopen(file_name, "rb");
 				if (!fp) {
@@ -127,7 +160,9 @@ FST_CORE_BEGIN("conf")
 				
 				if (frame.img != NULL) {
 					// write down the decoded
-					status = switch_img_write_png(frame.img, (char *)"case1.output.qcif.png");
+					char png_name[TEST_OPENH264_PATH_MAX] = { 0 };
+					TEST_OPENH264_OUTPUT(png_name, "case1.output.qcif.png");
+					status = switch_img_write_png(frame.img, png_name);
 					fst_check(status == SWITCH_STATUS_SUCCESS);
 					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
 						 "write output file done! \n");
@@ -161,9 +196,9 @@ FST_CORE_BEGIN("conf")
 			frame.img = (switch_image_t*)NULL;
 			do {
 				switch_size_t len = TEST_SIMU_RTP_MAX_LEN;
-				char  file_name[128] = { 0 };
+				char  file_name[TEST_OPENH264_PATH_MAX] = { 0 };
 				frame.seq++;
-				switch_snprintf(file_name, 128, "./data/case2.packet%d.264", file_count);
+				TEST_OPENH264_FIXTURE(file_name, "case2.packet", file_count);
 
 				fp = fopen(file_name, "rb");
 				if (!fp) {
@@ -191,7 +226,9 @@ FST_CORE_BEGIN("conf")
 				fst_check(decode_status == SWITCH_STATUS_SUCCESS || decode_status == SWITCH_STATUS_MORE_DATA);
 				if (frame.img != NULL) {
 					// write down the decoded
-					status = switch_img_write_png(frame.img, (char *)"case2.output.qcif.png");
+					char png_name[TEST_OPENH264_PATH_MAX] = { 0 };
+					TEST_OPENH264_OUTPUT(png_name, "case2.output.qcif.png");
+					status = switch_img_write_png(frame.img, png_name);
 					fst_check(status == SWITCH_STATUS_SUCCESS);
 					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_INFO,
 						 "write output file done! \n");

@@ -1,0 +1,14 @@
+{
+  "directory": {
+    "@name": "result",
+    "user": {
+      "@id": "1000",
+      "params": {
+        "param": {
+          "@name": "badgerfish-violation",
+          "@value": "ROOT_ATTRIBUTE"
+        }
+      }
+    }
+  }
+}

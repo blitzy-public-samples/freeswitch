@@ -1,0 +1,184 @@
+LIVE BADGERFISH DECODE MATRIX - WARNING <-> EVENT 1:1 PAIRING
+============================================================
+
+WHAT THIS IS
+  The five-case live decode matrix, re-run AFTER the fallback event was added, so
+  the pairing the event exists to provide is measured rather than assumed.  The
+  pre-event run recorded only WARNING counts; this one records, per case, the value
+  the lookup resolved, the fallback WARNINGs the log gained, the
+  xml_curl::json_fallback events an ESL consumer received, and the three headers
+  each event carried.
+
+HOW TO REPRODUCE
+  run-decode-matrix.py in this directory is the harness, python3 standard library
+  only.  It starts its own loopback provisioning gateway, drives the instance over
+  the inbound event socket, and restores the configuration it borrows - including on
+  failure.  It exits non-zero unless every case matches AND every case pairs 1:1.
+
+    python3 run-decode-matrix.py --prefix /usr/local/freeswitch
+
+  The run archived below used a private prefix and clone-unique ports, because this
+  host runs several FreeSWITCH trees side by side:
+
+    python3 run-decode-matrix.py \
+        --prefix /tmp/fs014-install \
+        --conf-dir /tmp/fs014-install/etc/freeswitch \
+        --log /tmp/fs014-install/var/log/freeswitch/freeswitch.log \
+        --esl-port 18021 --gateway-port 18094
+
+  The instance loaded seven modules and deliberately NOT mod_signalwire, so nothing
+  in this evidence can carry an adoption token.
+
+CAPTURED RUN   exit 0
+------------------------------------------------------------
+
+mod_xml_curl live BadgerFish decode matrix
+  instance   : /tmp/fs014-install
+  esl        : 127.0.0.1:18021
+  gateway    : http://127.0.0.1:18094/{json,badjson,wrongtype,xml}
+  log        : /tmp/fs014-install/var/log/freeswitch/freeswitch.log
+  version    : FreeSWITCH Version 1.11.2-dev+git~20260805T235808Z~6721d50211~64bit (git 6721d50 2026-08-05 23:58:08Z 64bit)
+
+json_happy_path              PASS
+    response-format      : json
+    gateway path         : /json
+    lookup resolved      : badgerfish-json
+    fallback WARNINGs    : 0
+    fallback events      : 0
+    Fallback-Reason      : -
+    Binding              : -
+    Gateway (redacted)   : -
+
+malformed_json               PASS
+    response-format      : json
+    gateway path         : /badjson
+    lookup resolved      : -ERR no reply
+    fallback WARNINGs    : 2
+    fallback events      : 2
+    Fallback-Reason      : malformed-json
+    Binding              : malformed_json
+    Gateway (redacted)   : http%3A//127.0.0.1%3A18094/%5Bredacted%5D
+
+wrong_content_type           PASS
+    response-format      : json
+    gateway path         : /wrongtype
+    lookup resolved      : -ERR no reply
+    fallback WARNINGs    : 2
+    fallback events      : 2
+    Fallback-Reason      : content-type-mismatch
+    Binding              : wrong_content_type
+    Gateway (redacted)   : http%3A//127.0.0.1%3A18094/%5Bredacted%5D
+
+xml_default_backward_compat  PASS
+    response-format      : (absent)
+    gateway path         : /xml
+    lookup resolved      : classic-xml
+    fallback WARNINGs    : 0
+    fallback events      : 0
+    Fallback-Reason      : -
+    Binding              : -
+    Gateway (redacted)   : -
+
+xml_via_json_total_fallback  PASS
+    response-format      : json
+    gateway path         : /xml
+    lookup resolved      : classic-xml
+    fallback WARNINGs    : 1
+    fallback events      : 1
+    Fallback-Reason      : content-type-mismatch
+    Binding              : xml_via_json_total_fallback
+    Gateway (redacted)   : http%3A//127.0.0.1%3A18094/%5Bredacted%5D
+
+pairing summary
+  json_happy_path              WARNING 0 : event 0   1:1
+  malformed_json               WARNING 2 : event 2   1:1
+  wrong_content_type           WARNING 2 : event 2   1:1
+  xml_default_backward_compat  WARNING 0 : event 0   1:1
+  xml_via_json_total_fallback  WARNING 1 : event 1   1:1
+  TOTAL                        WARNING 5 : event 5
+
+RESULT: PASS - 5 of 5 cases matched, every fallback WARNING paired 1:1 with one xml_curl::json_fallback event, and the response-format-absent case fired none
+
+restored /tmp/fs014-install/etc/freeswitch/autoload_configs/xml_curl.conf.xml
+
+------------------------------------------------------------
+LOG-SIDE CORROBORATION (same instance, same run)
+------------------------------------------------------------
+  grep -c 'falling back to XML parsing'                      -> 12
+  'not a well-formed BadgerFish JSON document'               ->  6
+  'response Content-Type is not application/json'            ->  6
+
+  The 12 log-side warnings against 5 in the matrix is not a discrepancy: the log
+  spans BOTH runs of the harness (a first run, then this archived one), while each
+  matrix row counts only the delta its own case produced.  Within every case the
+  two signals matched exactly, which is the property being proven.
+
+  URL-path hygiene, same log:
+    grep -cF '/badjson'      -> 0
+    grep -cF '/wrongtype'    -> 0
+    grep -cF '18094/json'    -> 0
+    grep -cF '18094/xml'     -> 0
+    every warning renders    -> from [http://127.0.0.1:18094/[redacted]]   (12 of 12)
+
+  The gateway path never reaches the log; the authority is kept for diagnosis.
+
+------------------------------------------------------------
+ONE RAW EVENT, AS AN ESL CONSUMER RECEIVES IT
+------------------------------------------------------------
+  Captured off a `event plain CUSTOM xml_curl::json_fallback' subscription during a
+  malformed-JSON case.  Header VALUES are percent-encoded by the plain event
+  serialisation, which is ESL's own encoding and not the module's; the Gateway
+  header decodes to http://127.0.0.1:18094/[redacted].
+
+  Four incidental host identifiers - the per-process Core-UUID, the container
+  hostname twice and the private pod address - are substituted with the placeholders
+  shown.  Nothing else is altered, and none of the four is part of what this
+  evidence proves.
+
+Event-Subclass: xml_curl%3A%3Ajson_fallback
+Event-Name: CUSTOM
+Core-UUID: <per-process uuid, substituted>
+FreeSWITCH-Hostname: <container hostname, substituted>
+FreeSWITCH-Switchname: <container hostname, substituted>
+FreeSWITCH-IPv4: <private pod address, substituted>
+FreeSWITCH-IPv6: %3A%3A1
+Event-Date-Local: 2026-08-06%2002%3A24%3A02
+Event-Date-GMT: Thu,%2006%20Aug%202026%2002%3A24%3A02%20GMT
+Event-Date-Timestamp: 1785983042529051
+Event-Calling-File: mod_xml_curl.c
+Event-Calling-Function: xml_curl_json_fire_fallback_event
+Event-Calling-Line-Number: 1287
+Event-Sequence: 410
+Binding: provisioning-a
+Fallback-Reason: malformed-json
+Gateway: http%3A//127.0.0.1%3A18094/%5Bredacted%5D
+
+------------------------------------------------------------
+WHAT THE FIVE CASES ESTABLISH
+------------------------------------------------------------
+  1. json_happy_path              a conformant BadgerFish response decodes: the
+                                  lookup resolved badgerfish-json, and neither
+                                  signal fired.
+  2. malformed_json               truncated bytes announced as JSON: 2 WARNINGs, 2
+                                  events, Fallback-Reason=malformed-json.  The
+                                  lookup then failed because the body was not XML
+                                  either - a fallback, not a rescue.
+  3. wrong_content_type           a conformant JSON body announced as text/xml: 2
+                                  WARNINGs, 2 events,
+                                  Fallback-Reason=content-type-mismatch.  The
+                                  announcement is what the classifier judges.
+  4. xml_default_backward_compat  response-format ABSENT: the lookup resolved
+                                  classic-xml, 0 WARNINGs and 0 EVENTS.  This is
+                                  the bit-identical-behaviour requirement,
+                                  including the "no events fired" half of it.
+  5. xml_via_json_total_fallback  an XML response to a JSON-configured binding: 1
+                                  WARNING, 1 event, content-type-mismatch, and the
+                                  lookup STILL RESOLVED classic-xml.  Total
+                                  fallback: the degradation is signalled and the
+                                  provisioning lookup survives it.
+
+  Case 5 firing an event immediately after case 4 fired none also proves the
+  consumer was still connected and subscribed during case 4, so its zero is an
+  observed zero rather than a lost subscription.
+
+  TOTAL: 5 fallback WARNINGs, 5 fallback events, 5 of 5 cases 1:1.

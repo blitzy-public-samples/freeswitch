@@ -1,0 +1,45 @@
+{
+  "dialplan": {
+    "context": {
+      "@name": "default",
+      "extension": {
+        "@name": "unpark",
+        "condition": [
+          {
+            "@field": "source",
+            "@expression": "mod_sofia"
+          },
+          {
+            "@field": "destination_number",
+            "@expression": "^parking$",
+            "action": [
+              {
+                "@application": "answer"
+              },
+              {
+                "@application": "log",
+                "@data": "INFO parking pickup"
+              }
+            ]
+          },
+          {
+            "@field": "caller_id_number",
+            "expression": {
+              "$": "^(10[01][0-9])$"
+            },
+            "action": [
+              {
+                "@application": "set",
+                "@data": "fifo_music=silence"
+              },
+              {
+                "@application": "transfer",
+                "@data": "$1 XML default"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  }
+}
