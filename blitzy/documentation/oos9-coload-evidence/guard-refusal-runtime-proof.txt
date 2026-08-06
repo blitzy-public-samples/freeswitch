@@ -1,47 +1,55 @@
 # OOS-9 Outcome A - runtime proof of the guard AS SHIPPED
 
-Re-captured against the binaries this branch installs, so every line number, log anchor and
-banner below is the SHIPPED revision rather than the first revision of the guard.  Three
-scenarios, each in a fresh disposable instance with its own conf/log/db/run/temp/cache/storage
-copy and its own event-socket port 28041.  The installed configuration under
+Captured against the binaries this branch installs: FreeSWITCH version: 1.11.2-dev+git~20260806T145837Z~24218f3856~64bit (git 24218f3 2026-08-06 14:58:37Z 64bit)
+Repository revision under test: 24218f3856 on blitzy-736674cf-ebe1-40c1-b224-21affe971d9d
+Captured: 2026-08-06T16:40:25Z
+
+Five scenarios, each in a fresh disposable instance with its own conf/log/db/run/temp/cache/
+storage copy and its own event-socket port 28041.  The installed configuration under
 /usr/local/freeswitch/conf was not modified, no tracked file was touched, and only the pid each
-run started was ever signalled.
+run started was ever signalled.  The "isolated prefix" path printed by each scenario below is
+that scenario's throwaway instance root; every one was deleted after capture, so the paths
+record how the capture was made rather than naming anything a reader can open.  The same
+sequences reproduce against the ordinary installed instance: scenarios 4 and 5 were re-run on
+/usr/local/freeswitch with its shipped configuration, with identical results.
 
-WHY THREE SCENARIOS AND NOT TWO.  The guard has two stages and they refuse for different
-reasons, so a proof of one is not a proof of the other:
+WHY FIVE SCENARIOS.  The guard has two stages that refuse for different reasons, and the second
+stage's claim deliberately OUTLIVES an unload, so a proof of one is not a proof of the others:
 
-  stage 1  switch_loadable_module_exists(<sibling>)         mod_h323.cpp:198 / mod_opal.cpp:145
+  stage 1  switch_loadable_module_exists(<sibling>)         mod_h323.cpp:189 / mod_opal.cpp:136
            refuses when the sibling is in the module hash - the sequential, common case.
-           Proven by scenarios 1 and 2.
+           ERROR at mod_h323.cpp:190 / mod_opal.cpp:137.  Proven by scenarios 1 and 2.
   stage 2  switch_core_set_var_conditional(<RESERVATION>,   mod_h323.cpp:221 / mod_opal.cpp:169
-           modname, "")
-           refuses when the process-global PTLib reservation is already held even though the
-           sibling is NOT in the hash - the state a losing concurrent claimant sees, and the
-           one stage 1 cannot see.  Proven by scenario 3, which reaches it by planting the
-           reservation while the sibling is absent, and asserts that absence so the refusal
-           cannot be attributed to stage 1.
+           modname, "") or (..., modname, modname)
+           refuses when the process-global PTLib reservation is held by the OTHER endpoint even
+           though the sibling is NOT in the hash - the state a losing concurrent claimant sees,
+           and the one stage 1 cannot see.  ERROR at mod_h323.cpp:225 / mod_opal.cpp:173.
+           Proven by scenario 3, which reaches it by planting the reservation while the sibling
+           is absent and asserts that absence, so the refusal cannot be attributed to stage 1.
+  sticky   the claim is never released while the runtime is resident: mod_*_shutdown() does not
+           release it, because HAVE_FAKE_DLCLOSE leaves an unloaded module's PTLib runtime
+           mapped for the life of the process.  Scenarios 4 and 5 unload the first endpoint and
+           show, in both orders, that the reservation still names it, that the SIBLING is still
+           refused by stage 2 with neither module in the module hash, and that the SAME endpoint
+           reloads and re-registers its endpoint interface because it re-claims its own
+           reservation.
 
-The four observables the directive requires are labelled inline in every scenario.  Each
-capture also ends with the mod_xml_curl fallback-event subclass release, because it is the one
-line that shows the core taking its OWNER-MATCHED branch ("Subclass reservation deleted for
-mod_xml_curl.c:...") rather than the non-owner "inuse by listeners, detaching.." branch - the
-distinction the module's shutdown guard exists to preserve.
+The four observables the directive requires are labelled inline in scenarios 1 to 3; scenarios 4
+and 5 label the four observables of the sticky claim as A to D.
 
 mod_signalwire is deliberately not loaded in these instances.  It prints a per-installation
 adoption token at NOTICE on its not-yet-adopted branch, and a verbatim capture is no place for
 one; see signalwire-token-rotation.txt.
 
-
 ############################################################################
-# SCENARIO 1 of 3 - stage 1: load mod_h323, then attempt mod_opal
+# SCENARIO 1 of 5 - stage 1: load mod_h323, then attempt mod_opal
 ############################################################################
 ===== order1 =====
-instance pid: 2604016   event socket: 127.0.0.1:28041   isolated prefix: /tmp/blitzy/freeswitch/blitzy-736674cf-ebe1-40c1-b224-21affe971d9d_749798/blitzy_adhoc_test_oos9
+instance pid: 3574220   event socket: 127.0.0.1:28041   isolated prefix: /tmp/blitzy/freeswitch/blitzy-736674cf-ebe1-40c1-b224-21affe971d9d_749798/blitzy_adhoc_test_qa9/instance
 
 $ fs_cli -x 'load mod_h323'
 +OK Reloading XML
 +OK
-
 
 $ fs_cli -x 'module_exists mod_h323'
 true
@@ -51,21 +59,20 @@ $ fs_cli -x 'load mod_opal'
 +OK Reloading XML
 -ERR [module load file routine returned an error]
 
-
 $ fs_cli -x 'module_exists mod_opal'   (false => the refused module is NOT registered)
 false
 
 ===== OBSERVABLE 2: the ERROR line naming the PProcess singleton conflict =====
-2026-08-06 07:08:55.895498 99.70% [ERR] mod_opal.cpp:146 Refusing to load mod_opal: mod_h323 is already loaded in this process, and their conflicting PProcess singletons - one per PTLib runtime, libpt.so.2.12-beta10 for mod_opal against libpt.so.2.10.9 for mod_h323 - crash the process (OOS-9). Run the two endpoints in separate FreeSWITCH instances.
-2026-08-06 07:08:55.895498 99.70% [CRIT] switch_loadable_module.c:1754 Error Loading module /usr/local/freeswitch/mod/mod_opal.so
+2026-08-06 16:40:29.345781 99.70% [ERR] mod_opal.cpp:137 Refusing to load mod_opal: mod_h323 is already loaded in this process, and their conflicting PProcess singletons - one per PTLib runtime, libpt.so.2.12-beta10 for mod_opal against libpt.so.2.10.9 for mod_h323 - crash the process (OOS-9). Unloading mod_h323 does not make this load safe, because its PTLib runtime stays mapped for the lifetime of the process: run the two endpoints in separate FreeSWITCH instances, and restart this one to change which endpoint it serves.
+2026-08-06 16:40:29.345781 99.70% [CRIT] switch_loadable_module.c:1754 Error Loading module /usr/local/freeswitch/mod/mod_opal.so
 
 ===== OBSERVABLE 3: the process SURVIVES the refused load =====
-pid 2604016 is alive: PASS
+pid 3574220 is alive: PASS
 
 ===== OBSERVABLE 4: fs_cli -x status still reports UP =====
-$ fs_cli -H 127.0.0.1 -P 28041 -p ClueCon -x status
-UP 0 years, 0 days, 0 hours, 0 minutes, 3 seconds, 228 milliseconds, 847 microseconds
-FreeSWITCH (Version 1.11.2-dev git 5c0f7f2 2026-08-06 04:21:50Z 64bit) is ready
+$ fs_cli -x 'status'
+UP 0 years, 0 days, 0 hours, 0 minutes, 3 seconds, 216 milliseconds, 573 microseconds
+FreeSWITCH (Version 1.11.2-dev git 24218f3 2026-08-06 14:58:37Z 64bit) is ready
 0 session(s) since startup
 0 session(s) - peak 0, last 5min 0 
 0 session(s) per Sec out of max 30, peak 0, last 5min 0 
@@ -73,35 +80,28 @@ FreeSWITCH (Version 1.11.2-dev git 5c0f7f2 2026-08-06 04:21:50Z 64bit) is ready
 min idle cpu 0.00/99.70
 Current Stack Size/Max 240K/8192K
 
-
 ===== registration state of both endpoints in this process =====
 endpoint,h323,mod_h323
 
-===== the reservation after the refusal =====
-$ fs_cli -x 'global_getvar _fs_ptlib_endpoint_reservation'
+$ fs_cli -x 'global_getvar _fs_ptlib_endpoint_reservation'   (the reservation after the refusal)
 mod_h323
 
-===== module load lines from this instance's own log =====
-2026-08-06 07:08:55.715495 100.00% [CONSOLE] mod_h323.cpp:234 Starting loading mod_h323
-2026-08-06 07:08:55.715495 100.00% [CONSOLE] switch_loadable_module.c:1772 Successfully Loaded [mod_h323]
-2026-08-06 07:08:55.895498 99.70% [ERR] mod_opal.cpp:146 Refusing to load mod_opal: mod_h323 is already loaded in this process, and their conflicting PProcess singletons - one per PTLib runtime, libpt.so.2.12-beta10 for mod_opal against libpt.so.2.10.9 for mod_h323 - crash the process (OOS-9). Run the two endpoints in separate FreeSWITCH instances.
-2026-08-06 07:08:55.895498 99.70% [CRIT] switch_loadable_module.c:1754 Error Loading module /usr/local/freeswitch/mod/mod_opal.so
+===== module load lines from this instance own log =====
+2026-08-06 16:40:29.145785 100.00% [CONSOLE] mod_h323.cpp:236 Starting loading mod_h323
+2026-08-06 16:40:29.145785 100.00% [CONSOLE] switch_loadable_module.c:1772 Successfully Loaded [mod_h323]
+2026-08-06 16:40:29.345781 99.70% [ERR] mod_opal.cpp:137 Refusing to load mod_opal: mod_h323 is already loaded in this process, and their conflicting PProcess singletons - one per PTLib runtime, libpt.so.2.12-beta10 for mod_opal against libpt.so.2.10.9 for mod_h323 - crash the process (OOS-9). Unloading mod_h323 does not make this load safe, because its PTLib runtime stays mapped for the lifetime of the process: run the two endpoints in separate FreeSWITCH instances, and restart this one to change which endpoint it serves.
 
-===== mod_xml_curl fallback-event subclass ownership on unload (F9) =====
-2026-08-06 07:08:57.075495 99.47% [NOTICE] switch_event.c:468 Subclass reservation deleted for mod_xml_curl.c:xml_curl::json_fallback
-
-instance 2604016 stopped: gone
+instance 3574220 stopped: gone
 
 ############################################################################
-# SCENARIO 2 of 3 - stage 1, opposite order: load mod_opal, then attempt mod_h323
+# SCENARIO 2 of 5 - stage 1, opposite order: load mod_opal, then attempt mod_h323
 ############################################################################
 ===== order2 =====
-instance pid: 2604111   event socket: 127.0.0.1:28041   isolated prefix: /tmp/blitzy/freeswitch/blitzy-736674cf-ebe1-40c1-b224-21affe971d9d_749798/blitzy_adhoc_test_oos9
+instance pid: 3574322   event socket: 127.0.0.1:28041   isolated prefix: /tmp/blitzy/freeswitch/blitzy-736674cf-ebe1-40c1-b224-21affe971d9d_749798/blitzy_adhoc_test_qa9/instance
 
 $ fs_cli -x 'load mod_opal'
 +OK Reloading XML
 +OK
-
 
 $ fs_cli -x 'module_exists mod_opal'
 true
@@ -111,52 +111,45 @@ $ fs_cli -x 'load mod_h323'
 +OK Reloading XML
 -ERR [module load file routine returned an error]
 
-
 $ fs_cli -x 'module_exists mod_h323'   (false => the refused module is NOT registered)
 false
 
 ===== OBSERVABLE 2: the ERROR line naming the PProcess singleton conflict =====
-2026-08-06 07:09:11.553733 100.00% [ERR] mod_h323.cpp:199 Refusing to load mod_h323: mod_opal is already loaded in this process, and their conflicting PProcess singletons - one per PTLib runtime, libpt.so.2.10.9 for mod_h323 against libpt.so.2.12-beta10 for mod_opal - crash the process (OOS-9). Run the two endpoints in separate FreeSWITCH instances.
-2026-08-06 07:09:11.553733 100.00% [CRIT] switch_loadable_module.c:1754 Error Loading module /usr/local/freeswitch/mod/mod_h323.so
+2026-08-06 16:40:44.891353 99.80% [ERR] mod_h323.cpp:190 Refusing to load mod_h323: mod_opal is already loaded in this process, and their conflicting PProcess singletons - one per PTLib runtime, libpt.so.2.10.9 for mod_h323 against libpt.so.2.12-beta10 for mod_opal - crash the process (OOS-9). Unloading mod_opal does not make this load safe, because its PTLib runtime stays mapped for the lifetime of the process: run the two endpoints in separate FreeSWITCH instances, and restart this one to change which endpoint it serves.
+2026-08-06 16:40:44.891353 99.80% [CRIT] switch_loadable_module.c:1754 Error Loading module /usr/local/freeswitch/mod/mod_h323.so
 
 ===== OBSERVABLE 3: the process SURVIVES the refused load =====
-pid 2604111 is alive: PASS
+pid 3574322 is alive: PASS
 
 ===== OBSERVABLE 4: fs_cli -x status still reports UP =====
-$ fs_cli -H 127.0.0.1 -P 28041 -p ClueCon -x status
-UP 0 years, 0 days, 0 hours, 0 minutes, 3 seconds, 154 milliseconds, 643 microseconds
-FreeSWITCH (Version 1.11.2-dev git 5c0f7f2 2026-08-06 04:21:50Z 64bit) is ready
+$ fs_cli -x 'status'
+UP 0 years, 0 days, 0 hours, 0 minutes, 3 seconds, 306 milliseconds, 536 microseconds
+FreeSWITCH (Version 1.11.2-dev git 24218f3 2026-08-06 14:58:37Z 64bit) is ready
 0 session(s) since startup
 0 session(s) - peak 0, last 5min 0 
 0 session(s) per Sec out of max 30, peak 0, last 5min 0 
 1000 session(s) max
-min idle cpu 0.00/100.00
+min idle cpu 0.00/99.80
 Current Stack Size/Max 240K/8192K
-
 
 ===== registration state of both endpoints in this process =====
 endpoint,opal,mod_opal
 
-===== the reservation after the refusal =====
-$ fs_cli -x 'global_getvar _fs_ptlib_endpoint_reservation'
+$ fs_cli -x 'global_getvar _fs_ptlib_endpoint_reservation'   (the reservation after the refusal)
 mod_opal
 
-===== module load lines from this instance's own log =====
-2026-08-06 07:09:11.393740 100.00% [CONSOLE] mod_opal.cpp:182 Starting loading mod_opal
-2026-08-06 07:09:11.393740 100.00% [CONSOLE] switch_loadable_module.c:1772 Successfully Loaded [mod_opal]
-2026-08-06 07:09:11.553733 100.00% [ERR] mod_h323.cpp:199 Refusing to load mod_h323: mod_opal is already loaded in this process, and their conflicting PProcess singletons - one per PTLib runtime, libpt.so.2.10.9 for mod_h323 against libpt.so.2.12-beta10 for mod_opal - crash the process (OOS-9). Run the two endpoints in separate FreeSWITCH instances.
-2026-08-06 07:09:11.553733 100.00% [CRIT] switch_loadable_module.c:1754 Error Loading module /usr/local/freeswitch/mod/mod_h323.so
+===== module load lines from this instance own log =====
+2026-08-06 16:40:44.711344 100.00% [CONSOLE] mod_opal.cpp:185 Starting loading mod_opal
+2026-08-06 16:40:44.731345 100.00% [CONSOLE] switch_loadable_module.c:1772 Successfully Loaded [mod_opal]
+2026-08-06 16:40:44.891353 99.80% [ERR] mod_h323.cpp:190 Refusing to load mod_h323: mod_opal is already loaded in this process, and their conflicting PProcess singletons - one per PTLib runtime, libpt.so.2.10.9 for mod_h323 against libpt.so.2.12-beta10 for mod_opal - crash the process (OOS-9). Unloading mod_opal does not make this load safe, because its PTLib runtime stays mapped for the lifetime of the process: run the two endpoints in separate FreeSWITCH instances, and restart this one to change which endpoint it serves.
 
-===== mod_xml_curl fallback-event subclass ownership on unload (F9) =====
-2026-08-06 07:09:12.713749 99.27% [NOTICE] switch_event.c:468 Subclass reservation deleted for mod_xml_curl.c:xml_curl::json_fallback
-
-instance 2604111 stopped: gone
+instance 3574322 stopped: gone
 
 ############################################################################
-# SCENARIO 3 of 3 - stage 2: the ATOMIC RESERVATION refuses while the sibling is ABSENT
+# SCENARIO 3 of 5 - stage 2: the ATOMIC RESERVATION refuses while the sibling is ABSENT
 ############################################################################
 ===== reservation =====
-instance pid: 2603665   event socket: 127.0.0.1:28041   isolated prefix: /tmp/blitzy/freeswitch/blitzy-736674cf-ebe1-40c1-b224-21affe971d9d_749798/blitzy_adhoc_test_oos9
+instance pid: 3574429   event socket: 127.0.0.1:28041   isolated prefix: /tmp/blitzy/freeswitch/blitzy-736674cf-ebe1-40c1-b224-21affe971d9d_749798/blitzy_adhoc_test_qa9/instance
 
 ===== PRECONDITION: plant the reservation under the sibling's name while the sibling is NOT loaded =====
 $ fs_cli -x 'global_setvar _fs_ptlib_endpoint_reservation=mod_h323'
@@ -173,21 +166,20 @@ $ fs_cli -x 'load mod_opal'
 +OK Reloading XML
 -ERR [module load file routine returned an error]
 
-
 $ fs_cli -x 'module_exists mod_opal'   (false => the refused module is NOT registered)
 false
 
-===== OBSERVABLE 2: the ERROR line naming the PProcess singleton conflict =====
-2026-08-06 07:08:29.646435 100.00% [ERR] mod_opal.cpp:172 Refusing to load mod_opal: the PTLib runtime in this process is already reserved by [mod_h323], and two PTLib runtimes contending for the one PProcess singleton crash the process (OOS-9). Run the two endpoints in separate FreeSWITCH instances.
-2026-08-06 07:08:29.646435 100.00% [CRIT] switch_loadable_module.c:1754 Error Loading module /usr/local/freeswitch/mod/mod_opal.so
+===== OBSERVABLE 2: the ERROR line naming the reservation holder =====
+2026-08-06 16:41:00.206659 100.00% [ERR] mod_opal.cpp:173 Refusing to load mod_opal: the PTLib runtime in this process is already reserved by [mod_h323], and two PTLib runtimes contending for the one PProcess singleton crash the process (OOS-9). The reservation outlives an unload because the runtime stays mapped, so restart FreeSWITCH to change which endpoint this process serves, and run the two endpoints in separate instances.
+2026-08-06 16:41:00.206659 100.00% [CRIT] switch_loadable_module.c:1754 Error Loading module /usr/local/freeswitch/mod/mod_opal.so
 
 ===== OBSERVABLE 3: the process SURVIVES the refused load =====
-pid 2603665 is alive: PASS
+pid 3574429 is alive: PASS
 
 ===== OBSERVABLE 4: fs_cli -x status still reports UP =====
-$ fs_cli -H 127.0.0.1 -P 28041 -p ClueCon -x status
-UP 0 years, 0 days, 0 hours, 0 minutes, 3 seconds, 95 milliseconds, 413 microseconds
-FreeSWITCH (Version 1.11.2-dev git 5c0f7f2 2026-08-06 04:21:50Z 64bit) is ready
+$ fs_cli -x 'status'
+UP 0 years, 0 days, 0 hours, 0 minutes, 3 seconds, 72 milliseconds, 952 microseconds
+FreeSWITCH (Version 1.11.2-dev git 24218f3 2026-08-06 14:58:37Z 64bit) is ready
 0 session(s) since startup
 0 session(s) - peak 0, last 5min 0 
 0 session(s) per Sec out of max 30, peak 0, last 5min 0 
@@ -195,19 +187,174 @@ FreeSWITCH (Version 1.11.2-dev git 5c0f7f2 2026-08-06 04:21:50Z 64bit) is ready
 min idle cpu 0.00/100.00
 Current Stack Size/Max 240K/8192K
 
-
 ===== registration state of both endpoints in this process =====
 (none)
 
-===== the reservation after the refusal =====
+$ fs_cli -x 'global_getvar _fs_ptlib_endpoint_reservation'   (the reservation after the refusal)
+mod_h323
+
+instance 3574429 stopped: gone
+
+############################################################################
+# SCENARIO 4 of 5 - the reservation OUTLIVES AN UNLOAD: load mod_h323, unload it, then attempt mod_opal
+############################################################################
+===== unload-order1 =====
+instance pid: 3574529   event socket: 127.0.0.1:28041   isolated prefix: /tmp/blitzy/freeswitch/blitzy-736674cf-ebe1-40c1-b224-21affe971d9d_749798/blitzy_adhoc_test_qa9/instance
+
+$ fs_cli -x 'load mod_h323'
++OK Reloading XML
++OK
+
+$ fs_cli -x 'module_exists mod_h323'
+true
+
+$ fs_cli -x 'global_getvar _fs_ptlib_endpoint_reservation'   (the holder while mod_h323 is loaded)
+mod_h323
+
+===== the module is UNLOADED - registration ends here, residency does not =====
+$ fs_cli -x 'unload mod_h323'
++OK
+
+$ fs_cli -x 'module_exists mod_h323'   (false => the module is no longer registered)
+false
+
+$ fs_cli -x 'module_exists mod_opal'   (false => neither endpoint is registered now)
+false
+
+===== OBSERVABLE A: the reservation is STILL HELD after the unload =====
+$ fs_cli -x 'global_getvar _fs_ptlib_endpoint_reservation'   (expected: mod_h323 - the PTLib runtime is still mapped)
+mod_h323
+
+===== OBSERVABLE B: the SIBLING is still refused, by stage 2, with neither module in the hash =====
+$ fs_cli -x 'load mod_opal'
++OK Reloading XML
+-ERR [module load file routine returned an error]
+
+$ fs_cli -x 'module_exists mod_opal'   (false => the refused module is NOT registered)
+false
+
+===== the stage-2 ERROR naming the reservation holder =====
+2026-08-06 16:41:16.800255 99.50% [ERR] mod_opal.cpp:173 Refusing to load mod_opal: the PTLib runtime in this process is already reserved by [mod_h323], and two PTLib runtimes contending for the one PProcess singleton crash the process (OOS-9). The reservation outlives an unload because the runtime stays mapped, so restart FreeSWITCH to change which endpoint this process serves, and run the two endpoints in separate instances.
+2026-08-06 16:41:16.800255 99.50% [CRIT] switch_loadable_module.c:1754 Error Loading module /usr/local/freeswitch/mod/mod_opal.so
+
+===== OBSERVABLE C: the SAME endpoint reloads - the claim is re-claimed by its owner =====
+$ fs_cli -x 'load mod_h323'
++OK Reloading XML
++OK
+
+$ fs_cli -x 'module_exists mod_h323'   (true => an owner-matched reload is allowed)
+true
+
 $ fs_cli -x 'global_getvar _fs_ptlib_endpoint_reservation'
 mod_h323
 
-===== module load lines from this instance's own log =====
-2026-08-06 07:08:29.646435 100.00% [ERR] mod_opal.cpp:172 Refusing to load mod_opal: the PTLib runtime in this process is already reserved by [mod_h323], and two PTLib runtimes contending for the one PProcess singleton crash the process (OOS-9). Run the two endpoints in separate FreeSWITCH instances.
-2026-08-06 07:08:29.646435 100.00% [CRIT] switch_loadable_module.c:1754 Error Loading module /usr/local/freeswitch/mod/mod_opal.so
+===== OBSERVABLE D: the process SURVIVES all of it and status is UP =====
+pid 3574529 is alive: PASS
 
-===== mod_xml_curl fallback-event subclass ownership on unload (F9) =====
-2026-08-06 07:08:30.806438 99.60% [NOTICE] switch_event.c:468 Subclass reservation deleted for mod_xml_curl.c:xml_curl::json_fallback
+$ fs_cli -x 'status'
+UP 0 years, 0 days, 0 hours, 0 minutes, 4 seconds, 436 milliseconds, 497 microseconds
+FreeSWITCH (Version 1.11.2-dev git 24218f3 2026-08-06 14:58:37Z 64bit) is ready
+0 session(s) since startup
+0 session(s) - peak 0, last 5min 0 
+0 session(s) per Sec out of max 30, peak 0, last 5min 0 
+1000 session(s) max
+min idle cpu 0.00/99.50
+Current Stack Size/Max 240K/8192K
 
-instance 2603665 stopped: gone
+===== registration state of both endpoints in this process =====
+endpoint,h323,mod_h323
+
+===== module load/unload lines from this instance own log =====
+2026-08-06 16:41:15.540250 100.00% [CONSOLE] mod_h323.cpp:236 Starting loading mod_h323
+2026-08-06 16:41:15.540250 100.00% [CONSOLE] switch_loadable_module.c:1772 Successfully Loaded [mod_h323]
+2026-08-06 16:41:15.560273 100.00% [CONSOLE] switch_loadable_module.c:2354 Stopping: mod_h323
+2026-08-06 16:41:16.600255 99.77% [CONSOLE] switch_loadable_module.c:2374 mod_h323 unloaded.
+2026-08-06 16:41:16.800255 99.50% [ERR] mod_opal.cpp:173 Refusing to load mod_opal: the PTLib runtime in this process is already reserved by [mod_h323], and two PTLib runtimes contending for the one PProcess singleton crash the process (OOS-9). The reservation outlives an unload because the runtime stays mapped, so restart FreeSWITCH to change which endpoint this process serves, and run the two endpoints in separate instances.
+2026-08-06 16:41:16.920249 99.50% [CONSOLE] mod_h323.cpp:236 Starting loading mod_h323
+2026-08-06 16:41:16.920249 99.50% [CONSOLE] switch_loadable_module.c:1772 Successfully Loaded [mod_h323]
+
+instance 3574529 stopped: gone
+
+############################################################################
+# SCENARIO 5 of 5 - the same, in the opposite order: load mod_opal, unload it, then attempt mod_h323
+############################################################################
+===== unload-order2 =====
+instance pid: 3574654   event socket: 127.0.0.1:28041   isolated prefix: /tmp/blitzy/freeswitch/blitzy-736674cf-ebe1-40c1-b224-21affe971d9d_749798/blitzy_adhoc_test_qa9/instance
+
+$ fs_cli -x 'load mod_opal'
++OK Reloading XML
++OK
+
+$ fs_cli -x 'module_exists mod_opal'
+true
+
+$ fs_cli -x 'global_getvar _fs_ptlib_endpoint_reservation'   (the holder while mod_opal is loaded)
+mod_opal
+
+===== the module is UNLOADED - registration ends here, residency does not =====
+$ fs_cli -x 'unload mod_opal'
++OK
+
+$ fs_cli -x 'module_exists mod_opal'   (false => the module is no longer registered)
+false
+
+$ fs_cli -x 'module_exists mod_h323'   (false => neither endpoint is registered now)
+false
+
+===== OBSERVABLE A: the reservation is STILL HELD after the unload =====
+$ fs_cli -x 'global_getvar _fs_ptlib_endpoint_reservation'   (expected: mod_opal - the PTLib runtime is still mapped)
+mod_opal
+
+===== OBSERVABLE B: the SIBLING is still refused, by stage 2, with neither module in the hash =====
+$ fs_cli -x 'load mod_h323'
++OK Reloading XML
+-ERR [module load file routine returned an error]
+
+$ fs_cli -x 'module_exists mod_h323'   (false => the refused module is NOT registered)
+false
+
+===== the stage-2 ERROR naming the reservation holder =====
+2026-08-06 16:41:32.581971 99.50% [ERR] mod_h323.cpp:225 Refusing to load mod_h323: the PTLib runtime in this process is already reserved by [mod_opal], and two PTLib runtimes contending for the one PProcess singleton crash the process (OOS-9). The reservation outlives an unload because the runtime stays mapped, so restart FreeSWITCH to change which endpoint this process serves, and run the two endpoints in separate instances.
+2026-08-06 16:41:32.581971 99.50% [CRIT] switch_loadable_module.c:1754 Error Loading module /usr/local/freeswitch/mod/mod_h323.so
+
+===== OBSERVABLE C: the SAME endpoint reloads - the claim is re-claimed by its owner =====
+$ fs_cli -x 'load mod_opal'
++OK Reloading XML
++OK
+
+$ fs_cli -x 'module_exists mod_opal'   (true => an owner-matched reload is allowed)
+true
+
+$ fs_cli -x 'global_getvar _fs_ptlib_endpoint_reservation'
+mod_opal
+
+===== OBSERVABLE D: the process SURVIVES all of it and status is UP =====
+pid 3574654 is alive: PASS
+
+$ fs_cli -x 'status'
+UP 0 years, 0 days, 0 hours, 0 minutes, 4 seconds, 573 milliseconds, 286 microseconds
+FreeSWITCH (Version 1.11.2-dev git 24218f3 2026-08-06 14:58:37Z 64bit) is ready
+0 session(s) since startup
+0 session(s) - peak 0, last 5min 0 
+0 session(s) per Sec out of max 30, peak 0, last 5min 0 
+1000 session(s) max
+min idle cpu 0.00/99.50
+Current Stack Size/Max 240K/8192K
+
+===== registration state of both endpoints in this process =====
+endpoint,opal,mod_opal
+
+===== module load/unload lines from this instance own log =====
+2026-08-06 16:41:31.221968 100.00% [CONSOLE] mod_opal.cpp:185 Starting loading mod_opal
+2026-08-06 16:41:31.241976 100.00% [CONSOLE] switch_loadable_module.c:1772 Successfully Loaded [mod_opal]
+2026-08-06 16:41:31.261967 100.00% [CONSOLE] switch_loadable_module.c:2354 Stopping: mod_opal
+2026-08-06 16:41:32.421989 99.50% [CONSOLE] switch_loadable_module.c:2374 mod_opal unloaded.
+2026-08-06 16:41:32.581971 99.50% [ERR] mod_h323.cpp:225 Refusing to load mod_h323: the PTLib runtime in this process is already reserved by [mod_opal], and two PTLib runtimes contending for the one PProcess singleton crash the process (OOS-9). The reservation outlives an unload because the runtime stays mapped, so restart FreeSWITCH to change which endpoint this process serves, and run the two endpoints in separate instances.
+2026-08-06 16:41:32.721982 99.50% [CONSOLE] mod_opal.cpp:185 Starting loading mod_opal
+2026-08-06 16:41:32.721982 99.50% [CONSOLE] switch_loadable_module.c:1772 Successfully Loaded [mod_opal]
+
+instance 3574654 stopped: gone
+
+############################################################################
+# END OF CAPTURE
+############################################################################

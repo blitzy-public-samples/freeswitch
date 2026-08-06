@@ -664,7 +664,7 @@ line **was** observed in both orders; a frame **inside** `mod_*_load` was on the
 stack in both orders (`#7 mod_opal_load … mod_opal.cpp:116` and
 `#6 mod_h323_load … mod_h323.cpp:167` — those two line numbers are gdb's own output against
 the **unguarded** sources, where they are the `new FSProcess()` statements; in the guarded tree
-the same statements are `mod_opal.cpp:199` and `mod_h323.cpp:249`); and the fault was **not**
+the same statements are `mod_opal.cpp:203` and `mod_h323.cpp:252`); and the fault was **not**
 in `dl_init`, a library
 constructor or a static initialiser — a `dlopen(RTLD_NOW|RTLD_LOCAL)`-only probe of both
 modules in one process completed with exit 0. Because module code runs first, module code can
@@ -678,17 +678,18 @@ is already in the core's module hash, and refuses if it is. This is the common c
 only stage that can name the offending module in its message.
 
 - `mod_h323_load` refuses when `switch_loadable_module_exists("mod_opal")` succeeds
-  (`src/mod/endpoints/mod_h323/mod_h323.cpp:198`).
+  (`src/mod/endpoints/mod_h323/mod_h323.cpp:189`).
 - `mod_opal_load` refuses when `switch_loadable_module_exists("mod_h323")` succeeds
-  (`src/mod/endpoints/mod_opal/mod_opal.cpp:145`).
+  (`src/mod/endpoints/mod_opal/mod_opal.cpp:136`).
 
 **Stage 2 — claim the runtime atomically.** Stage 1 alone is only a *snapshot*:
 `switch_loadable_module_exists()` takes the module-hash lock for its own lookup and releases
 it, and the core publishes a module into that hash only *after* the module's load routine has
 returned. Nothing serialises the interval in between, so two concurrent load requests — one
 per endpoint — can both see the sibling absent and both go on to construct a `PProcess`,
-which is exactly the operation that kills the process. Unloading has the same window in
-reverse: the sibling leaves the hash before its shutdown has torn PTLib down.
+which is exactly the operation that kills the process. Unloading defeats stage 1 outright: the
+sibling leaves the module hash while its PTLib runtime stays mapped, so after an unload there is
+nothing left for stage 1 to find and the crash would be one `load` away.
 
 Each module therefore claims one process-global reservation with a compare-and-swap before it
 constructs anything:
@@ -696,71 +697,126 @@ constructs anything:
 | | |
 |---|---|
 | Reservation variable | `_fs_ptlib_endpoint_reservation` — spelled `H323_PTLIB_RESERVATION` in `mod_h323.cpp:162` and `OPAL_PTLIB_RESERVATION` in `mod_opal.cpp:109`, deliberately the identical string so the two modules contend for **one** entry. The `_fs_` prefix keeps it clear of any name an operator would pick |
-| Claimed with | `switch_core_set_var_conditional(<RESERVATION>, modname, "")` — it holds `runtime.global_var_rwlock` in **write** mode across the whole test-and-set |
-| Claim sites | `src/mod/endpoints/mod_h323/mod_h323.cpp:221`, `src/mod/endpoints/mod_opal/mod_opal.cpp:169` |
-| Released on | every load-failure edge after the claim, and **last** in shutdown — after the `FSProcess` is deleted, so the claim also spans the unload window |
-| Release sites | `mod_h323.cpp:243`, `:252`, `:268`, `:290`; `mod_opal.cpp:195`, `:201`, `:215`, `:233` |
+| Claimed with | two compare-and-swaps, tried in order: `switch_core_set_var_conditional(<RESERVATION>, modname, "")` claims a runtime **nobody** holds, and `switch_core_set_var_conditional(<RESERVATION>, modname, modname)` re-claims one **this module already holds**. Each call holds `runtime.global_var_rwlock` in **write** mode across its whole test-and-set, so the decision is atomic. Refusing needs both to fail, which happens exactly when the holder is the *other* endpoint |
+| Claim sites | `src/mod/endpoints/mod_h323/mod_h323.cpp:221-222`, `src/mod/endpoints/mod_opal/mod_opal.cpp:169-170` |
+| Lifetime | **the life of the process, once claimed.** `mod_h323_shutdown()` (`mod_h323.cpp:274`) and `mod_opal_shutdown()` (`mod_opal.cpp:222`) deliberately do **not** release it |
+| Released on | exactly two edges per module, both *before* the `FSProcess` is constructed: the failure to create a module interface, and the failure to allocate the `FSProcess`. Nothing is resident to protect at either point, and the core never calls a module's shutdown for a load that returned failure, so a claim left behind there would reserve nothing and refuse every later retry |
+| Release sites | `mod_h323.cpp:246`, `:255`; `mod_opal.cpp:199`, `:205` |
 
-The release passes the module's own name as the expected value, so a second shutdown, or a
-shutdown after a refused load, is a no-op rather than a way to free another module's claim.
-No core API was added for this: `switch_core_set_var_conditional()` is already exported to
-modules and already used by `mod_commands` and `mod_v8`.
+Each release passes the module's own name as the expected value, so it can never free another
+module's claim. No core API was added for this: `switch_core_set_var_conditional()` is already
+exported to modules and already used by `mod_commands` and `mod_v8`.
 
-**Inspecting it.** `fs_cli -x 'global_getvar _fs_ptlib_endpoint_reservation'` names the module
-holding the PTLib runtime, or returns empty when neither endpoint is loaded.
+**The claim is sticky, and that is the point.** This build defines `HAVE_FAKE_DLCLOSE`, so
+`switch_dso.c` skips `dlclose()` and an **unloaded** module keeps its PTLib runtime mapped for
+the lifetime of the process. Residency, not registration, is what makes a second `PProcess`
+fatal, so the claim outlives the module that made it. Concretely, and measured in both orders in
+`blitzy/documentation/oos9-coload-evidence/guard-refusal-runtime-proof.txt` (scenarios 4 and 5):
+
+- `load mod_h323` → `+OK`, and `global_getvar _fs_ptlib_endpoint_reservation` answers `mod_h323`.
+- `unload mod_h323` → `+OK`, and `module_exists mod_h323` and `module_exists mod_opal` are now
+  **both** `false` — registration has ended.
+- `global_getvar _fs_ptlib_endpoint_reservation` still answers **`mod_h323`**. This is correct
+  and deliberate, not a leak and not a stale value.
+- `load mod_opal` is therefore still **refused**, by stage 2 rather than stage 1, because the
+  sibling is no longer in the module hash for stage 1 to find. Without the sticky claim,
+  `load mod_h323; unload mod_h323; load mod_opal` would find an empty module hash and a released
+  reservation and walk straight into the crash this guard exists to prevent.
+- `load mod_h323` **succeeds** — an owner-matched reload re-claims its own reservation, and the
+  endpoint interface is registered again (`show endpoint` lists `endpoint,h323,mod_h323`).
+  Destroying and rebuilding one `FSProcess` on one PTLib runtime is safe.
+
+To change which endpoint a process serves, **restart FreeSWITCH**. Both refusal messages say so.
+
+**Inspecting it.** `fs_cli -x 'global_getvar _fs_ptlib_endpoint_reservation'` names the endpoint
+whose PTLib runtime is mapped into this process. It is unset **only** in a fresh process in which
+neither endpoint has been loaded yet — where the variable does not exist at all, so `global_getvar`
+answers `-ERR no reply` rather than a blank line. Once either endpoint has loaded, the variable
+holds that module's name for the life of the process, whether or not the module is still loaded.
+
+**Do not "clear" it.** A reservation that names an endpoint while neither endpoint is loaded is the
+expected state after an unload, and it is exactly what stops the sibling from crashing the process.
+Setting it back to empty by hand re-opens the deterministic `PProcess` crash for the next `load` of
+the other endpoint. If you want the other endpoint, restart the process.
 
 **One consequence worth knowing before you go looking for it.** The reservation is an ordinary
 core global variable, so it is writable by an operator — `global_setvar` takes
 `<var>=<value>`, i.e. `fs_cli -x 'global_setvar _fs_ptlib_endpoint_reservation=anything'`, and
 `X-PRE-PROCESS set` in a configuration file does the same. There is no core facility for a
-variable that is readable but not writable. Setting `_fs_ptlib_endpoint_reservation` to any
-non-empty value by hand therefore makes **both** endpoints refuse to load, with an `ERROR`
-reporting that the runtime is `already reserved by [<your value>]` — the refusal comes from the
-compare-and-swap at `mod_h323.cpp:221` / `mod_opal.cpp:169` and is logged at `mod_h323.cpp:224` /
-`mod_opal.cpp:172`, which is a different line from the sibling-already-loaded refusal above. That is a configuration mistake rather than a
-security boundary: the crash this section exists to prevent stays prevented either way, because
-the sibling-in-the-hash check runs first and is independent of the reservation. If both
-endpoints refuse and neither is loaded, read this variable first — an unexpected value in it is
-the diagnosis. The `_fs_` prefix exists so that value cannot get there by accident.
+variable that is readable but not writable. Setting `_fs_ptlib_endpoint_reservation` by hand to
+any value that is neither empty nor a loading module's own name therefore makes **both**
+endpoints refuse to load, with an `ERROR` reporting that the runtime is
+`already reserved by [<your value>]` — the refusal comes from the compare-and-swap pair at
+`mod_h323.cpp:221-222` / `mod_opal.cpp:169-170` and is logged at `mod_h323.cpp:225` /
+`mod_opal.cpp:173`, which is a different line from the sibling-already-loaded refusal above.
+Writing one endpoint's own name into it pre-emptively refuses the *other* endpoint only, since
+the named module re-claims its own reservation. Either way this is a configuration mistake
+rather than a security boundary: the crash this section exists to prevent stays prevented,
+because the sibling-in-the-hash check runs first and is independent of the reservation. If both
+endpoints refuse and neither is loaded, read this variable first — and note that a value naming
+an endpoint that *was* loaded earlier in this process is the expected sticky claim described
+above, not a value to remove. The `_fs_` prefix exists so that no value gets there by accident.
 
-Beyond the two guard stages and the four release sites per module tabulated above, nothing in
-either module is changed — the exact per-file extent is tabulated in
+Beyond the two guard stages and the two release sites per module tabulated above, the only other
+change either file carries is a small set of pre-existing compiler-warning fixes — three sites in
+each — which are unrelated to the guard. The exact per-file extent is tabulated in
 `blitzy/documentation/oos9-coload-determination.md` §7.
 
 ### What an operator observes when the guard fires
 
 The second load is **refused**, and the process **survives**. Concretely:
 
-- An `ERROR` naming the singleton conflict and both PTLib runtimes is written to the log,
-  for example (`src/mod/endpoints/mod_h323/mod_h323.cpp:199-202`):
+- **Stage 1** — the sibling is loaded. An `ERROR` naming the singleton conflict and both PTLib
+  runtimes is written to the log, verbatim as it appears at
+  `src/mod/endpoints/mod_h323/mod_h323.cpp:190-195` (logged as `mod_h323.cpp:190`):
 
   ```
   Refusing to load mod_h323: mod_opal is already loaded in this process, and their conflicting
   PProcess singletons - one per PTLib runtime, libpt.so.2.10.9 for mod_h323 against
-  libpt.so.2.12-beta10 for mod_opal - crash the process (OOS-9). Run the two endpoints in
-  separate FreeSWITCH instances.
+  libpt.so.2.12-beta10 for mod_opal - crash the process (OOS-9). Unloading mod_opal does not make
+  this load safe, because its PTLib runtime stays mapped for the lifetime of the process: run the
+  two endpoints in separate FreeSWITCH instances, and restart this one to change which endpoint it
+  serves.
   ```
 
-- The load function returns `SWITCH_STATUS_FALSE`
-  (`src/mod/endpoints/mod_h323/mod_h323.cpp:203`,
-  `src/mod/endpoints/mod_opal/mod_opal.cpp:179`), which the core reports as
+  `mod_opal`'s counterpart at `mod_opal.cpp:137-143` is the same sentence with the module names
+  and runtime versions swapped.
+
+- **Stage 2** — the runtime is reserved, which is what you see after an unload or under a
+  concurrent load. The `ERROR` names the holder, verbatim as at `mod_opal.cpp:173-180` (logged as
+  `mod_opal.cpp:173`; `mod_h323`'s counterpart is `mod_h323.cpp:225`):
+
+  ```
+  Refusing to load mod_opal: the PTLib runtime in this process is already reserved by [mod_h323],
+  and two PTLib runtimes contending for the one PProcess singleton crash the process (OOS-9). The
+  reservation outlives an unload because the runtime stays mapped, so restart FreeSWITCH to change
+  which endpoint this process serves, and run the two endpoints in separate instances.
+  ```
+
+- Either way the load function returns `SWITCH_STATUS_FALSE` — stage 1 at
+  `src/mod/endpoints/mod_h323/mod_h323.cpp:196` / `src/mod/endpoints/mod_opal/mod_opal.cpp:144`,
+  stage 2 at `mod_h323.cpp:233` / `mod_opal.cpp:182` — which the core reports as
   `Error Loading module … Module load routine returned an error`, so `fs_cli -x 'load
   mod_h323'` answers `-ERR [module load file routine returned an error]`.
 - The refused module's own `Starting loading …` line never appears, because the guard returns
-  ahead of it.
+  ahead of it (`mod_h323.cpp:236`, `mod_opal.cpp:185`).
 - The already-loaded sibling keeps serving calls, and `fs_cli -x status` still reports
-  `UP … is ready`. Measured in both load orders; captured in
-  `blitzy/documentation/oos9-coload-evidence/guard-refusal-runtime-proof.txt`.
+  `UP … is ready`. Measured in both load orders, for both stages, and across an unload; captured
+  in `blitzy/documentation/oos9-coload-evidence/guard-refusal-runtime-proof.txt`.
 
 The refusal is therefore a safe degradation, not a mitigation of the prohibition: the module
 you asked for is unavailable in that process. The remedy is still one endpoint per instance.
 
-Each endpoint's test suite also carries a case asserting the refusal —
-`coload_guard_refuses_when_sibling_is_loaded`
-(`src/mod/endpoints/mod_h323/test/test_mod_h323.cpp:3402`,
-`src/mod/endpoints/mod_opal/test/test_mod_opal.cpp:3506`) — which exercises the guard against
-a sibling registered through the module-load API, so no test binary ever links two PTLib
-runtimes.
+Each endpoint's test suite carries three covering cases, one per behaviour:
+`coload_guard_refuses_when_sibling_is_loaded` for stage 1
+(`src/mod/endpoints/mod_h323/test/test_mod_h323.cpp:3528`,
+`src/mod/endpoints/mod_opal/test/test_mod_opal.cpp:3680`), which exercises the guard against a
+sibling registered through the module-load API;
+`coload_reservation_refuses_a_reserved_ptlib_runtime` for stage 2 (`test_mod_h323.cpp:3595`,
+`test_mod_opal.cpp:3747`), which plants the reservation while the sibling is absent so the refusal
+cannot be attributed to stage 1; and `coload_reservation_outlives_the_unloaded_module`
+(`test_mod_h323.cpp:3458`, `test_mod_opal.cpp:3610`), which asserts that shutdown leaves the claim
+in place and that the owner may re-claim it. No test binary ever links two PTLib runtimes.
 
 One thing this guard is **not**: a build-time or test-time restriction. Both modules are
 built and both suites are run in the same tree; the prohibition is about one running
