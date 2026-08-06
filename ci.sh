@@ -20,6 +20,17 @@ display_usage()
 	echo "  --guard-self-test  Assert both capability guards - the CVE-2013-1864"
 	echo "                     verdict matrix included - and the unconditional"
 	echo "                     mod_xml_curl arm against scratch copies, then exit"
+	echo "                     REQUIRES A HOST THAT CARRIES BOTH ENDPOINT TOOLKITS."
+	echo "                     Two of the five arms assert the guards' POSITIVE"
+	echo "                     branch, which cannot be asserted where the toolkit is"
+	echo "                     absent, so on a toolkit-free host - including the"
+	echo "                     project's own Debian bookworm CI image as it ships -"
+	echo "                     this mode fails by design rather than passing"
+	echo "                     vacuously. Provision the host first with"
+	echo "                     build/provision_endpoint_toolkits.sh, then run it."
+	echo "                     The unit-test arm itself needs none of this: it gates"
+	echo "                     each endpoint on the toolkit and enables mod_xml_curl"
+	echo "                     unconditionally, so it succeeds either way."
 	exit 1
 }
 
@@ -1271,6 +1282,7 @@ guard_self_test_h323_negative()
 	# pass for a step it never reached.
 	if ! pkg-config --exists ptlib; then
 		echo "Error: this host has no ptlib.pc, so h323_toolkit_available refuses before it reaches the compile+link probe this arm has to exercise" >&2
+		echo "Error: install an H.323 toolkit - see build/provision_endpoint_toolkits.sh - or run --guard-self-test on a host that carries one; the unit-test arm itself does not need it, because it gates mod_h323 on exactly this probe" >&2
 		return 1
 	fi
 
@@ -1425,11 +1437,13 @@ guard_self_test_guards_positive()
 
 	if ! pkg-config --atleast-version=3.12.8 opal; then
 		echo "Error: this host does not satisfy the OPAL version gate, so the positive branch of the mod_opal guard cannot be asserted here" >&2
+		echo "Error: provision OPAL with build/provision_endpoint_toolkits.sh, or run --guard-self-test on a host that carries it; the unit-test arm needs neither, because it gates mod_opal on exactly this check" >&2
 		return 1
 	fi
 
 	if ! pkg-config --exists ptlib; then
 		echo "Error: this host has no ptlib.pc, so the positive branch of the mod_h323 guard cannot be asserted here" >&2
+		echo "Error: provision PTLib with build/provision_endpoint_toolkits.sh, or run --guard-self-test on a host that carries it; the unit-test arm needs neither, because it gates mod_h323 on exactly this check" >&2
 		return 1
 	fi
 

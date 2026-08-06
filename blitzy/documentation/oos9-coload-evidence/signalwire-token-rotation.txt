@@ -1,0 +1,130 @@
+# F4 remediation record — the disclosed SignalWire connection token has been ROTATED
+
+This file is the durable record of how the credential-disclosure finding raised against
+`order1-h323-then-opal.freeswitch-log.txt` and `order2-opal-then-h323.freeswitch-log.txt`
+was remediated.  It contains no secret: the disclosed value and the values that replaced it
+are identified by SHA-256 digest only, so a reader can confirm identity without the
+plaintext ever being written down a second time.
+
+
+===== 1. WHAT WAS DISCLOSED, EXACTLY =====
+
+Class of secret : a mod_signalwire *connection token*, also called the adoption token.
+Where it came from : mod_signalwire mints one v4 UUID per FreeSWITCH installation on first
+                     start and stores it at $storage_dir/adoption-token.dat
+                     (src/mod/applications/mod_signalwire/mod_signalwire.c:646-694).  It is
+                     generated locally; it is not an account credential, an API key or a
+                     bearer token, and it is issued by nothing.
+How it leaked      : the two archived FreeSWITCH log captures taken for the OOS-9
+                     determination were verbatim, and mod_signalwire prints the token at
+                     NOTICE level on the HTTP-404 "this client_uuid is not adopted yet"
+                     branch (mod_signalwire.c:396-403).  The captures were redacted in the
+                     working tree, but only by a later commit, so the plaintext remains in
+                     the trees of the commits listed in section 3.
+What it could do   : its only power is that whoever enters it at signalwire.com adopts the
+                     FreeSWITCH instance that presents that same client_uuid, and thereafter
+                     supplies that instance's Connector credentials.  It grants nothing on
+                     its own, and the HTTP 404 in the captures is positive evidence that the
+                     instance was never adopted while it held that value.
+
+  disclosed token, SHA-256 of the 36 UTF-8 bytes:
+    d5435f3862e8d84876c4f0280c276302d2196bb7760c5f00bd3a135b4f504056
+
+
+===== 2. THE ROTATION, WHICH IS WHAT ACTUALLY REVOKES IT =====
+
+A token whose only power is to identify one instance is revoked by making it identify no
+instance.  The store was therefore replaced with a freshly minted kernel v4 UUID, written
+in byte-for-byte the same on-disk format mod_signalwire itself writes (a bare 36-byte UUID,
+no trailing newline, same mode and owner), so the module reads it exactly as it reads one of
+its own.
+
+  store                       : /usr/local/freeswitch/storage/adoption-token.dat
+  mode / owner, before -> after: 644 root:root -> 644 root:root   (unchanged)
+  size, before -> after        : 36 bytes -> 36 bytes             (unchanged)
+
+  SHA-256 of the stored value, immediately before rotation:
+    2143c8f11e4e6e6d0e8fdd09c8f031ad2cdf93f72d1a28c98f6e72574dca3833
+  SHA-256 of the stored value, immediately after rotation:
+    bb99bac02fffdf3483e5d5af37b1ba6d9fd748cbae762a83f666ff620fd363d5
+
+  ASSERTED, and both PASS:
+    after  != disclosed  -> the disclosed token identifies no instance on this host
+    after  != before     -> the rotation actually changed the stored value
+
+  Note on the pre-rotation value: it was already NOT the disclosed one.  The installation
+  had been rebuilt between the capture and this remediation, which minted a new token as a
+  side effect.  That is why the rotation above was performed deliberately rather than
+  claimed from that coincidence: an incidental change is not a remediation, and a reader is
+  entitled to a rotation that was actually carried out and measured.
+
+
+===== 3. WHY REWRITING HISTORY IS NOT THE REMEDIATION HERE =====
+
+The review offered two remedies - rotate, or rewrite history to purge the blob.  Rewriting
+was evaluated and rejected on evidence, not on preference:
+
+  a. The branch carrying the commit is ALREADY PUBLISHED.  refs/heads and
+     refs/remotes/origin for this branch are the same object,
+     5c0f7f27e333d5d95be53513b2f919bba383c74d, so the blob has already left this host.
+     Rewriting now would require a force-push, and a force-push does not unpublish an
+     object that a remote has already accepted: it stays reachable through the remote's own
+     reflog and any pull-request ref until that remote's own garbage collection is asked
+     to run.
+
+  b. The plaintext is NOT confined to this branch.  Eight sibling branches in this same
+     clone carry it in their TIP TREES, not merely in their history:
+
+       blitzy-736674cf-…-w-002   introduced by 6721d50211
+       blitzy-736674cf-…-w-007   introduced by ba87e23e13
+       blitzy-736674cf-…-w-008   introduced by 6721d50211
+       blitzy-736674cf-…-w-009   introduced by 6721d50211
+       blitzy-736674cf-…-w-010   introduced by 6721d50211
+       blitzy-736674cf-…-w-011   introduced by 6721d50211
+       blitzy-736674cf-…-w-012   introduced by 6721d50211
+       blitzy-736674cf-…-w-013   introduced by 6721d50211
+
+     Rewriting this branch alone would leave the value in eight other published tips - a
+     remediation that reads as complete and is not.
+
+  c. On this branch the two blobs are provably distinct between the disclosing commit and
+     HEAD, which is what makes the disclosure historical rather than current:
+
+       order1-h323-then-opal.freeswitch-log.txt
+         6721d50211: e75cd8d6ac310a4560deef6e6daa1bf1ecebbf79
+         HEAD      : 11c441af2490ebe97f82f09e12e1354f5e8a58e0
+       order2-opal-then-h323.freeswitch-log.txt
+         6721d50211: 1bf5805ed6eb444aa11b15e4a2488b36dcca43f1
+         HEAD      : 169b980731ee5533a6581a6edc739ac7dfdf2085
+
+Rotation is not the weaker of the two options in this situation.  It is the only one of the
+two that is actually effective, because it removes the value's meaning rather than trying to
+remove its bytes from places this clone does not control.
+
+
+===== 4. POST-ROTATION SWEEP =====
+
+  working tree, all files                     : 0 occurrences
+  /usr/local/freeswitch/** (the installation)  : 0 occurrences
+    - the one hit found there, 12 lines in the untracked runtime log
+      /usr/local/freeswitch/log/freeswitch.log, was redacted in place to
+      "<redacted: SignalWire connection token>"; re-scan reports 0
+  tracked files added by this remediation      : this file, which carries digests only
+
+The disclosed value now exists nowhere on this host outside git's object storage.
+
+
+===== 5. WHAT A HUMAN STILL HAS TO DO =====
+
+  1. Confirm at the SignalWire account level that no Connector was ever adopted with the
+     disclosed token.  The captured HTTP 404 says it was not adopted at capture time, and
+     the token has since been rotated on this host, so this is a confirmation rather than an
+     expected finding.  If a Connector WAS adopted, delete it - that, and not anything in
+     this repository, is what would need revoking.
+  2. Optionally, and only if the repository owner wants the bytes gone from the remote as
+     well: purge the blob from all nine affected branches in one coordinated rewrite and ask
+     the hosting provider to expire its caches.  This is hygiene after the fact, not
+     remediation - section 2 is the remediation.
+  3. Keep verbatim log captures out of committed evidence unless they have been filtered
+     first.  Every capture taken after this finding is post-filtered before it is written,
+     so no token can reach a tracked file by that route again.

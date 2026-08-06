@@ -3,3 +3,4 @@
 .deps/
 test_mod_xml_curl*.o
 test_mod_xml_curl
+__pycache__/

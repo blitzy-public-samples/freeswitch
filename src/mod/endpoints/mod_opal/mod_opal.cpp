@@ -101,12 +101,12 @@ SWITCH_MODULE_DEFINITION(mod_opal, mod_opal_load, mod_opal_shutdown, NULL);
 
 /* OOS-9 mutual exclusion, part 1 of 2: the process-global reservation name.
 
-   mod_h323 declares the identical name; the two MUST match, because the whole
-   mechanism is that they contend for one entry in the core's global variable table.
-   Namespaced so it cannot collide with an operator's own variable, and left visible
-   there deliberately - `global_getvar ptlib_endpoint_reservation' then names which
-   endpoint holds the PTLib runtime in this process. */
-#define OPAL_PTLIB_RESERVATION "ptlib_endpoint_reservation"
+   mod_h323 declares the identical name; the two MUST match, because the whole mechanism
+   is that they contend for one entry in the core's global variable table. The `_fs_'
+   prefix keeps it clear of any name an operator would pick, and it stays visible there
+   deliberately - `global_getvar _fs_ptlib_endpoint_reservation' names the holder. Any
+   core variable is operator-writable, so pre-setting this one refuses BOTH endpoints. */
+#define OPAL_PTLIB_RESERVATION "_fs_ptlib_endpoint_reservation"
 
 SWITCH_MODULE_LOAD_FUNCTION(mod_opal_load)
 {

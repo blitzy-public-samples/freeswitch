@@ -28,13 +28,42 @@ determination began. Everything below was produced first-hand on this host.
 
 **Reading the line numbers below.** Every frame and log line quoted here comes from the
 **unguarded** sources, so its line numbers are those of `323d52c88a`. The guard delivered
-afterwards (§7) inserts 25 lines at the top of `mod_h323_load` and 26 at the top of
-`mod_opal_load`, which shifts every subsequent line in those two files by the same
-constant: `mod_h323.cpp:167` here is `:192` in the guarded tree, `mod_opal.cpp:116` is
-`:142`, and the two entry log lines move from `:157` and `:104` to `:182` and `:130`. The
-same constant applies to the `mod_h323.cpp:<line>` and `mod_opal.cpp:<line>` anchors cited
-in the two endpoint suites' comments, which were deliberately left as they were rather
-than mass-rewritten.
+afterwards (§7) adds **94 lines to `mod_h323.cpp` and 97 to `mod_opal.cpp`**, and — this is the
+part worth reading carefully — **the shift is piecewise, not one constant**, because the guard
+lands in six separate hunks per file: the reservation name above the load function, the two
+refusal stages at the top of it, three release sites on its failure edges, and one release in
+the shutdown function. Measured against the shipped tree:
+
+| `mod_h323.cpp`, pre-guard line | shift | | `mod_opal.cpp`, pre-guard line | shift |
+|---|---|---|---|---|
+| 1 – 154 | +0 | | 1 – 101 | +0 |
+| 155 – 156 | +9 | | 102 – 103 | +9 |
+| 157 – 161 | +77 | | 104 – 112 | +78 |
+| 162 – 169 | +82 | | 113 – 117 | +83 |
+| 170 – 184 | +83 | | 118 – 129 | +84 |
+| 185 – 197 | +85 | | 130 – 137 | +87 |
+| 198 and after | +94 | | 138 and after | +97 |
+
+Every anchor this document quotes, translated once so no reader has to do the arithmetic:
+
+| Pre-guard anchor | Guarded tree | What it is |
+|---|---|---|
+| `mod_h323.cpp:157` | **`:234`** | `mod_h323_load`'s entry log line |
+| `mod_h323.cpp:167` | **`:249`** | `h323_process = new FSProcess();` — the gdb frame in §4 |
+| `mod_h323.cpp:174` | **`:257`** | "H323 mod initialized and running" |
+| `mod_h323.cpp:363` | **`:457`** | the `FSProcess::FSProcess` frame in §4 |
+| `mod_h323.cpp:42`, `:57` | **`:42`, `:57`** | unchanged — both precede the guard |
+| `mod_opal.cpp:104` | **`:182`** | `mod_opal_load`'s entry log line |
+| `mod_opal.cpp:116` | **`:199`** | `opal_process = new FSProcess();` — the gdb frame in §3 |
+| `mod_opal.cpp:122` | **`:206`** | "Opal manager initialized and running" |
+| `mod_opal.cpp:239` | **`:336`** | the `FSProcess::FSProcess` frame in §3 |
+| `mod_opal.cpp:58`, `:61`, `:62` | **`:58`, `:61`, `:62`** | unchanged — all precede the guard |
+| `mod_h323.h:630` | **`:630`** | `h323_process`; the header is 0-diff |
+
+The same piecewise mapping applies to the `mod_h323.cpp:<line>` and `mod_opal.cpp:<line>`
+anchors cited in the two endpoint suites' comments, which were deliberately left on the
+pre-guard numbering rather than mass-rewritten. Each suite's header now says so explicitly and
+points here, so no reader of those files is misled by an anchor that lands on a comment.
 
 `readelf -d` on both modules confirms each names its own PTLib SONAME plus
 `libfreeswitch.so.1`, so the two runtimes coexist rather than one satisfying the other:
@@ -198,48 +227,122 @@ fixed here; refusing the second load is the safe degradation.
 
 ## 7. What was delivered, and what it means for a reviewer
 
-Outcome A was delivered: a mutual-exclusion guard is the **first** thing each load function does,
-before `switch_loadable_module_create_module_interface` and before `new FSProcess()`:
+Outcome A was delivered as a **two-stage** guard, and both stages are the first thing each load
+function does — before `switch_loadable_module_create_module_interface` and before
+`new FSProcess()`, which is the operation that would crash.
+
+### 7.1 Stage 1 — the sibling-in-the-hash check
 
 - `mod_h323_load` refuses when `switch_loadable_module_exists("mod_opal") == SWITCH_STATUS_SUCCESS`
-  (`src/mod/endpoints/mod_h323/mod_h323.cpp`);
+  (`mod_h323.cpp:198`, ERROR at `:199`, `return SWITCH_STATUS_FALSE` at `:203`);
 - `mod_opal_load` refuses when `switch_loadable_module_exists("mod_h323") == SWITCH_STATUS_SUCCESS`
-  (`src/mod/endpoints/mod_opal/mod_opal.cpp`).
+  (`mod_opal.cpp:145`, ERROR at `:146`, `return SWITCH_STATUS_FALSE` at `:179`).
 
 Each logs `SWITCH_LOG_ERROR` naming the `PProcess` singleton conflict and both PTLib runtimes, then
 returns `SWITCH_STATUS_FALSE`, which `switch_loadable_module_load_file()` reports as
 `Error Loading module … **Module load routine returned an error**` while the process keeps running.
-Everything else in `mod_h323.cpp`/`.h` and `mod_opal.cpp`/`.h` is byte-identical to `323d52c88a`.
 
-Measured afterwards, in both load orders, in a fresh disposable instance per order
-(`oos9-coload-evidence/guard-refusal-runtime-proof.txt`): the second `load` answers
-`-ERR [module load file routine returned an error]` and `module_exists` reports the refused module
-absent; the log carries the guard's `ERROR` line naming the conflict plus the core's `CRIT
-Error Loading module …`; the process is still alive afterwards; and `fs_cli -x status` reports
-`UP … is ready`. The `switch_module_load` entry log line of the refused module never appears,
+### 7.2 Stage 2 — the atomic reservation, which is the stage that is safe under concurrency
+
+Stage 1 is a **snapshot**. `switch_loadable_module_exists()` takes `loadable_modules.mutex` for its
+own lookup and releases it, and the core holds no single lock across a sibling observation, a
+module's load routine and the publication of its result —
+`switch_loadable_module_load_module_ex()` checks the hash, releases, calls the module's load
+routine, and publishes under a separate lock later. Two concurrent load requests can therefore
+both observe the sibling absent and both proceed to construct a `PProcess`, which is exactly the
+fatal case. Unloading has the same window in reverse, because the sibling leaves the hash before
+its shutdown has torn PTLib down.
+
+Immediately after stage 1, therefore, each module claims one process-global reservation with a
+compare-and-swap. `switch_core_set_var_conditional()` holds `runtime.global_var_rwlock` in **write**
+mode across its whole test-and-set, so with the empty string as `val2` it succeeds only if the
+variable did not exist and returns `SWITCH_FALSE` having changed nothing otherwise. Exactly one of
+two concurrent claimants can win, whatever the loader is doing with its own locks, and the loser
+refuses. No core API was added: the function is already exported to modules and already used by
+`mod_commands` and `mod_v8`.
+
+| | `mod_h323.cpp` | `mod_opal.cpp` |
+|---|---|---|
+| Reservation name (`#define`) | `:162` `H323_PTLIB_RESERVATION` | `:109` `OPAL_PTLIB_RESERVATION` |
+| Claim site (the CAS) | `:221` | `:169` |
+| Refusal ERROR naming the holder | `:224` | `:172` |
+| Release — load failure, no module interface | `:243` | `:195` |
+| Release — load failure, no `FSProcess` | `:252` | `:201` |
+| Release — load failure, `Initialise()` false | `:268` | `:215` |
+| Release — in `*_shutdown()`, after the `FSProcess` is deleted | `:290` | `:233` |
+
+Both modules spell the reservation as the identical string `_fs_ptlib_endpoint_reservation`,
+because the whole mechanism is that they contend for one entry in the core's global variable
+table. Every load-failure edge releases it, because the core never calls a module's shutdown for
+a load that returned failure, so nothing else would ever release it and a later retry would be
+refused. The shutdown release is **last**, after the `FSProcess` is deleted, so the claim also
+spans the unload window; and it passes the module's own name as the expected value, so a second
+shutdown, or a shutdown after a refused load, is a no-op rather than a way to free another
+module's claim.
+
+**What that means for the extent of the edit, stated plainly.** Stage 2's release bookkeeping is
+why four lines per module sit **outside** the "top of `switch_module_load`" region the refine
+directive authorised — three load-failure edges and one inside `*_shutdown()`, a function the
+directive froze. That is a real departure and it is escalated as such (Project Guide §1.4 and
+H-3): reverting to stage 1 alone would reintroduce the race described above, so the recommended
+disposition is ratification of the widened carve-out rather than a narrower guard. Beyond the two
+stages and those four release sites per module, nothing in `mod_h323.cpp` or `mod_opal.cpp` is
+changed, and `mod_h323.h` and `mod_opal.h` are 0-diff.
+
+**One description, not two.** The operator-facing account of the same guard lives in
+`src/mod/xml_int/mod_xml_curl/README.response-format.md` §7, and it is the authoritative one for
+anything an operator does with it — inspecting the reservation with
+`fs_cli -x 'global_getvar _fs_ptlib_endpoint_reservation'`, the consequence of setting it by hand,
+and what a refusal looks like from the outside. This section is the authoritative one for *why*
+the guard has the shape it has. The two are cross-referenced rather than duplicated so they cannot
+drift into disagreeing.
+
+### 7.3 What was measured against the shipped binaries
+
+`oos9-coload-evidence/guard-refusal-runtime-proof.txt` was re-captured against the binaries this
+branch installs — its banner reads the shipped revision and its log anchors are the shipped
+`mod_h323.cpp:199` / `mod_opal.cpp:146` (stage 1) and `mod_opal.cpp:172` (stage 2). Three
+scenarios, one fresh disposable instance each:
+
+1. **stage 1, order 1** — `mod_h323` loads, `mod_opal` is refused;
+2. **stage 1, order 2** — `mod_opal` loads, `mod_h323` is refused;
+3. **stage 2** — the reservation is planted under the sibling's name while the sibling is
+   **absent from the module hash**, which is asserted in the capture, so the refusal cannot be
+   attributed to stage 1; `mod_opal` is then refused by the CAS, naming the holder.
+
+In all three: the second `load` answers `-ERR [module load file routine returned an error]`,
+`module_exists` reports the refused module absent, the log carries the guard's `ERROR` plus the
+core's `CRIT Error Loading module …`, the process is still alive afterwards, and `fs_cli -x status`
+reports `UP … is ready`. The refused module's `switch_module_load` entry log line never appears,
 because the guard returns ahead of it.
 
-Each endpoint suite also carries one case — `coload_guard_refuses_when_sibling_is_loaded` — that
-asserts the refusal through the module-load API against a sibling registered with
-`switch_loadable_module_build_dynamic()`, so the negative branch is exercised without linking a
-second PTLib into a test binary. That indirection is deliberate and is explained in each suite: a
-binary that loaded the real sibling would die of exactly the crash under discussion, which is why
-the end-to-end refusal lives in this archived runtime proof instead.
+Each endpoint suite carries one case per stage. `coload_guard_refuses_when_sibling_is_loaded`
+asserts stage 1 through the module-load API against a sibling registered with
+`switch_loadable_module_build_dynamic()`, and `coload_reservation_refuses_a_reserved_ptlib_runtime`
+asserts stage 2 by planting the reservation under the sibling's name while the sibling is *not* in
+the hash — the same distinguishing control scenario 3 above uses, so the case cannot pass because
+of stage 1. Both indirections are deliberate and are explained in each suite: a binary that loaded
+the real sibling would die of exactly the crash under discussion, which is why the end-to-end
+refusal lives in the archived runtime proof instead.
 
-**This guard is requested work, not an AAP deviation.** The refine directive authorises exactly this
-edit under Outcome A and supersedes the plan's zero-production-edit rule for these two blocks only.
+**Stage 1 is requested work; stage 2 exceeds the authorised carve-out and is escalated.** The
+refine directive authorises the guard under Outcome A and supersedes the plan's
+zero-production-edit rule for these blocks — but it scoped the edit to the top of
+`switch_module_load`, and §7.2 records exactly where stage 2 goes beyond that and why reverting it
+would be worse than ratifying it.
 
 ## 8. Evidence index
 
 | File | Contents |
 |---|---|
 | `oos9-coload-evidence/order1-h323-then-opal.gdb.txt` | Full gdb batch capture, order 1: stop reason, faulting frame, backtrace, `info sharedlibrary` |
-| `oos9-coload-evidence/order1-h323-then-opal.freeswitch-log.txt` | Module load lines and the final 40 log lines of the crashed instance, order 1 |
+| `oos9-coload-evidence/order1-h323-then-opal.freeswitch-log.txt` | Module load lines and the final 40 log lines of the crashed instance, order 1. Redacted: see the token-rotation record below |
 | `oos9-coload-evidence/order2-opal-then-h323.gdb.txt` | Same capture, order 2 |
-| `oos9-coload-evidence/order2-opal-then-h323.freeswitch-log.txt` | Same log extract, order 2 |
+| `oos9-coload-evidence/order2-opal-then-h323.freeswitch-log.txt` | Same log extract, order 2. Redacted as above |
 | `oos9-coload-evidence/staticinit-probe.c` | The `dlopen(RTLD_NOW\|RTLD_LOCAL)`-only probe |
 | `oos9-coload-evidence/staticinit-probe.txt` | Its output for both orders |
-| `oos9-coload-evidence/guard-refusal-runtime-proof.txt` | Post-guard runtime proof: refusal, `ERROR` log line, process survival, `fs_cli -x status` UP |
+| `oos9-coload-evidence/guard-refusal-runtime-proof.txt` | Runtime proof of the guard **as shipped**, re-captured against the installed binaries: three scenarios (stage 1 in both load orders, and stage 2 reached with the sibling provably absent from the module hash), each with the four required observables, plus the owner-matched `mod_xml_curl` subclass release |
+| `oos9-coload-evidence/signalwire-token-rotation.txt` | The remediation record for the adoption token the two `*.freeswitch-log.txt` captures above originally carried in plaintext: what it was, the measured rotation, why rewriting history would not have remediated it, and the post-rotation sweep. Digests only, no secret |
 
 Every instance started for this determination was disposable and was confirmed gone afterwards
 (only pids captured at start were ever signalled); no shipped configuration under `conf/`, no

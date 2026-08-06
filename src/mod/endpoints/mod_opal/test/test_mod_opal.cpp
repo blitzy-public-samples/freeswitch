@@ -72,8 +72,18 @@
  *
  * This harness includes only "../mod_opal.h" and reaches its subjects through
  * legitimate C++ access.  Nothing is de-staticised, no symbol is re-exported, no
- * `friend' declaration is added and not one line of mod_opal.cpp / mod_opal.h is
- * modified.
+ * `friend' declaration is added, mod_opal.h is unmodified, and the only change to
+ * mod_opal.cpp is the OOS-9 co-load guard, which this suite asserts rather than
+ * introduces.
+ *
+ * HOW TO READ THE mod_opal.cpp LINE NUMBERS BELOW.  Every `mod_opal.cpp:<line>' anchor
+ * in this file numbers the module as it stood BEFORE that guard was added, and the guard
+ * shifted the file by +9 to +97 depending on where in it you are.  The anchors were
+ * deliberately left on the pre-guard numbering rather than mass-rewritten, so translate
+ * them through the piecewise mapping tabulated in
+ * blitzy/documentation/oos9-coload-determination.md, "Reading the line numbers".  The
+ * two most-cited: mod_opal.cpp:104, the load function's entry log line, is :182 in the
+ * guarded tree, and mod_opal.cpp:116, where the FSProcess is constructed, is :199.
  *
  * Link shape.  Because the suite includes the header alone, the module's translation
  * unit reaches the link through the libmodopal.la convenience library that
@@ -2321,14 +2331,17 @@ static FSManager *test_opal_module_manager(void)
  * WHY THIS IS NOT INVOKED FROM FST_TEARDOWN.  FST_TEARDOWN runs after EVERY case,
  * and this suite deliberately hands live state from the load case to the shutdown
  * case so that shutting it down can be asserted rather than assumed.  A teardown
- * that swept unconditionally would destroy precisely the state the last case
+ * that swept unconditionally would destroy precisely the state the shutdown case
  * exists to observe.  The sweep is therefore anchored where it cannot do that: in
  * the failure branch of the case that retains state, and unconditionally in the
- * LAST declared case.  That placement is sufficient because a fatal check only
+ * SHUTDOWN case.  That placement is sufficient because a fatal check only
  * breaks out of the case body it appears in (switch_fct.h:3668-3669) and the
  * framework re-enters the fixture suite once per declared case
- * (switch_fct.h:3507-3516), so no failure anywhere can prevent the last case from
- * running its own sweep.
+ * (switch_fct.h:3507-3516), so no failure anywhere can prevent the shutdown case
+ * from running its own sweep.  The two OOS-9 cases declared after it are outside
+ * that argument and do not need it: neither makes a fatal check, so neither can
+ * break out early, and each releases in its own body the single thing it plants -
+ * a registered stand-in module, or a planted reservation.
  *
  * The one exit that does bypass this sweep needs it least.  An environmental skip
  * leaves the process outright through test_opal_skip_run(), and everything this
@@ -2399,11 +2412,28 @@ static void test_opal_suite_state_cleanup(void)
  * OOS-9 atomic exclusion.  Spelled out here rather than included, because the module
  * defines it in its own translation unit: this suite links the module rather than
  * including its source, so the literal is the interface.  It must stay identical to
- * OPAL_PTLIB_RESERVATION in mod_opal.cpp and H323_PTLIB_RESERVATION in mod_h323.cpp -
- * case 10 below fails loudly if it drifts, because a reservation taken under a
- * different name would not be seen by the module and the load would succeed.
+ * OPAL_PTLIB_RESERVATION in mod_opal.cpp and H323_PTLIB_RESERVATION in mod_h323.cpp.
+ *
+ * WHY THAT INVARIANT IS NOT ENFORCED AT COMPILE TIME, AND WHAT ENFORCES IT INSTEAD.
+ * A compile-time check would need the module's own macro in scope, which would mean
+ * either including the module translation unit - it is already linked in through
+ * libmodopal.la, so a second copy would be a duplicate-definition error - or adding a
+ * -D to this target's flags, and this module's Makefile.am is frozen.  mod_h323's suite
+ * has no such problem: it white-box-includes ../mod_h323.cpp, so it aliases the module's
+ * macro directly and cannot drift.  Here the invariant is instead machine-checked at run
+ * time, in BOTH directions, so drift cannot pass silently:
+ *
+ *   - POSITIVELY, in the module-load case: a successful mod_opal_load() must leave the
+ *     reservation held under exactly this name, with this module's own name as its value.
+ *     A module that reserved some other name would leave this one unset.
+ *   - NEGATIVELY, in case 10: a reservation planted under exactly this name must make
+ *     mod_opal_load() refuse.  A module reading some other name would not see it and the
+ *     load would succeed.
+ *
+ * Either half fails loudly and names the drift, so the two together are equivalent in
+ * effect to a static assertion that this suite is not in a position to write.
  */
-#define TEST_OPAL_PTLIB_RESERVATION "ptlib_endpoint_reservation"
+#define TEST_OPAL_PTLIB_RESERVATION "_fs_ptlib_endpoint_reservation"
 
 SWITCH_BEGIN_EXTERN_C
 static switch_status_t test_opal_sibling_stub_load(switch_loadable_module_interface_t **module_interface, switch_memory_pool_t *pool)
@@ -2517,12 +2547,12 @@ FST_CORE_BEGIN("conf_opal")
 		 * statements and checked non-fatally, each acquiring case ends with a
 		 * single unconditional tail that releases what it took, and anything
 		 * deliberately handed to a later case is swept by
-		 * test_opal_suite_state_cleanup() in the last declared case.
+		 * test_opal_suite_state_cleanup() in the shutdown case.
 		 *
 		 * Two things a fatal check CAN still strand, and why neither matters.  The
 		 * shared PTLib process, which every socket-free case acquires before its
 		 * first assertion: it has two independent reclamation paths, the load
-		 * case's own handover and the last case's sweep.  And anything allocated
+		 * case's own handover and the shutdown case's sweep.  And anything allocated
 		 * from fst_pool, which FST_TEARDOWN_BEGIN destroys on the way in before
 		 * this body would ever run.
 		 *
@@ -2606,7 +2636,7 @@ FST_CORE_BEGIN("conf_opal")
 			 * provenance handshake proves it came from the parent of this run.  Helper mode
 			 * _exit()s from inside this first case, so a top-level run that entered it on an
 			 * inherited or stale marker alone would run one case, exit with that case's
-			 * status, and be recorded as a clean pass with the eight later cases never run.
+			 * status, and be recorded as a clean pass with the nine later cases never run.
 			 *
 			 * A marker without valid provenance is therefore a hard refusal rather than a
 			 * fallback to an ordinary run: the marker's presence also disarms the spawn
@@ -3213,6 +3243,7 @@ FST_CORE_BEGIN("conf_opal")
 			switch_status_t status = SWITCH_STATUS_FALSE;
 			switch_status_t bound = SWITCH_STATUS_FALSE;
 			switch_status_t pooled = SWITCH_STATUS_FALSE;
+			char *reservation_holder = NULL;
 
 			fst_requires(test_opal_acquire_process() != NULL);
 			/* The IAX2 wildcard listener must be unable to bind before a manager is
@@ -3265,6 +3296,23 @@ FST_CORE_BEGIN("conf_opal")
 
 			fst_check(status == SWITCH_STATUS_SUCCESS);
 			fst_check(loaded_interface != NULL);
+
+			if (status == SWITCH_STATUS_SUCCESS) {
+				/* The POSITIVE half of the reservation-name drift check described above
+				 * TEST_OPAL_PTLIB_RESERVATION.  A load that succeeded claimed the PTLib
+				 * runtime, and it claimed it under the module's OPAL_PTLIB_RESERVATION
+				 * with `modname' as the value (mod_opal.cpp:169), so the variable this
+				 * suite spells out independently must now read back as "mod_opal".  If
+				 * the module's spelling ever moves, this reads NULL and says so - which
+				 * is the check case 10 cannot make, because an unset reservation is
+				 * indistinguishable from a correctly released one there. */
+				reservation_holder = switch_core_get_variable_dup(TEST_OPAL_PTLIB_RESERVATION);
+				fst_xcheck(reservation_holder != NULL && !strcmp(reservation_holder, TEST_OPAL_MODULE_NAME),
+						   "a successful mod_opal_load must hold the PTLib reservation under exactly "
+						   "TEST_OPAL_PTLIB_RESERVATION; an empty or foreign holder means that literal has "
+						   "drifted from OPAL_PTLIB_RESERVATION in mod_opal.cpp");
+				switch_safe_free(reservation_holder);
+			}
 
 			if (loaded_interface) {
 				/* The module name carried by the interface is the `modname` the

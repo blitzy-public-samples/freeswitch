@@ -29,10 +29,21 @@
  */
 
 /*
+ * HOW TO READ THE mod_h323.cpp LINE NUMBERS IN THIS FILE
+ * -----------------------------------------------------
+ * Every `mod_h323.cpp:<line>' anchor below numbers the module as it stood BEFORE the
+ * OOS-9 co-load guard was added, and the guard shifted the file by +9 to +94 depending
+ * on where in it you are.  The anchors were deliberately left on the pre-guard numbering
+ * rather than mass-rewritten, so translate them through the piecewise mapping tabulated
+ * in blitzy/documentation/oos9-coload-determination.md, "Reading the line numbers".  The
+ * two most-cited: mod_h323.cpp:157, the load function's entry log line, is :234 in the
+ * guarded tree, and mod_h323.cpp:167, where the FSProcess is constructed, is :249.
+ *
  * HARNESS ARCHITECTURE
  * --------------------
- * This suite observes mod_h323; it does not alter it.  No line of mod_h323.cpp,
- * mod_h323.h or h323.conf.xml is modified.
+ * This suite observes mod_h323; it does not alter it.  No line of mod_h323.h or
+ * h323.conf.xml is modified, and the only change to mod_h323.cpp is the OOS-9 co-load
+ * guard, which this suite asserts rather than introduces.
  *
  * Subjects: the two module entry points, which are the complete entry-point set --
  * SWITCH_MODULE_DEFINITION(mod_h323, mod_h323_load, mod_h323_shutdown, NULL) passes
@@ -119,7 +130,7 @@
  * allocates and abandons (mod_h323.cpp:469) is captured by a preprocessor seam scoped
  * to the module translation unit and released from the per-case teardown.  The
  * module's retained state -- provider registration, PProcess, module-lifetime pool --
- * is handed forward from case to case and swept by the last declared case, see
+ * is handed forward from case to case and swept by the shutdown case, see
  * fst_h323_suite_state_cleanup().
  */
 
@@ -907,9 +918,9 @@ static int fst_h323_name_position(const char *haystack, const char *needle)
  *
  * So exactly one PProcess-derived object exists in this process for the whole run, and
  * it is the one the MODULE creates: the module-load case constructs that FSProcess
- * (mod_h323.cpp:167) while both registries are still populated, every later case
- * adopts it through PTLib's public singleton accessor, and the last declared case
- * shuts the module down, which is the only thing that destroys it.
+ * (mod_h323.cpp:167) while both registries are still populated, every case between it
+ * and the shutdown case adopts it through PTLib's public singleton accessor, and the
+ * shutdown case shuts the module down, which is the only thing that destroys it.
  *
  * The configuration-absent branch cannot fit inside that arrangement -- it must be
  * declared first and still needs a PProcess to construct an endpoint against -- so it
@@ -2109,16 +2120,19 @@ static void fst_h323_module_pool_destroy(void)
  * It is not invoked from FST_TEARDOWN, which runs after every case, because this suite
  * hands state forward on purpose: the module-load case leaves the module loaded, its
  * PProcess alive and its pool alive, because the cases that follow observe a loaded
- * module and the last of them asserts that shutting it down works.  Reclamation is
+ * module and the shutdown case asserts that shutting it down works.  Reclamation is
  * anchored instead in a cleanup tail in every case that retains anything, plus this
- * total sweep in the last declared case.
+ * total sweep in the shutdown case.
  *
  * Two framework facts make that sound: a fatal check merely breaks out of the enclosing
  * test body (fct_req expands to `if (!ok) { break; }`, switch_fct.h:3668-3669), and FCTX
  * re-enters the whole fixture-suite body once per declared case, running only the case
  * whose number matches (switch_fct.h:3507-3516).  So a fatal check in one case can skip
- * that case's own tail but never a later case, which is why the last case is a dependable
- * safety net.
+ * that case's own tail but never a later case, which is why the sweep case is a dependable
+ * safety net for everything declared ahead of it.  The two OOS-9 cases declared AFTER it
+ * need no safety net of their own: neither makes a fatal check, so neither can break out
+ * early, and each releases in its own body the one thing it plants - a registered
+ * stand-in module, or a planted reservation.
  *
  * Two properties of the cases as written bound what such a skipped tail can leave behind,
  * and both hold by construction rather than by convention.  First, no fatal check stands
@@ -2128,7 +2142,7 @@ static void fst_h323_module_pool_destroy(void)
  * Second, the state a fatal check CAN strand is the shared PProcess - the gk-address-empty
  * and codec-prefs cases each acquire it and only then check the module interface fatally -
  * and releasing exactly that is what this sweep is for.  The sweep is always reached,
- * because the last declared case makes no fatal check at all.
+ * because the case that runs it makes no fatal check at all.
  *
  * Order is load-bearing: unbind the provider first, so nothing that follows can trigger
  * a configuration lookup that re-enters it; shut the module down next, since that is the
@@ -2298,7 +2312,7 @@ FST_CORE_BEGIN("conf_h323")
 		 * PROCESS during the case that just ran.  FSH323EndPoint::ReadConfig() allocates
 		 * one on entry and never destroys or uses it (mod_h323.cpp:469).
 		 *
-		 * Six of the eight cases call it, but only five of those calls happen in this
+		 * Six of the nine cases call it, but only five of those calls happen in this
 		 * process and reach this hook: cases 2 through 6 read configuration here, while
 		 * case 1 reads it twice inside the exec'd helper image, whose pools live and die
 		 * in an address space this hook cannot see and that _exit() discards wholesale.
@@ -2323,13 +2337,13 @@ FST_CORE_BEGIN("conf_h323")
 		 * module-lifetime pool, so control always reaches that case's cleanup tail
 		 * instead of breaking out to this hook.  A fatal check can still strand a
 		 * harness-owned fallback PProcess, which only exists when the module load did
-		 * not happen and which the last case's sweep releases, and anything allocated
+		 * not happen and which the shutdown case's sweep releases, and anything allocated
 		 * from fst_pool, which FST_TEARDOWN_BEGIN destroys on the way in.
 		 *
 		 * The release count is discarded here and only here, because a teardown body
 		 * runs outside any test's assertion scope.  The property is asserted where it is
 		 * attributable: the case that reads configuration checks the seam recorded a
-		 * pool, and the last declared case checks that none survives and that the
+		 * pool, and the shutdown case checks that none survives and that the
 		 * recorder never overflowed.
 		 */
 		FST_TEARDOWN_BEGIN()
@@ -2401,7 +2415,7 @@ FST_CORE_BEGIN("conf_h323")
 			 * provenance handshake proves it came from the parent of this run.  Helper
 			 * mode _exit()s from inside this first case, so a top-level run that entered
 			 * it on an inherited or stale marker alone would run one case, exit with that
-			 * case's status, and be recorded as a clean pass with the seven later cases
+			 * case's status, and be recorded as a clean pass with the eight later cases
 			 * never run.
 			 *
 			 * A marker without valid provenance is therefore a hard refusal rather than a
@@ -2736,8 +2750,8 @@ FST_CORE_BEGIN("conf_h323")
 			/* On the success path the module interface, h323_process and the
 			 * pool that backs them are deliberately left alive for every case
 			 * that follows: they adopt this process rather than creating one,
-			 * and the last of them asserts that shutting the module down
-			 * works. */
+			 * and the shutdown case among them asserts that shutting the module
+			 * down works. */
 		}
 		FST_TEST_END()
 
@@ -3115,9 +3129,10 @@ FST_CORE_BEGIN("conf_h323")
 			 * This case MUST run while the first PProcess of the process
 			 * lifetime is still alive, and it does: acquire ADOPTS the module's
 			 * process rather than creating a second, and nothing destroys a
-			 * PProcess before the last declared case.  Once any PProcess has
-			 * been destroyed the capability factory and the media-format registry
-			 * are empty for good and AddAllCapabilities() can add nothing. */
+			 * PProcess before the shutdown case, which is declared after this
+			 * one.  Once any PProcess has been destroyed the capability factory
+			 * and the media-format registry are empty for good and
+			 * AddAllCapabilities() can add nothing. */
 			fst_requires(fst_h323_process_acquire() != NULL);
 
 			/* Initialise() calls switch_loadable_module_create_interface(), so
@@ -3213,7 +3228,7 @@ FST_CORE_BEGIN("conf_h323")
 			fst_check(fst_h323_unbind_config() == SWITCH_STATUS_SUCCESS);
 
 			/* The PROCESS IS DELIBERATELY NOT RELEASED HERE.  It belongs to the
-			 * module, which the module-load case loaded and the last case shuts down;
+			 * module, which the module-load case loaded and the shutdown case shuts down;
 			 * releasing it now would destroy the module's own FSProcess behind
 			 * its back and empty both PTLib factories before the shutdown case
 			 * had observed anything.  This case owns the endpoint it constructed
@@ -3316,8 +3331,8 @@ FST_CORE_BEGIN("conf_h323")
 			/* ONLY NOW is retained state released.  Shutdown is the last thing
 			 * that touches pool-backed module state, so this is the earliest
 			 * point at which destroying the pool is safe - and doing it here,
-			 * inside the last declared case, keeps it out of the per-case
-			 * teardown that owns fst_pool.
+			 * inside this case, keeps it out of the per-case teardown that owns
+			 * fst_pool.
 			 *
 			 * The sweep is total rather than a bare pool destroy so that it also
 			 * reclaims anything an earlier case could have orphaned by breaking

@@ -92,6 +92,10 @@ static struct {
 	switch_memory_pool_t *pool;
 	hash_node_t *hash_root;
 	hash_node_t *hash_tail;
+	/* OBSERVABILITY: 1 only when THIS module's reservation of the fallback event's subclass
+	   succeeded, so shutdown releases a name it owns and nothing else. Appended as the final
+	   member; the wholesale memset in mod_xml_curl_load() zeroes it before every load. */
+	int fallback_subclass_reserved;
 } globals;
 
 #define XML_CURL_SYNTAX "[debug_on|debug_off]"
@@ -2124,9 +2128,15 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_xml_curl_load)
 	   first reserves the name on this module's behalf, and the white-box test suite drives load and
 	   shutdown directly within one process, possibly more than once - so SWITCH_STATUS_INUSE is
 	   tolerated and no outcome fails the load: emission does not depend on the reservation, so at
-	   worst the event still fires and only its discoverability by name is degraded. */
-	if ((subclass_status = switch_event_reserve_subclass(XML_CURL_JSON_FALLBACK_EVENT)) != SWITCH_STATUS_SUCCESS &&
-		subclass_status != SWITCH_STATUS_INUSE) {
+	   worst the event still fires and only its discoverability by name is degraded.
+	   The outcome is LATCHED because it decides what shutdown may release: the core answers
+	   SWITCH_STATUS_INUSE when the name already belongs to somebody else, and releasing it
+	   then would take the core's non-owner branch, log "inuse by listeners, detaching.." and
+	   re-arm the OTHER owner's binding. Freeing only what was actually reserved here keeps
+	   this module out of a name it does not hold. */
+	if ((subclass_status = switch_event_reserve_subclass(XML_CURL_JSON_FALLBACK_EVENT)) == SWITCH_STATUS_SUCCESS) {
+		globals.fallback_subclass_reserved = 1;
+	} else if (subclass_status != SWITCH_STATUS_INUSE) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
 						  "Could not reserve the %s event subclass (status %d); the fallback event still fires\n",
 						  XML_CURL_JSON_FALLBACK_EVENT, (int) subclass_status);
@@ -2145,11 +2155,17 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_xml_curl_shutdown)
 	hash_node_t *ptr = NULL;
 
 	/* OBSERVABILITY: release the fallback event's subclass, the counterpart of the reservation in
-	   mod_xml_curl_load(). The outcome is deliberately not checked: the core keeps the name alive for
-	   a listener that is still subscribed and reports that as a failure, which is the correct
-	   behaviour rather than an error to handle here, and a name this module never reserved is simply
-	   not found. */
-	switch_event_free_subclass(XML_CURL_JSON_FALLBACK_EVENT);
+	   mod_xml_curl_load(), and ONLY when that reservation is the one that succeeded. The guard is
+	   what keeps this module out of a name it does not own: on SWITCH_STATUS_INUSE the name belongs
+	   to another owner, and releasing it unconditionally would take the core's non-owner branch,
+	   log "inuse by listeners, detaching.." and re-arm that owner's binding behind its back.
+	   Where the guard does pass, the outcome is still deliberately not checked: the core keeps the
+	   name alive for a listener that is currently subscribed and reports that as a failure, which
+	   is the correct behaviour rather than an error to handle here. */
+	if (globals.fallback_subclass_reserved) {
+		globals.fallback_subclass_reserved = 0;
+		switch_event_free_subclass(XML_CURL_JSON_FALLBACK_EVENT);
+	}
 
 	while (globals.hash_root) {
 		ptr = globals.hash_root;
