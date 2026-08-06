@@ -1,5 +1,10 @@
 # Tail of /usr/local/freeswitch/log/freeswitch.log for this run (last 40 lines of the crashed instance)
 # Full run captured 1135 lines; the module-relevant lines and the final 40 are archived.
+# Redaction: this capture is verbatim except that the SignalWire connection token this
+# throwaway instance printed at startup, the STUN-detected external address and the host's
+# LAN address are replaced by the <redacted-...> placeholders below, and trailing whitespace
+# was stripped from the captured lines.  None of the four observables OOS-9 turns on is
+# affected: no redacted line is a module load, a refusal, a fault or a status line.
 
 ## grep -nE 'Starting loading|Successfully Loaded \[mod_(h323|opal)\]|initialized' :
 212:2026-08-05 22:35:05.797802 0.00% [NOTICE] switch_loadable_module.c:172 Adding Endpoint 'sofia'
@@ -35,17 +40,17 @@
 .=======================================================================================================.
 [m
 
-2026-08-05 22:35:07.299415 100.00% [INFO] switch_core.c:2506 
+2026-08-05 22:35:07.299415 100.00% [INFO] switch_core.c:2506
 FreeSWITCH Version 1.11.2-dev+git~20260801T120201Z~c3a857358d~64bit (git c3a8573 2026-08-01 12:02:01Z 64bit)
 
 FreeSWITCH Started
 Max Sessions [1000]
 Session Rate [30]
 SQL [Enabled]
-2026-08-05 22:35:07.498832 100.00% [NOTICE] mod_signalwire.c:401 Go to https://signalwire.com to set up your Connector now! Enter connection token a2ad0697-1f0d-418d-995d-c26441804653
+2026-08-05 22:35:07.498832 100.00% [NOTICE] mod_signalwire.c:401 Go to https://signalwire.com to set up your Connector now! Enter connection token <redacted: SignalWire connection token>
 2026-08-05 22:35:07.498832 100.00% [INFO] mod_signalwire.c:1125 Next SignalWire adoption check in 1 minutes
-2026-08-05 22:35:09.098832 99.67% [INFO] switch_stun.c:924 External ip address detected using STUN: 34.9.44.197
-2026-08-05 22:35:09.218834 99.67% [INFO] switch_stun.c:924 External ip address detected using STUN: 34.9.44.197
+2026-08-05 22:35:09.098832 99.67% [INFO] switch_stun.c:924 External ip address detected using STUN: <redacted-external-ip>
+2026-08-05 22:35:09.218834 99.67% [INFO] switch_stun.c:924 External ip address detected using STUN: <redacted-external-ip>
 2026-08-05 22:35:09.298839 99.67% [ERR] sofia.c:3293 Error Creating SIP UA for profile: external-ipv6 (sip:mod_sofia@[::1]:5080;transport=udp,tcp) ATTEMPT 2 (RETRY IN 5 SEC)
 2026-08-05 22:35:09.298839 99.67% [ERR] sofia.c:3293 Error Creating SIP UA for profile: internal-ipv6 (sip:mod_sofia@[::1]:5060;transport=udp,tcp) ATTEMPT 2 (RETRY IN 5 SEC)
 2026-08-05 22:35:09.298839 99.67% [INFO] mod_enum.c:890 ENUM Reloaded
@@ -53,12 +58,12 @@ SQL [Enabled]
 2026-08-05 22:35:10.258835 99.33% [CONSOLE] mod_opal.cpp:104 Starting loading mod_opal
 2026-08-05 22:35:10.278833 99.33% [WARNING] osutils.cxx:390 {mod_opal:0x7fff982166c0,-} PTLib	Trace stream set to 0x7fff8019f3a0 (0x7fff8019f3a0)
 2026-08-05 22:35:10.278833 99.33% [DEBUG] mod_opal.cpp:431 Created Listener 'default'
-2026-08-05 22:35:10.278833 99.33% [INFO] transports.cxx:570 {Opal Liste...ff7ab736c0,-} Listen	Started listening thread on tcp$10.236.2.230:1720
+2026-08-05 22:35:10.278833 99.33% [INFO] transports.cxx:570 {Opal Liste...ff7ab736c0,-} Listen	Started listening thread on tcp$<redacted-host-ip>:1720
 2026-08-05 22:35:10.278833 99.33% [CONSOLE] mod_opal.cpp:122 Opal manager initialized and running
 2026-08-05 22:35:10.278833 99.33% [CONSOLE] switch_loadable_module.c:1772 Successfully Loaded [mod_opal]
 2026-08-05 22:35:10.278833 99.33% [NOTICE] switch_loadable_module.c:172 Adding Endpoint 'opal'
-2026-08-05 22:35:13.458827 97.77% [INFO] switch_stun.c:924 External ip address detected using STUN: 34.9.44.197
-2026-08-05 22:35:13.498858 97.77% [INFO] switch_stun.c:924 External ip address detected using STUN: 34.9.44.197
+2026-08-05 22:35:13.458827 97.77% [INFO] switch_stun.c:924 External ip address detected using STUN: <redacted-external-ip>
+2026-08-05 22:35:13.498858 97.77% [INFO] switch_stun.c:924 External ip address detected using STUN: <redacted-external-ip>
 2026-08-05 22:35:13.598858 97.77% [INFO] mod_enum.c:890 ENUM Reloaded
 2026-08-05 22:35:13.598858 97.77% [INFO] switch_time.c:1436 Timezone reloaded 597 definitions
 2026-08-05 22:35:14.094627 97.77% [CONSOLE] mod_h323.cpp:157 Starting loading mod_h323

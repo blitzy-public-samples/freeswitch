@@ -2394,6 +2394,17 @@ static void test_opal_suite_state_cleanup(void)
  */
 #define TEST_OPAL_SIBLING_MODULE "mod_h323"
 
+/*
+ * The process-global reservation name mod_opal.cpp and mod_h323.cpp both use for the
+ * OOS-9 atomic exclusion.  Spelled out here rather than included, because the module
+ * defines it in its own translation unit: this suite links the module rather than
+ * including its source, so the literal is the interface.  It must stay identical to
+ * OPAL_PTLIB_RESERVATION in mod_opal.cpp and H323_PTLIB_RESERVATION in mod_h323.cpp -
+ * case 10 below fails loudly if it drifts, because a reservation taken under a
+ * different name would not be seen by the module and the load would succeed.
+ */
+#define TEST_OPAL_PTLIB_RESERVATION "ptlib_endpoint_reservation"
+
 SWITCH_BEGIN_EXTERN_C
 static switch_status_t test_opal_sibling_stub_load(switch_loadable_module_interface_t **module_interface, switch_memory_pool_t *pool)
 {
@@ -2459,8 +2470,12 @@ SWITCH_END_EXTERN_C
  *      observes a fully initialised module and its result is asserted rather than
  *      discarded, and so that its two extra duties come last: proving the case before it
  *      orphaned no configuration provider, and running the suite's unconditional sweep;
- *   9. coload_guard_refuses_when_sibling_is_loaded - last; the OOS-9 refusal, which needs a
- *      shut-down module and adds no state for case 8's sweep to release.
+ *   9. coload_guard_refuses_when_sibling_is_loaded - the OOS-9 refusal reached through the
+ *      module hash, which needs a shut-down module and adds no state for case 8's sweep
+ *      to release.
+ *  10. coload_reservation_refuses_a_reserved_ptlib_runtime - last; the OOS-9 refusal
+ *      reached through the ATOMIC reservation instead, which is the branch a concurrent
+ *      load takes and which the module hash cannot express.
  */
 FST_CORE_BEGIN("conf_opal")
 {
@@ -3474,6 +3489,77 @@ FST_CORE_BEGIN("conf_opal")
 				fst_check(switch_loadable_module_unload_module("", TEST_OPAL_SIBLING_MODULE, SWITCH_FALSE, &err) == SWITCH_STATUS_SUCCESS);
 				fst_check(switch_loadable_module_exists(TEST_OPAL_SIBLING_MODULE) == SWITCH_STATUS_FALSE);
 			}
+		}
+		FST_TEST_END()
+
+		/*
+		 * CASE 10 - the OOS-9 refusal reached through the ATOMIC RESERVATION, declared last.
+		 *
+		 * Case 9 asserts the guard that reads the module hash, and that guard is a snapshot:
+		 * switch_loadable_module_exists() takes loadable_modules.mutex for its own lookup and
+		 * releases it, while the core holds no single lock across a sibling observation, a
+		 * module's load routine and the publication of its result
+		 * (switch_loadable_module_load_module_ex()).  Two concurrent loads can therefore both
+		 * see the sibling absent.  What stops them is the second guard: a compare-and-swap on
+		 * a process-global reservation, performed by switch_core_set_var_conditional() under
+		 * runtime.global_var_rwlock in write mode.
+		 *
+		 * That branch cannot be reached by registering a sibling, because a registered sibling
+		 * is refused by case 9's guard first and the reservation is never consulted.  So it is
+		 * reached the way a losing concurrent claimant reaches it: the reservation is taken
+		 * under the SIBLING's name while the sibling is NOT in the module hash - exactly the
+		 * state the window produces - and mod_opal_load() is then asked to load into it.
+		 *
+		 * Asserted: the sibling really is absent from the hash, so case 9's guard cannot be
+		 * what refuses; the load returns SWITCH_STATUS_FALSE; no module interface is created;
+		 * and no FSProcess is constructed, which is the property that matters because
+		 * constructing a second one is what crashes the process.  The reservation this case
+		 * planted is then released and its absence confirmed, so nothing is stranded.
+		 */
+		FST_TEST_BEGIN(coload_reservation_refuses_a_reserved_ptlib_runtime)
+		{
+			switch_loadable_module_interface_t *module_interface = NULL;
+			switch_status_t status = SWITCH_STATUS_FALSE;
+			char *holder = NULL;
+
+			/* The reservation must start out unheld: case 8 shut the module down, and that
+			 * shutdown releases it.  If it were still held, this case would be asserting a
+			 * leak rather than the guard. */
+			holder = switch_core_get_variable_dup(TEST_OPAL_PTLIB_RESERVATION);
+			fst_xcheck(holder == NULL, "the PTLib reservation must be unheld once mod_opal has shut down");
+			switch_safe_free(holder);
+
+			/* The distinguishing control: the sibling is NOT registered, so the module-hash
+			 * guard asserted in case 9 cannot be the thing that refuses below. */
+			fst_check(switch_loadable_module_exists(TEST_OPAL_SIBLING_MODULE) == SWITCH_STATUS_FALSE);
+
+			/* Take the reservation under the sibling's name, the way the sibling's own load
+			 * would have taken it a moment before publishing itself. */
+			fst_xcheck(switch_core_set_var_conditional(TEST_OPAL_PTLIB_RESERVATION,
+													  TEST_OPAL_SIBLING_MODULE, "") == SWITCH_TRUE,
+					   "the sibling stand-in must be able to claim the PTLib reservation");
+
+			status = mod_opal_load(&module_interface, fst_pool);
+
+			fst_xcheck(status == SWITCH_STATUS_FALSE,
+					   "mod_opal must refuse to load while another endpoint holds the PTLib reservation (OOS-9)");
+			fst_check(module_interface == NULL);
+			fst_check(!PProcess::IsInitialised());
+
+			/* The refused load must not have taken the reservation from its holder either. */
+			holder = switch_core_get_variable_dup(TEST_OPAL_PTLIB_RESERVATION);
+			fst_check(holder != NULL && !strcmp(holder, TEST_OPAL_SIBLING_MODULE));
+			switch_safe_free(holder);
+
+			/* Cleanup tail: release what this case planted, and confirm the release, so the
+			 * refusal is provably a function of the reservation rather than of anything
+			 * permanent this case did. */
+			fst_check(switch_core_set_var_conditional(TEST_OPAL_PTLIB_RESERVATION, NULL,
+													 TEST_OPAL_SIBLING_MODULE) == SWITCH_TRUE);
+
+			holder = switch_core_get_variable_dup(TEST_OPAL_PTLIB_RESERVATION);
+			fst_check(holder == NULL);
+			switch_safe_free(holder);
 		}
 		FST_TEST_END()
 	}

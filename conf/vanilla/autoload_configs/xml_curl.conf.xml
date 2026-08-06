@@ -66,20 +66,22 @@
 
            The profile is bounded as well, so a runaway or hostile response cannot exhaust memory.
            A document may nest 32 levels deep and may carry 50000 values in total; one object may
-           carry 256 members, one array 256 elements, and one parent 256 children of any single
+           carry 256 members, one array 256 elements, and one parent 256 children across every
            name; the whole document may build 20000 elements and attributes; one string value may
            be 8192 bytes and one name 128 bytes. Exceeding any of these is refused like any other
            shape error. The existing response-max-bytes parameter still caps the response body
            itself, for JSON exactly as it does for XML.
 
            A response that is not application/json, or whose body falls outside that profile, is
-           logged as a warning and parsed as XML instead. When omitted, responses are decoded as
-           XML.
+           logged as a warning and parsed as XML instead, and the same degradation also fires the
+           custom event xml_curl::json_fallback, so it can be alerted on without log scraping.
+           When omitted, responses are decoded as XML.
 
            The operator runbook at src/mod/xml_int/mod_xml_curl/README.response-format.md
            documents this contract in full: both fallback reasons and their log and event
            signatures, the eleven resource ceilings, the "file:" boundary, the TLS hardening
-           parameters, cookie jar placement, and the mod_h323 / mod_opal co-load prohibition. -->
+           parameters, cookie jar placement, the mod_h323 / mod_opal co-load prohibition, and the
+           standalone validator that proves a gateway's JSON conforms before it is deployed. -->
       <!-- <param name="response-format" value="json"/> -->
     </binding>
   </bindings>

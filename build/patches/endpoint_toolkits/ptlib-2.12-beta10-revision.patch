@@ -1,0 +1,30 @@
+PTLib 2.12-beta10 (OPAL stack): give the generated revision header a revision
+
+src/Makefile generates revision.h from revision.h.in by extracting a number out
+of the file's Subversion $Revision$ keyword.  These sources are consumed from a
+git mirror, where that keyword is never expanded, so the extraction yields
+nothing and the generated header reads `#define SVN_REVISION` with no value -
+which makes PProcess::GetLibVersion() in osutils.cxx a syntax error.
+
+Seeding the keyword with 0 makes the generated header read
+`#define SVN_REVISION 0`, which is what the retained source tree that produced
+this project's installed PTLib carried.  0 rather than an invented number: the
+value only reaches PProcess::GetLibVersion()'s "(svn:%u)" suffix, and a git
+mirror has no Subversion revision to report honestly.
+
+Applies to: 10503462abe31a6c288a39f6f894a5ceb367abbc (branch v2_12)
+Upstream:   https://git.code.sf.net/p/opalvoip/ptlib
+
+diff --git a/revision.h.in b/revision.h.in
+index 15da936..6ae38ec 100644
+--- a/revision.h.in
++++ b/revision.h.in
+@@ -22,7 +22,7 @@
+  *
+  * Contributor(s): ______________________________________.
+  *
+- * $Revision$
++ * $Revision: 0 $
+  * $Author$
+  * $Date$
+  */

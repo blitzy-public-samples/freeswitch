@@ -1,0 +1,24 @@
+PTLib 2.12-beta10 (OPAL stack): include <termios.h> instead of <termio.h>
+
+glibc 2.42 removed the legacy System V <termio.h> header, so this translation
+unit does not compile on any host carrying it.  <termios.h> is the POSIX
+replacement, and this file references only struct termios.  Unlike the 2.10.9
+branch the guard here has no __GLIBC_ typo, so on Linux the include really is
+compiled and the build really does fail without this change.
+
+Applies to: 10503462abe31a6c288a39f6f894a5ceb367abbc (branch v2_12)
+Upstream:   https://git.code.sf.net/p/opalvoip/ptlib
+
+diff --git a/src/ptlib/unix/pipechan.cxx b/src/ptlib/unix/pipechan.cxx
+index 00610c4..1e9c278 100644
+--- a/src/ptlib/unix/pipechan.cxx
++++ b/src/ptlib/unix/pipechan.cxx
+@@ -44,7 +44,7 @@
+ #include <signal.h>
+ 
+ #if defined(P_LINUX) || defined(P_SOLARIS)
+-#include <termio.h>
++#include <termios.h>  /* glibc >= 2.42 removed the legacy <termio.h> */
+ #endif
+ 
+ #include "../common/pipechan.cxx"

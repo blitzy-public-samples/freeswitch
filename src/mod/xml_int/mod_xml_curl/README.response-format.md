@@ -35,45 +35,45 @@ states, and one guarantee that holds across both.
 **`response-format` absent — XML decoding, bit-identical legacy behaviour, zero events.**
 The binding's `response_format` member stays `NULL`, because the whole `xml_binding`
 structure is zeroed after allocation
-(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1956`) and the parameter arm that would set
-it never runs (`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1937`). The format decision
-therefore evaluates to 0 (`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1547`), which means
-no `Accept` header is appended (`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1612`), no
-JSON decode is attempted (`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1749`), and the
+(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1989`) and the parameter arm that would set
+it never runs (`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1970`). The format decision
+therefore evaluates to 0 (`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1580`), which means
+no `Accept` header is appended (`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1645`), no
+JSON decode is attempted (`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1782`), and the
 pre-existing `switch_xml_parse_file()` call runs exactly as it always did
-(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1757`). **No `xml_curl::json_fallback` event
+(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1790`). **No `xml_curl::json_fallback` event
 can fire on this path**, because the only call site of the event helper is inside the JSON
-decode function (`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1384`), which is only reached
+decode function (`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1417`), which is only reached
 from the guarded dispatch at
-`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1749-1751`. A binding that does not opt in produces the same
+`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1782-1784`. A binding that does not opt in produces the same
 request bytes, the same temporary file, the same HTTP-200 gate, the same log lines and the
 same tree it produced before JSON support existed.
 
 **`response-format="json"` — `Accept: application/json` is sent and a BadgerFish response
 is translated.** The value is compared case-insensitively
-(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1547`), so `json`, `JSON` and `Json` all opt
+(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1580`), so `json`, `JSON` and `Json` all opt
 in. The request then carries one additional header, `Accept: application/json`, appended
 between the existing `Content-Type` header and the point where the header list is handed to
-libcurl (`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1612-1618`). Nothing else about the
+libcurl (`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1645-1651`). Nothing else about the
 request changes: the form body, the user agent `freeswitch-xml/1.0`, the redirect limit and
 every TLS option are what they were. If the header cannot be appended at all — an
 allocation failure inside libcurl — the fetch still happens and the format decision is
 lowered back to XML on the spot, with a `WARNING`
-(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1613-1617`), so the decoder can never expect
+(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1646-1650`), so the decoder can never expect
 a representation this fetch did not ask for.
 
 **Any JSON failure edge degrades to the untouched XML parse, so a lookup never fails
 because of a decode problem.** The JSON decoder returns `NULL` on every failure edge, and
 the caller's next statement parses the same already-downloaded body as XML
-(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1753-1757`). The HTTP-200 success gate
+(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1786-1790`). The HTTP-200 success gate
 (`:1742`) and the non-200 error branch (`:1781-1785`) are unchanged, and the `NULL`-return
 semantics the core sees are unchanged. A gateway that answers XML while a binding asks for
 JSON is therefore still served — degraded in fidelity, never in availability.
 
 **The single dispatch point and the single signal site.** There is exactly one place where
-the format is chosen — `src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1750` — and exactly one
+the format is chosen — `src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1782-1783` — and exactly one
 place where a degradation is signalled: the `if (!xml)` block at
-`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1374-1385`, which emits the `WARNING` and
+`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1407-1418`, which emits the `WARNING` and
 fires the event side by side. Alerting therefore never has to correlate across sites: one
 degradation produces one `WARNING` and one event, always together.
 
@@ -88,7 +88,7 @@ signatures for the same event, from the same place, and they pair 1:1.
 ### 2.1 The log signature
 
 One `SWITCH_LOG_WARNING`, from `xml_curl_json_decode_response()`
-(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1374-1379`). The format string is stable and
+(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1407-1412`). The format string is stable and
 is not changed by this work:
 
 ```
@@ -97,24 +97,24 @@ JSON decode of the [%s] response from [%s] failed (%s) [Content-Type: %s]; falli
 
 The four operands are, in order: the requested provisioning section; the gateway URL,
 redacted to its authority so a configured credential or query token is never written to the
-log (`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1377`); the human-readable reason; and the
+log (`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1410`); the human-readable reason; and the
 response `Content-Type` as the gateway sent it. Section, URL and `Content-Type` are all
 bounded and sanitized before they are rendered, so a hostile `Content-Type` cannot forge a
 second log line.
 
 The reason operand is one of **five** human-readable phrases
-(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1354-1368`), reproduced here exactly:
+(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1387-1401`), reproduced here exactly:
 
 | # | Reason phrase in the `WARNING` | Line |
 |---|---|---|
-| 1 | `no response body was captured` | `mod_xml_curl.c:1355` |
-| 2 | `the requested provisioning section is unknown` | `mod_xml_curl.c:1358` |
-| 3 | `response Content-Type is not application/json` | `mod_xml_curl.c:1361` |
-| 4 | `response body could not be read in full` | `mod_xml_curl.c:1364` |
-| 5 | `response body is not a well-formed BadgerFish JSON document for the requested section` | `mod_xml_curl.c:1367` |
+| 1 | `no response body was captured` | `mod_xml_curl.c:1388` |
+| 2 | `the requested provisioning section is unknown` | `mod_xml_curl.c:1391` |
+| 3 | `response Content-Type is not application/json` | `mod_xml_curl.c:1394` |
+| 4 | `response body could not be read in full` | `mod_xml_curl.c:1397` |
+| 5 | `response body is not a well-formed BadgerFish JSON document for the requested section` | `mod_xml_curl.c:1400` |
 
 A sixth string, `unknown translation error`
-(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1348`), is the initialiser of the same
+(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1381`), is the initialiser of the same
 variable. It describes no reachable edge: the five-armed `if`/`else if` ladder above it
 assigns one of the five phrases on every path that can produce a `NULL` document, so it is a
 defensive default rather than a sixth reason to alert on.
@@ -123,9 +123,9 @@ defensive default rather than a sixth reason to alert on.
 
 One `SWITCH_EVENT_CUSTOM` with subclass **`xml_curl::json_fallback`**, fired by
 `xml_curl_json_fire_fallback_event()`
-(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1279-1296`). The subclass name is the constant
+(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1292-1322`). The subclass name is the constant
 at `src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:229`; it is reserved when the module loads
-(`:2095`) and released when it shuts down (`:2119`), so it is discoverable by name in
+(`:2128`) and released when it shuts down (`:2152`), so it is discoverable by name in
 `fs_cli`. Reservation is best-effort: emission does not depend on it, so at worst
 discoverability is degraded and the event still fires.
 
@@ -133,26 +133,36 @@ The event carries exactly three headers:
 
 | Header | Value | Line |
 |---|---|---|
-| `Binding` | the `name` attribute of the `<binding>` whose fetch degraded, sanitized; the literal `(unnamed)` when the configuration named none | `mod_xml_curl.c:1289-1291`, constant at `:232` |
-| `Fallback-Reason` | exactly one of `content-type-mismatch` or `malformed-json` | `mod_xml_curl.c:1292`, constants at `:230-231` |
-| `Gateway` | the binding's gateway URL, **redacted** through the same helper the `WARNING` uses, so userinfo, path and query never reach a subscriber | `mod_xml_curl.c:1293` |
+| `Binding` | the `name` attribute of the `<binding>` whose fetch degraded, sanitized; the literal `(unnamed)` when the configuration named none | `mod_xml_curl.c:1307-1311`, constant at `:232` |
+| `Fallback-Reason` | exactly one of `content-type-mismatch` or `malformed-json` | `mod_xml_curl.c:1312`, constants at `:230-231` |
+| `Gateway` | the binding's gateway URL, **redacted** through the same helper the `WARNING` uses, so userinfo, path and query never reach a subscriber | `mod_xml_curl.c:1313` |
 
 Emission is fire-and-forget and fully guarded: the helper returns `void`, the caller ignores
-it, and every failure edge inside it — an event that could not be created, a dispatcher that
-refused it — leaves the module's behaviour and the document it returns exactly as they were
-(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1285-1295`). Observability cannot change
-provisioning.
+it, and every failure edge inside it — an event that could not be created, a header that could
+not be added, a dispatcher that refused it — leaves the module's behaviour and the document it
+returns exactly as they were (`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1300-1321`).
+Observability cannot change provisioning.
+
+**All three headers or none.** `switch_event_add_header_string()` returns a status and refuses
+a value it cannot store, so the three-header contract above holds only because every one of
+those statuses is checked (`mod_xml_curl.c:1311-1313`). On the first refusal the incomplete
+event is destroyed and nothing is fired (`:1317`), because a subscriber cannot tell a header
+that was refused from a header the module chose not to send — an absent `Fallback-Reason`
+would read as a different class of degradation and alert on the wrong thing. **A subscriber
+may therefore rely on all three headers being present on every event it receives.** The
+abandonment is deliberately silent: the `WARNING` of section 2.1 has already reported the
+degradation.
 
 ### 2.3 Which failure edge maps to which reason
 
 The `WARNING` carries five prose reasons; the event carries a two-valued machine taxonomy
 over them. The mapping is fixed in the code
-(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1354-1368`) and is total:
+(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1387-1401`) and is total:
 
 | `Fallback-Reason` | Failure edges that produce it | Line |
 |---|---|---|
-| `content-type-mismatch` | **Only** the `Content-Type` classifier rejection: the response's declared media type is not `application/json`. This is the "the gateway answered in a representation this binding did not ask for" class. | `mod_xml_curl.c:1360-1362` |
-| `malformed-json` | **Every** other edge: no response body was captured (`:1354-1356`); the requested provisioning section is unknown (`:1357-1359`); the response body could not be read in full (`:1363-1365`); the body is not a well-formed BadgerFish document for the requested section (`:1366-1368`). This is the "a body this module could not turn into a document" class. | `mod_xml_curl.c:1354-1368` |
+| `content-type-mismatch` | **Only** the `Content-Type` classifier rejection: the response's declared media type is not `application/json`. This is the "the gateway answered in a representation this binding did not ask for" class. | `mod_xml_curl.c:1393-1395` |
+| `malformed-json` | **Every** other edge: no response body was captured (`:1354-1356`); the requested provisioning section is unknown (`:1357-1359`); the response body could not be read in full (`:1363-1365`); the body is not a well-formed BadgerFish document for the requested section (`:1366-1368`). This is the "a body this module could not turn into a document" class. | `mod_xml_curl.c:1387-1401` |
 
 The classifier itself accepts `application/json` bare or carrying parameters such as
 `; charset=utf-8`, and rejects an absent or empty header, `text/xml`, `application/xml` and
@@ -164,7 +174,7 @@ its remedy is a gateway header fix rather than a payload fix.
 
 Note the practical consequence for a mismatch: the ceilings in section 3 are never reached
 on that edge, because the classifier rejects before the body is read at all
-(`mod_xml_curl.c:1360` precedes `mod_xml_curl.c:1363`).
+(`mod_xml_curl.c:1393` precedes `mod_xml_curl.c:1396`).
 
 ### 2.4 Watching the event, and alerting without log scraping
 
@@ -229,7 +239,7 @@ the core's own:
 
 Note the `Gateway` value: everything after the authority is replaced with `[redacted]`,
 because a gateway URL's path and query routinely carry provisioning tokens
-(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1293`).
+(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1309`, added as a header at `:1313`).
 
 If your consumer already subscribes to `CUSTOM` more broadly, add a `filter` so a busy
 switch does not deliver every `CUSTOM` event to it. `filter` takes a header name and a value
@@ -256,17 +266,17 @@ couples an alert rule to wording. Three rules cover the operational cases:
   9.
 
 Because the event and the `WARNING` are emitted from the same block
-(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1374-1385`), the two counts pair 1:1 over any
+(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1407-1418`), the two counts pair 1:1 over any
 interval. That makes the log useful as a cross-check on the alerting path rather than as its
 input: if the log shows fallback `WARNING`s that the event stream did not, the subscription
 is the thing to look at.
 
 For a one-off diagnosis rather than an alert, `fs_cli -x 'xml_curl debug_on'` leaves each
 fetched response body on disk and logs its path
-(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1788-1790`), which is the fastest way to see
+(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1821-1823`), which is the fastest way to see
 the bytes a gateway actually sent. Note that the temporary file keeps its historical
 `.tmp.xml` suffix even for a JSON payload
-(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1597`); the suffix is cosmetic and deliberately
+(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1630`); the suffix is cosmetic and deliberately
 unchanged, since it appears in that operator-visible log line.
 
 ---
@@ -322,7 +332,7 @@ Three different nesting numbers exist in this tree, and only one of them governs
 - **31** is where the parity corpus's nesting-boundary fixture sits — one level inside the
   enforced ceiling, which is the boundary worth testing
   (`src/mod/xml_int/mod_xml_curl/test/fixtures/directory_nesting_boundary.json`, asserted by
-  `src/mod/xml_int/mod_xml_curl/test/test_mod_xml_curl.c:5137`).
+  `src/mod/xml_int/mod_xml_curl/test/test_mod_xml_curl.c:5604`).
 
 If you are sizing a gateway's documents, 32 is the number to design against.
 
@@ -334,11 +344,11 @@ A `file:` gateway URL is **always** XML, and `response-format` cannot change tha
 
 The fetch routine detects the `file:` prefix, reads the file straight off disk with
 `switch_xml_parse_file()` and returns
-(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1554-1561`). That return precedes every part
+(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1587-1594`). That return precedes every part
 of the HTTP path: no request is made, so no `Accept` header is sent — the only append site is
-at `src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1612`, downstream of the return — and no
+at `src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1645`, downstream of the return — and no
 content type is negotiated or read, since the `CURLINFO_CONTENT_TYPE` probe is at
-`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1726`, also downstream. The JSON decoder is
+`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1759`, also downstream. The JSON decoder is
 never reached, so a `file:` binding fires no `xml_curl::json_fallback` event either.
 
 Setting `response-format="json"` on a `file:` binding is therefore inert, not an error, and
@@ -353,19 +363,19 @@ gateway that sets `Content-Type: application/json`.
 
 | Parameter | Effect | Lines |
 |---|---|---|
-| `enable-cacert-check` | When true, sets `CURLOPT_SSL_VERIFYPEER` back on, so libcurl verifies that the gateway's certificate chains to a trusted CA | parsed at `mod_xml_curl.c:1895`, applied at `:1667-1669` |
-| `enable-ssl-verifyhost` | When true, sets `CURLOPT_SSL_VERIFYHOST` to 2, so libcurl verifies that the certificate actually names the host being contacted | parsed at `mod_xml_curl.c:1907`, applied at `:1695-1697` |
-| `ssl-cacert-file` | Sets `CURLOPT_CAINFO` to a PEM bundle, so a private or internal CA can be trusted instead of the system trust store. Only meaningful together with `enable-cacert-check` | parsed at `mod_xml_curl.c:1905`, applied at `:1691-1693` |
+| `enable-cacert-check` | When true, sets `CURLOPT_SSL_VERIFYPEER` back on, so libcurl verifies that the gateway's certificate chains to a trusted CA | parsed at `mod_xml_curl.c:1928`, applied at `:1667-1669` |
+| `enable-ssl-verifyhost` | When true, sets `CURLOPT_SSL_VERIFYHOST` to 2, so libcurl verifies that the certificate actually names the host being contacted | parsed at `mod_xml_curl.c:1940`, applied at `:1695-1697` |
+| `ssl-cacert-file` | Sets `CURLOPT_CAINFO` to a PEM bundle, so a private or internal CA can be trusted instead of the system trust store. Only meaningful together with `enable-cacert-check` | parsed at `mod_xml_curl.c:1938`, applied at `:1691-1693` |
 
 Both booleans are parsed with `switch_true()` and the arm only matches when the value is
-true (`mod_xml_curl.c:1895`, `:1907`), so writing `value="false"` is equivalent to omitting
+true (`mod_xml_curl.c:1928`, `:1907`), so writing `value="false"` is equivalent to omitting
 the parameter rather than being an explicit opt-out.
 
 ### Why the shipped defaults are permissive, and unchanged by this work
 
 For any `https` gateway URL the module unconditionally disables both checks before applying
 any per-binding option: `CURLOPT_SSL_VERIFYPEER` is set to 0 and `CURLOPT_SSL_VERIFYHOST` to
-0 at `src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1620-1623`. The three parameters above are
+0 at `src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1653-1656`. The three parameters above are
 opt-in overrides applied later in the same function. So out of the box, an `https`
 provisioning fetch is encrypted but **not authenticated** — a machine-in-the-middle can
 present any certificate and serve the switch its provisioning documents.
@@ -411,13 +421,13 @@ transport that never completed.
 ## 6. Cookie-jar placement
 
 `cookie-file` enables cookie persistence for a binding by handing libcurl a jar path
-(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1705-1708`).
+(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1738-1741`).
 
 ### Why the jar must sit in a directory other users cannot write
 
 libcurl opens the jar for writing at the end of **every** transfer. That open follows
 symbolic links and creates a missing file with whatever the process umask happens to be
-(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1391-1399`). So an unvalidated path in a
+(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1424-1432`). So an unvalidated path in a
 directory any local user can write lets that user choose which file FreeSWITCH truncates,
 and leaves a freshly created jar world-readable even though it holds session cookies for the
 provisioning gateway. A predictable name in a shared temporary directory is exactly the
@@ -435,19 +445,19 @@ natural choice, and it is what the shipped sample recommends
 
 A world-writable directory is acceptable **only** if it carries the sticky bit, because that
 is what stops the name being renamed away and re-created between the module's check and
-libcurl's open (`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1466`). The rule is
+libcurl's open (`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1499`). The rule is
 deliberately not "owner only": a service directory such as `$${db_dir}` is conventionally
 readable and traversable by others, and demanding mode 0700 there would refuse the very
 location the sample recommends
-(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1412-1418`).
+(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1445-1451`).
 
 ### What the module does when the path is unacceptable
 
 It **refuses the jar, keeps performing the fetch, and logs**. The validation function
-(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1427`) gates only the two cookie `setopt`
+(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1460`) gates only the two cookie `setopt`
 calls (`:1705-1708`); everything else about the fetch is untouched, so a refusal costs
 cookie persistence for that binding and nothing else. The refusal is a single
-`SWITCH_LOG_WARNING` (`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1495-1498`):
+`SWITCH_LOG_WARNING` (`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1528-1531`):
 
 ```
 Refusing cookie file [%s] for the binding at [%s] because %s; cookies will not be persisted for this binding
@@ -457,28 +467,28 @@ The reasons it can carry are these, and they say nothing at all on success:
 
 | Reason phrase | Line |
 |---|---|
-| `its path is too long to be validated` | `mod_xml_curl.c:1446` |
-| `the directory holding it could not be read` | `mod_xml_curl.c:1462` |
-| `the path holding it is not a directory` | `mod_xml_curl.c:1464` |
-| `the directory holding it is writable by other users and not sticky, so the name could be replaced after it is checked` | `mod_xml_curl.c:1466` |
-| `it is not a regular file, so a symbolic link, directory or special file would be written through` | `mod_xml_curl.c:1477` |
-| `it belongs to another user` | `mod_xml_curl.c:1479` |
-| `other users can write it, so its contents cannot be trusted` | `mod_xml_curl.c:1481` |
-| `its status could not be read` | `mod_xml_curl.c:1486` |
-| `it does not exist and could not be created privately` | `mod_xml_curl.c:1488` |
+| `its path is too long to be validated` | `mod_xml_curl.c:1479` |
+| `the directory holding it could not be read` | `mod_xml_curl.c:1495` |
+| `the path holding it is not a directory` | `mod_xml_curl.c:1497` |
+| `the directory holding it is writable by other users and not sticky, so the name could be replaced after it is checked` | `mod_xml_curl.c:1499` |
+| `it is not a regular file, so a symbolic link, directory or special file would be written through` | `mod_xml_curl.c:1510` |
+| `it belongs to another user` | `mod_xml_curl.c:1512` |
+| `other users can write it, so its contents cannot be trusted` | `mod_xml_curl.c:1514` |
+| `its status could not be read` | `mod_xml_curl.c:1519` |
+| `it does not exist and could not be created privately` | `mod_xml_curl.c:1521` |
 
 An existing jar that is a regular file, owned by this process and writable by nobody else,
 is accepted untouched and its mode is never altered
-(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1475-1483`). A jar that does not exist yet is
+(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1508-1516`). A jar that does not exist yet is
 created here with `O_EXCL` and no-follow semantics at mode 0600
-(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1487-1491`), so libcurl later truncates a file
+(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1520-1524`), so libcurl later truncates a file
 that is already private instead of creating a public one. The check is validated at fetch
 time rather than at configuration time, so a jar replaced by a symbolic link after the module
 loaded is caught just the same
-(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1699-1704`). On Windows the check is a no-op
+(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1732-1737`). On Windows the check is a no-op
 and behaviour is byte-for-byte what it was, because that platform has neither the link
 semantics nor the ownership model the check is written against
-(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1429-1430`).
+(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1462-1463`).
 
 ---
 
@@ -527,23 +537,53 @@ constructor or a static initialiser — a `dlopen(RTLD_NOW|RTLD_LOCAL)`-only pro
 modules in one process completed with exit 0. Because module code runs first, module code can
 refuse.
 
-So each load function's **first** statement now asks whether the sibling is already loaded,
-and refuses if it is:
+The guard is **two stages**, and both run before the `new FSProcess()` that creates the
+conflicting singleton.
+
+**Stage 1 — name the sibling.** Each load function's first statement asks whether the sibling
+is already in the core's module hash, and refuses if it is. This is the common case and the
+only stage that can name the offending module in its message.
 
 - `mod_h323_load` refuses when `switch_loadable_module_exists("mod_opal")` succeeds
-  (`src/mod/endpoints/mod_h323/mod_h323.cpp:174-179`).
+  (`src/mod/endpoints/mod_h323/mod_h323.cpp:198`).
 - `mod_opal_load` refuses when `switch_loadable_module_exists("mod_h323")` succeeds
-  (`src/mod/endpoints/mod_opal/mod_opal.cpp:121-127`).
+  (`src/mod/endpoints/mod_opal/mod_opal.cpp:145`).
 
-The guard has to be the first statement because the conflicting singleton is created by the
-`new FSProcess()` that follows it. Everything else in both modules is unchanged.
+**Stage 2 — claim the runtime atomically.** Stage 1 alone is only a *snapshot*:
+`switch_loadable_module_exists()` takes the module-hash lock for its own lookup and releases
+it, and the core publishes a module into that hash only *after* the module's load routine has
+returned. Nothing serialises the interval in between, so two concurrent load requests — one
+per endpoint — can both see the sibling absent and both go on to construct a `PProcess`,
+which is exactly the operation that kills the process. Unloading has the same window in
+reverse: the sibling leaves the hash before its shutdown has torn PTLib down.
+
+Each module therefore claims one process-global reservation with a compare-and-swap before it
+constructs anything:
+
+| | |
+|---|---|
+| Reservation variable | `ptlib_endpoint_reservation` — spelled `H323_PTLIB_RESERVATION` in `mod_h323.cpp:162` and `OPAL_PTLIB_RESERVATION` in `mod_opal.cpp:109`, deliberately the identical string so the two modules contend for **one** entry |
+| Claimed with | `switch_core_set_var_conditional(<RESERVATION>, modname, "")` — it holds `runtime.global_var_rwlock` in **write** mode across the whole test-and-set |
+| Claim sites | `src/mod/endpoints/mod_h323/mod_h323.cpp:221`, `src/mod/endpoints/mod_opal/mod_opal.cpp:169` |
+| Released on | every load-failure edge after the claim, and **last** in shutdown — after the `FSProcess` is deleted, so the claim also spans the unload window |
+| Release sites | `mod_h323.cpp:243`, `:252`, `:268`, `:290`; `mod_opal.cpp:195`, `:201`, `:215`, `:233` |
+
+The release passes the module's own name as the expected value, so a second shutdown, or a
+shutdown after a refused load, is a no-op rather than a way to free another module's claim.
+No core API was added for this: `switch_core_set_var_conditional()` is already exported to
+modules and already used by `mod_commands` and `mod_v8`.
+
+**Inspecting it.** `fs_cli -x 'global_getvar ptlib_endpoint_reservation'` names the module
+holding the PTLib runtime, or returns empty when neither endpoint is loaded.
+
+Everything else in both modules is unchanged.
 
 ### What an operator observes when the guard fires
 
 The second load is **refused**, and the process **survives**. Concretely:
 
 - An `ERROR` naming the singleton conflict and both PTLib runtimes is written to the log,
-  for example (`src/mod/endpoints/mod_h323/mod_h323.cpp:175-178`):
+  for example (`src/mod/endpoints/mod_h323/mod_h323.cpp:199-202`):
 
   ```
   Refusing to load mod_h323: mod_opal is already loaded in this process, and their conflicting
@@ -553,8 +593,8 @@ The second load is **refused**, and the process **survives**. Concretely:
   ```
 
 - The load function returns `SWITCH_STATUS_FALSE`
-  (`src/mod/endpoints/mod_h323/mod_h323.cpp:179`,
-  `src/mod/endpoints/mod_opal/mod_opal.cpp:127`), which the core reports as
+  (`src/mod/endpoints/mod_h323/mod_h323.cpp:203`,
+  `src/mod/endpoints/mod_opal/mod_opal.cpp:179`), which the core reports as
   `Error Loading module … Module load routine returned an error`, so `fs_cli -x 'load
   mod_h323'` answers `-ERR [module load file routine returned an error]`.
 - The refused module's own `Starting loading …` line never appears, because the guard returns
@@ -568,8 +608,8 @@ you asked for is unavailable in that process. The remedy is still one endpoint p
 
 Each endpoint's test suite also carries a case asserting the refusal —
 `coload_guard_refuses_when_sibling_is_loaded`
-(`src/mod/endpoints/mod_h323/test/test_mod_h323.cpp:3370`,
-`src/mod/endpoints/mod_opal/test/test_mod_opal.cpp:3443`) — which exercises the guard against
+(`src/mod/endpoints/mod_h323/test/test_mod_h323.cpp:3387`,
+`src/mod/endpoints/mod_opal/test/test_mod_opal.cpp:3458`) — which exercises the guard against
 a sibling registered through the module-load API, so no test binary ever links two PTLib
 runtimes.
 

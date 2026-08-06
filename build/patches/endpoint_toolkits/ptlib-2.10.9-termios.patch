@@ -1,0 +1,29 @@
+PTLib 2.10.9 (H.323 stack): include <termios.h> instead of <termio.h>
+
+glibc 2.42 removed the legacy System V <termio.h> header, so this translation
+unit does not compile on any host carrying it (Ubuntu 25.10 and newer, Debian
+trixie and newer).  <termios.h> is the POSIX replacement and is what the file
+already relies on in every other configuration: nothing in pipechan.cxx or the
+common implementation it includes references a struct termio, only termios.
+
+The guard around the include is upstream's and is left exactly as it is - note
+that its __GLIBC_ spelling is a typo for __GLIBC__ and therefore never true on
+Linux, which is why the include is dead code in practice.  It is repaired rather
+than deleted because a host where the guard DOES fire must still compile.
+
+Applies to: c01afdc78cc4fb56e497b04aea69ef575fc53bf0 (tag v2_10_9_6)
+Upstream:   https://github.com/willamowius/ptlib.git
+
+diff --git a/src/ptlib/unix/pipechan.cxx b/src/ptlib/unix/pipechan.cxx
+index 4f91ccb..f6a0395 100644
+--- a/src/ptlib/unix/pipechan.cxx
++++ b/src/ptlib/unix/pipechan.cxx
+@@ -44,7 +44,7 @@
+ #include <signal.h>
+ 
+ #if (defined(P_LINUX) && defined(__GLIBC_)) || defined(P_SOLARIS)
+-#include <termio.h>
++#include <termios.h>  /* glibc >= 2.42 removed <termio.h> */
+ #endif
+ 
+ #include "../common/pipechan.cxx"

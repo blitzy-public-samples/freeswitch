@@ -1259,14 +1259,27 @@ static const char *xml_curl_json_redact_url(const char *url, char *buf, switch_s
 /*
  * OBSERVABILITY: fires the machine-readable twin of the JSON fallback WARNING, so an ESL consumer
  * can alert on the degradation instead of scraping logs. Called from exactly one place - beside the
- * WARNING in xml_curl_json_decode_response() - so the module keeps exactly one fallback signal site.
+ * WARNING in xml_curl_json_decode_response_ex() - so the module keeps exactly one fallback signal
+ * site.
  *
  * FIRE AND FORGET, AND GUARDED. The function returns void and the caller ignores it, because
  * observability must never change what the module does: every failure edge here - an event that
  * could not be created, a header that could not be added, a dispatcher that refused the event -
- * returns having changed nothing, leaves the value xml_curl_json_decode_response() returns exactly
- * as it was, and leaves the XML parse that follows untouched. switch_event_fire() consumes the
- * event and NULLs the pointer on every path including refusal, so there is nothing to release here.
+ * returns having changed nothing, leaves the value xml_curl_json_decode_response_ex() returns
+ * exactly as it was, and leaves the XML parse that follows untouched.
+ *
+ * AN INCOMPLETE EVENT IS NEVER SENT. switch_event_add_header_string() returns a status and refuses
+ * a value it cannot store, so the three headers below are a contract only if every one of those
+ * statuses is checked. A partially populated event is worse than no event at all: a consumer
+ * cannot tell a header that was refused from a header the module chose not to send, so it would
+ * read an absent Fallback-Reason as a different class of degradation and alert on the wrong thing.
+ * Construction is therefore abandoned at the first refusal, and the incomplete event is destroyed
+ * here - the one path on which this function still owns the event when it returns. Every other
+ * path hands ownership to switch_event_fire(), which consumes the event and NULLs the pointer even
+ * when the dispatcher refuses it, so there is nothing left to release. Abandoning is silent by
+ * design: the WARNING beside the call site has already told the operator that provisioning
+ * fidelity degraded, and a second complaint about the module's own event plumbing would only
+ * obscure it.
  *
  * The three headers are the minimum an alert rule needs: which binding degraded, why, and which
  * gateway answered. Both untrusted operands are rendered through the same bounding helpers the
@@ -1281,16 +1294,29 @@ static void xml_curl_json_fire_fallback_event(const char *binding_name, const ch
 	switch_event_t *event = NULL;
 	char safe_binding[128] = "";
 	char safe_url[256] = "";
+	const char *binding_header = NULL;
+	const char *gateway_header = NULL;
 
 	if (switch_event_create_subclass(&event, SWITCH_EVENT_CUSTOM, XML_CURL_JSON_FALLBACK_EVENT) != SWITCH_STATUS_SUCCESS) {
 		return;
 	}
 
-	switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Binding",
-								   zstr(binding_name) ? XML_CURL_JSON_FALLBACK_UNNAMED_BINDING :
-								   xml_curl_json_sanitize_token(binding_name, safe_binding, sizeof(safe_binding)));
-	switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Fallback-Reason", reason);
-	switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Gateway", xml_curl_json_redact_url(url, safe_url, sizeof(safe_url)));
+	/* Both untrusted operands are bounded and rendered once, before the event is touched, so the
+	   guard below reads as three status checks rather than three checks wrapped around three
+	   renderings. */
+	binding_header = zstr(binding_name) ? XML_CURL_JSON_FALLBACK_UNNAMED_BINDING :
+		xml_curl_json_sanitize_token(binding_name, safe_binding, sizeof(safe_binding));
+	gateway_header = xml_curl_json_redact_url(url, safe_url, sizeof(safe_url));
+
+	if (switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Binding", binding_header) != SWITCH_STATUS_SUCCESS ||
+		switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Fallback-Reason", reason) != SWITCH_STATUS_SUCCESS ||
+		switch_event_add_header_string(event, SWITCH_STACK_BOTTOM, "Gateway", gateway_header) != SWITCH_STATUS_SUCCESS) {
+		/* Abandoned at the first refusal, and destroyed rather than sent: see the ownership
+		   paragraph above. Short-circuit evaluation is what makes "the first" exact - no later
+		   header is attempted once one has been refused. */
+		switch_event_destroy(&event);
+		return;
+	}
 
 	switch_event_fire(&event);
 }
@@ -1336,9 +1362,16 @@ static int xml_curl_json_append_header(switch_curl_slist_t **list, const char *h
 
    OBSERVABILITY: every failure edge also carries a machine-readable token alongside its prose
    reason, and `binding_name` names the binding whose fetch degraded. Both exist only to populate the
-   event fired beside the WARNING below; neither changes what this function returns. */
-static switch_xml_t xml_curl_json_decode_response(const char *filename, const char *content_type, switch_size_t max_bytes, const char *url,
-												  const char *section, const char *binding_name)
+   event fired beside the WARNING below; neither changes what this function returns.
+
+   The `_ex' suffix marks this as the binding-aware form. It is the only form this module calls, and
+   the parameter it adds is the only difference from the decode contract that existed before the
+   event: passing a NULL `binding_name' yields byte-for-byte the earlier behaviour, with the event's
+   Binding header rendered as XML_CURL_JSON_FALLBACK_UNNAMED_BINDING. Naming the wider function
+   separately rather than widening the original in place is what lets the pre-existing five-argument
+   contract go on being exercised exactly as it was, unchanged, by the suite that already covers it. */
+static switch_xml_t xml_curl_json_decode_response_ex(const char *filename, const char *content_type, switch_size_t max_bytes, const char *url,
+													 const char *section, const char *binding_name)
 {
 	switch_xml_t xml = NULL;
 	char *json_text = NULL;
@@ -1747,7 +1780,7 @@ static switch_xml_t xml_url_fetch(const char *section, const char *tag_name, con
 			   requested, and a document outside the canonical contract all converge on the XML
 			   parse below. */
 			if (json_response) {
-				xml = xml_curl_json_decode_response(filename, content_type, binding->curl_max_bytes, binding->url, section, binding->name);
+				xml = xml_curl_json_decode_response_ex(filename, content_type, binding->curl_max_bytes, binding->url, section, binding->name);
 			}
 
 			/* JSON: parse the response as XML whenever the JSON decode did not produce a document.

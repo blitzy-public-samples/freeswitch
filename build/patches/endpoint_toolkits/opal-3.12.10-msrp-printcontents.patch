@@ -1,0 +1,27 @@
+OPAL 3.12.10: do not stream an ostream into an ostream
+
+MSRPProtocol::SendREPORT() wrote `str << ::setfill('\r') << mime.PrintContents(str)`.
+PrintContents returns std::ostream &, and inserting an ostream into an ostream
+has no valid overload: before C++11 it selected operator void *, which is why
+this compiled once, and since C++11 that conversion is deleted and the
+statement is ill-formed.
+
+Splitting it into two statements is the minimal repair and preserves the emitted
+bytes: the fill character is set on str, then PrintContents writes to str.
+
+Applies to: a9091f39fcb16f66da2b1134646f341a741a1d15 (branch v3_12)
+Upstream:   https://git.code.sf.net/p/opalvoip/opal
+
+diff --git a/src/im/msrp.cxx b/src/im/msrp.cxx
+index 9b09073..fcabc29 100644
+--- a/src/im/msrp.cxx
++++ b/src/im/msrp.cxx
+@@ -918,7 +918,7 @@ bool MSRPProtocol::SendREPORT(const PString & chunkId,
+   flush();
+ 
+   {
+-    PStringStream str; str << ::setfill('\r') << mime.PrintContents(str);
++    PStringStream str; str << ::setfill('\r'); mime.PrintContents(str);  /* split: streaming an ostream into an ostream is invalid C++ */
+     PTRACE(4, "Sending MSRP REPORT\n" << "MSRP " << chunkId << " " << MSRPCommands[REPORT] << CRLF 
+                                                  << "To-Path: " << toUrl << CRLF 
+                                                  << "From-Path: "<< fromUrl << CRLF 

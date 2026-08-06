@@ -75,10 +75,13 @@
  *
  * FIXTURES
  * --------
- * The nine paired fixtures under test/fixtures/ are the parity contract: a
+ * The eighteen paired fixtures under test/fixtures/ are the parity contract: a
  * BadgerFish JSON document and its XML twin must serialise to byte-identical
- * output through one and the same switch_xml_toxml() call.  Three pairs cover
- * each of the configuration, directory and dialplan provisioning sections.
+ * output through one and the same switch_xml_toxml() call.  Six pairs cover each
+ * of the configuration, directory and dialplan provisioning sections, and each
+ * pair has a case of its own that asserts the construct it was added for as well
+ * as the parity.  All eighteen are named in the required-corpus list further
+ * down, so a pair cannot silently leave the corpus.
  *
  * The XML side of every pair is read with switch_xml_parse_file_simple().
  * switch_xml_parse_file() is deliberately never used on a fixture: it takes
@@ -87,9 +90,12 @@
  * <include>, </include> or <? -- which would erase a minified, single-line
  * fixture entirely.
  *
- * Adversarial inputs are in-source string literals rather than extra fixture
- * files, so the shipped fixture set stays exactly what it documents: the
- * canonical, well-formed contract.
+ * Adversarial inputs to the TRANSLATOR are in-source string literals rather than
+ * extra fixture files, so the paired fixture set stays exactly what it
+ * documents: the canonical, well-formed contract.  The five badgerfish_invalid_*
+ * files beside those pairs are not translator inputs at all - they are the
+ * counter-examples the standalone contract validator has to refuse, and only the
+ * last case in this suite reads them.
  *
  * DRIVING THE PRODUCTION DISPATCH WITHOUT A NETWORK PEER
  * ------------------------------------------------------
@@ -234,6 +240,38 @@ static void fst_xc_uuid_format(char *buffer, const switch_uuid_t *uuid);
 #define switch_curl_slist_free_all fst_xc_curl_slist_free_all
 
 #include "../mod_xml_curl.c"
+
+/*
+ * -------------------------------------------------------------------------
+ * THE DECODE CONTRACT THIS SUITE WAS WRITTEN AGAINST
+ * -------------------------------------------------------------------------
+ * The module's decode step takes one more argument than it used to: the name of
+ * the binding whose fetch degraded, which the fallback event reports.  That
+ * argument only ever reaches the event, so it is the production dispatch point
+ * in xml_url_fetch() that has something to say about it, and the cases that
+ * assert the event drive that dispatch point end to end.
+ *
+ * The case that covers the decode step in isolation predates the event and is
+ * not about it.  Widening its seven calls to carry an argument they have no
+ * opinion on would have rewritten a case whose subject did not change, and a
+ * test rewritten for a reason unrelated to what it asserts is a test whose
+ * history stops meaning anything.  The pre-existing five-argument spelling is
+ * therefore kept as what it always was, right here, forwarding to the wider form
+ * with no binding: `binding_name' is documented as optional at its definition,
+ * and NULL selects exactly the behaviour that existed before it.
+ *
+ * This lives in the test translation unit rather than in the module because the
+ * module has no caller for it -- xml_url_fetch() always has a binding -- and an
+ * unused file-static function is a -Wunused-function error under the tree's
+ * -Werror.  Nothing is de-staticised and no production symbol is added: the
+ * module source above is already part of this translation unit, so this is one
+ * more static function beside the ones it brought.
+ */
+static switch_xml_t xml_curl_json_decode_response(const char *filename, const char *content_type, switch_size_t max_bytes, const char *url,
+												  const char *section)
+{
+	return xml_curl_json_decode_response_ex(filename, content_type, max_bytes, url, section, NULL);
+}
 
 /*
  * Fixture directory, composed at compile time from the base directory the build
@@ -1155,6 +1193,63 @@ static char *fst_xc_render(const char *text, const char *section)
 }
 
 /*
+ * How many times `needle` occurs in `haystack`, counting non-overlapping
+ * occurrences.
+ *
+ * A parity case that only compared two serialisations would still pass if both
+ * twins lost the construct the pair was written for, so the cases that stand on a
+ * width count the elements in the output rather than trusting the comparison to
+ * notice.  Returns 0 for an empty needle, so a caller's mistake cannot read as a
+ * satisfied count.
+ */
+static int fst_xc_count_occurrences(const char *haystack, const char *needle)
+{
+	const char *at = haystack;
+	switch_size_t len;
+	int count = 0;
+
+	if (zstr(haystack) || zstr(needle)) {
+		return 0;
+	}
+
+	len = strlen(needle);
+
+	while ((at = strstr(at, needle))) {
+		count++;
+		at += len;
+	}
+
+	return count;
+}
+
+/*
+ * True when every member of a BadgerFish object is an attribute: a "@"-prefixed
+ * member carrying a string.  Such an element has no text member and no child
+ * element, which is the construct an attribute-only fixture exists to cover, and
+ * which a serialisation comparison alone cannot distinguish from an element that
+ * merely happens to look similar.
+ *
+ * An object with no members at all is not attribute-only - it is the empty
+ * element, a different construct with its own pair - so it answers 0.
+ */
+static int fst_xc_json_attribute_only(const cJSON *node)
+{
+	const cJSON *member = NULL;
+
+	if (!node || !cJSON_IsObject(node) || !node->child) {
+		return 0;
+	}
+
+	for (member = node->child; member; member = member->next) {
+		if (!member->string || member->string[0] != '@' || !cJSON_IsString(member)) {
+			return 0;
+		}
+	}
+
+	return 1;
+}
+
+/*
  * Write `len` bytes to `path`, replacing anything already there.  Returns 1 on
  * success.  Both xml_curl_json_read_file() and xml_url_fetch() take a file name
  * rather than a buffer, because the production fetch streams the HTTP response
@@ -1208,7 +1303,7 @@ static int fst_xc_write_file(const char *path, const char *text, switch_size_t l
 #define FST_XC_LOG_PATTERNS 3
 #define FST_XC_LOG_TIMEOUT_US 10000000
 
-/* The one JSON fallback warning, emitted by xml_curl_json_decode_response(). */
+/* The one JSON fallback warning, emitted by xml_curl_json_decode_response_ex(). */
 #define FST_XC_LOG_FALLBACK "falling back to XML parsing"
 #define FST_XC_LOG_IDX_FALLBACK 0
 
@@ -1826,25 +1921,81 @@ static int fst_xc_count_jar_log(const char *needle, const char *path, const char
 #define FST_XC_VAL_PYTHON "python3"
 
 /*
- * The floor for the conformant half of the corpus.  It is deliberately a
- * MINIMUM rather than an exact count: the original nine parity pairs are frozen
- * and therefore present in every checkout, while further pairs are additive.
- * The merged tree carries eighteen, and asserting that aggregate here would
- * make this case fail in any tree that legitimately carries only the frozen
- * nine - so the exact total belongs to the delta review and QA gates that see
- * the whole merged corpus, and this case asserts the invariant floor plus the
- * verdict on whatever is actually present.
+ * The floor for the conformant half of the corpus: every parity fixture this
+ * suite ships, all eighteen of them.
+ *
+ * It is a MINIMUM rather than an exact count so that a nineteenth pair can be
+ * added without editing this case - the sweep below runs the validator over
+ * whatever is present and requires a clean verdict across all of it.  It is not
+ * a smaller number, because a floor below the shipped corpus is a floor that
+ * nothing has to satisfy: at nine, deleting every pair added after the original
+ * nine would leave this case passing while the contract the validator exists to
+ * police went uncovered.  The named list below closes the same hole from the
+ * other side, since a count alone cannot say WHICH eighteen were run.
  */
-#define FST_XC_VAL_MIN_PARITY_JSON 9
+#define FST_XC_VAL_MIN_PARITY_JSON 18
 
 /* Stems of the conformant corpus: one prefix per bound provisioning section.
    A fixture outside these three prefixes - the deliberately non-conformant
    badgerfish_invalid_* samples - is never swept into the conformant run. */
 static const char *fst_xc_val_section_prefixes[] = { "configuration_", "directory_", "dialplan_" };
 
+/*
+ * The conformant fixtures the validator MUST be run over, by name: the original
+ * nine pairs and the nine that widened the corpus, each of which also has a
+ * parity case of its own above.  Naming them is what makes the requirement an
+ * identity rather than a headcount - eighteen unrelated files would satisfy a
+ * count, and would prove nothing about the pair whose construct went missing.
+ *
+ * Additive by construction: the sweep below marks these off as it walks the
+ * directory and separately runs everything it finds, so a new pair needs a new
+ * line here only when it is meant to be mandatory.
+ */
+static const char *fst_xc_val_required_parity_json[] = {
+	"configuration_modules.json",
+	"configuration_acl.json",
+	"configuration_event_socket.json",
+	"directory_user_simple.json",
+	"directory_user_params.json",
+	"directory_domain_multi_user.json",
+	"dialplan_single_extension.json",
+	"dialplan_multi_condition.json",
+	"dialplan_multi_extension.json",
+	"configuration_load_width_ceiling.json",
+	"configuration_attribute_only.json",
+	"configuration_unicode_escapes.json",
+	"directory_mixed_text_and_siblings.json",
+	"directory_nesting_boundary.json",
+	"directory_empty_elements.json",
+	"dialplan_nested_arrays.json",
+	"dialplan_attribute_only_unicode.json",
+	"dialplan_empty_and_mixed.json"
+};
+
 /* Prefix of the committed non-conformant samples, each of which must be
    refused. */
 #define FST_XC_VAL_INVALID_PREFIX "badgerfish_invalid_"
+
+/*
+ * The five counter-examples the contract enumerates, by name: an emitted
+ * <document>/<section> envelope, more than one top-level key, a non-string leaf
+ * value, an attribute directly under the root key, and a top-level key that is
+ * not a bound section name.  Each is run on its own below and each must be
+ * refused on its own.
+ *
+ * Named rather than matched by prefix because a prefix and a count cannot tell
+ * "all five are still detected" from "one was deleted and an unrelated sixth
+ * was added": the count would hold and the missing rule would stop being
+ * covered.  Samples beyond these five are still swept afterwards, so the list
+ * is a floor and not a ceiling.
+ */
+static const char *fst_xc_val_required_invalid_json[] = {
+	"badgerfish_invalid_envelope_attributes.json",
+	"badgerfish_invalid_multiple_top_level_keys.json",
+	"badgerfish_invalid_non_string_leaf.json",
+	"badgerfish_invalid_root_attribute.json",
+	"badgerfish_invalid_unbound_section.json"
+};
 
 /*
  * Run one shell command and return the exit code the child actually reported.
@@ -1891,23 +2042,79 @@ static int fst_xc_val_run(const char *command)
 }
 
 /*
- * Append one path to a command line as a single shell word.
+ * Append one word to a command line, quoted so the shell can only ever read it
+ * as that one word.
  *
- * Every path here is composed from the build's own directory, so single quoting
- * is sufficient in practice - but "sufficient in practice" is not an assertion,
- * so a path that would break the quoting is refused rather than silently
- * mangled into a command that means something else.  Returns 0 when the path
- * cannot be quoted safely.
+ * This is the ONLY way a word reaches any command this case builds - the
+ * interpreter, the validator's own path and every argument alike.  Embedding a
+ * path directly between two literal quotes is what makes a checkout whose
+ * directory contains an apostrophe silently run a different command, and the
+ * paths here come from a compile-time base directory nobody in this file
+ * chooses, so "our paths are fine" is an assumption rather than a property.
+ *
+ * The quoting is the POSIX one: wrap in single quotes, and render each embedded
+ * single quote by closing the quoted run, emitting an escaped quote and opening
+ * a new one ('\'').  Inside single quotes the shell interprets nothing else, so
+ * no other character needs handling.  Returns 0 - which every caller turns into
+ * a failed assertion rather than a mangled command - for an empty word or one
+ * that would not fit the buffer.
  */
-static int fst_xc_val_append_arg(switch_stream_handle_t *stream, const char *path)
+static int fst_xc_val_append_word(switch_stream_handle_t *stream, const char *word)
 {
-	if (!stream || zstr(path) || strchr(path, '\'')) {
+	/* Twice the 1024-byte path buffer the case builds its arguments in, which is
+	   the worst case only a word made entirely of single quotes could approach,
+	   plus room for the two delimiters and the terminator. */
+	char quoted[2 * 1024 + 8];
+	switch_size_t out = 0;
+	switch_size_t i;
+
+	if (!stream || zstr(word)) {
 		return 0;
 	}
 
-	stream->write_function(stream, " '%s'", path);
+	quoted[out++] = '\'';
+
+	for (i = 0; word[i]; i++) {
+		/* Worst case for one input byte is the four-byte '\'' sequence, plus the
+		   closing quote and the terminator this loop has to leave room for. */
+		if (out + 6 >= sizeof(quoted)) {
+			return 0;
+		}
+
+		if (word[i] == '\'') {
+			quoted[out++] = '\'';
+			quoted[out++] = '\\';
+			quoted[out++] = '\'';
+			quoted[out++] = '\'';
+		} else {
+			quoted[out++] = word[i];
+		}
+	}
+
+	quoted[out++] = '\'';
+	quoted[out] = '\0';
+
+	stream->write_function(stream, " %s", quoted);
 
 	return 1;
+}
+
+/*
+ * Begin a validator command: the interpreter and the tool, both quoted by the
+ * helper above rather than by literal quotes in a format string, so the command
+ * this case runs is the command it means on any checkout path.
+ */
+static int fst_xc_val_begin_command(switch_stream_handle_t *stream)
+{
+	if (!stream) {
+		return 0;
+	}
+
+	if (!fst_xc_val_append_word(stream, FST_XC_VAL_PYTHON)) {
+		return 0;
+	}
+
+	return fst_xc_val_append_word(stream, FST_XC_VAL_TOOL);
 }
 
 /*
@@ -1966,12 +2173,74 @@ static int fst_xc_val_is_parity_json(const char *name)
 	return 0;
 }
 
-/*
- * True when `name` is one of the committed non-conformant samples.
- */
 static int fst_xc_val_is_invalid_sample(const char *name)
 {
 	return fst_xc_val_is_json(name) && fst_xc_val_has_prefix(name, FST_XC_VAL_INVALID_PREFIX);
+}
+
+/*
+ * Index of `name` in a required-fixture list, or -1 when it is not a member.
+ *
+ * The index rather than a yes/no answer, because both callers need to record
+ * WHICH member was found: one marks it off a checklist, the other skips a file
+ * it has already run.
+ */
+static int fst_xc_val_index_of(const char *const *list, switch_size_t len, const char *name)
+{
+	switch_size_t i;
+
+	if (!list || zstr(name)) {
+		return -1;
+	}
+
+	for (i = 0; i < len; i++) {
+		if (list[i] && !strcmp(list[i], name)) {
+			return (int) i;
+		}
+	}
+
+	return -1;
+}
+
+/* Returned when a path cannot be passed to a shell as one word, which is a
+   harness failure and not a conformance verdict.  No exit code of the validator
+   can collide with it. */
+#define FST_XC_VAL_UNQUOTABLE (-2)
+
+/*
+ * Run the validator over exactly one fixture and return the exit code it
+ * reported, FST_XC_VAL_UNQUOTABLE when the path could not be quoted, or -1 when
+ * no child ran at all.
+ *
+ * One run per file is what makes a verdict attributable: a single run over a set
+ * exits non-zero as soon as any member is refused, which is the right shape for
+ * the conformant sweep - where every member must pass - and the wrong shape for
+ * the counter-examples, where each must be refused ON ITS OWN or a validator
+ * that had stopped detecting one rule could hide behind another still firing.
+ *
+ * `quiet` discards stderr as well as stdout.  It is set for the counter-examples
+ * because their named violations are the expected outcome and would otherwise
+ * fill a passing run's log with alarming text, and clear for fixtures that are
+ * meant to pass, so that an unexpected violation names itself.
+ */
+static int fst_xc_val_run_one(const char *path, int quiet)
+{
+	switch_stream_handle_t stream = { 0 };
+	int code = FST_XC_VAL_UNQUOTABLE;
+
+	SWITCH_STANDARD_STREAM(stream);
+
+	/* The interpreter and the tool path go through the same quoting every argument
+	   does, so a repository path carrying an apostrophe cannot break the command
+	   this helper hands to the shell. */
+	if (fst_xc_val_begin_command(&stream) && fst_xc_val_append_word(&stream, path)) {
+		stream.write_function(&stream, "%s", quiet ? " >/dev/null 2>&1" : " >/dev/null");
+		code = fst_xc_val_run((const char *) stream.data);
+	}
+
+	switch_safe_free(stream.data);
+
+	return code;
 }
 
 
@@ -1989,12 +2258,22 @@ static int fst_xc_val_is_invalid_sample(const char *name)
  * hands the event to the core's dispatch queue and returns, so a bound consumer
  * sees it some time later and a naive "did anything arrive" test can be satisfied
  * by an event an earlier sub-case produced.  The remedy is the same barrier the
- * log capture uses, for the same reason: the core has ONE event dispatch queue,
- * so an event of this very subclass carrying a private barrier header, observed
- * by this consumer, proves every event enqueued before it has already been
- * delivered.  Two barriers -- one before the counters are armed and one before
- * they are read -- make the counts exact rather than probable, and the wait is
- * bounded and reports a failure instead of blocking.
+ * log capture uses, but the invariant it rests on has to be stated, because one
+ * queue is not by itself enough.  The core owns ONE FIFO event dispatch queue,
+ * yet it can ADD dispatch workers once the queued backlog exceeds
+ * DISPATCH_QUEUE_LEN per running worker, and with several workers draining that
+ * one queue the order in which callbacks COMPLETE is no longer the order they
+ * were enqueued in.  This harness is ordered because it starts with a single
+ * worker and cannot come near that threshold: it fires a handful of events at a
+ * time and every barrier waits for the queue to drain, so the instantaneous
+ * backlog stays in single digits against a ceiling of ten thousand, no second
+ * worker is ever launched, and callback completion is FIFO here.  Under that
+ * stated invariant an event of this very subclass carrying a private barrier
+ * header, observed by this consumer, proves every event enqueued before it has
+ * already been delivered.  Two barriers -- one before the counters are armed and
+ * one before they are read -- then make the counts exact rather than probable,
+ * and the wait is bounded so a stalled dispatcher becomes a failure rather than a
+ * hang.
  *
  * The barrier event is told apart from a real one by that private header alone,
  * never by its subclass: the production emitter adds exactly three headers and
@@ -2183,7 +2462,6 @@ static int fst_xc_evt_barrier(void)
 	return seen;
 }
 
-/* Start counting fallback events from zero. */
 static void fst_xc_evt_arm(void)
 {
 	if (!fst_xc_evt_mutex) {
@@ -3636,7 +3914,7 @@ FST_CORE_BEGIN("conf")
 			/* the whole decode step end to end: a JSON body, a JSON content type and the
 			   section that was actually requested */
 			xml = xml_curl_json_decode_response(path, "application/json; charset=utf-8", XML_CURL_MAX_BYTES,
-												"https://provisioner:secret@example.com/prov?token=abc", "directory", NULL);
+												"https://provisioner:secret@example.com/prov?token=abc", "directory");
 			fst_xcheck(xml != NULL, "a JSON body with a JSON content type must decode");
 			switch_xml_free(xml);
 
@@ -3646,30 +3924,30 @@ FST_CORE_BEGIN("conf")
 			 * misconfigured or misbehaving gateway degrades to today's behaviour instead
 			 * of failing the lookup.
 			 */
-			xml = xml_curl_json_decode_response(path, "text/xml", XML_CURL_MAX_BYTES, "https://example.com/prov", "directory", NULL);
+			xml = xml_curl_json_decode_response(path, "text/xml", XML_CURL_MAX_BYTES, "https://example.com/prov", "directory");
 			fst_xcheck(xml == NULL, "a text/xml content type must not be decoded as JSON");
 			switch_xml_free(xml);
 
-			xml = xml_curl_json_decode_response(path, "application/json", XML_CURL_MAX_BYTES, "https://example.com/prov", "dialplan", NULL);
+			xml = xml_curl_json_decode_response(path, "application/json", XML_CURL_MAX_BYTES, "https://example.com/prov", "dialplan");
 			fst_xcheck(xml == NULL, "a body whose root key is not the requested section must be refused");
 			switch_xml_free(xml);
 
-			xml = xml_curl_json_decode_response(path, NULL, XML_CURL_MAX_BYTES, "https://example.com/prov", "directory", NULL);
+			xml = xml_curl_json_decode_response(path, NULL, XML_CURL_MAX_BYTES, "https://example.com/prov", "directory");
 			fst_xcheck(xml == NULL, "a response with no Content-Type at all must fall back");
 			switch_xml_free(xml);
 
-			xml = xml_curl_json_decode_response(path, "application/json", XML_CURL_MAX_BYTES, "https://example.com/prov", NULL, NULL);
+			xml = xml_curl_json_decode_response(path, "application/json", XML_CURL_MAX_BYTES, "https://example.com/prov", NULL);
 			fst_xcheck(xml == NULL, "a fetch with no requested section must fall back");
 			switch_xml_free(xml);
 
-			xml = xml_curl_json_decode_response(NULL, "application/json", XML_CURL_MAX_BYTES, "https://example.com/prov", "directory", NULL);
+			xml = xml_curl_json_decode_response(NULL, "application/json", XML_CURL_MAX_BYTES, "https://example.com/prov", "directory");
 			fst_xcheck(xml == NULL, "a fetch with no captured body must fall back");
 			switch_xml_free(xml);
 
 			/* the XML twin of that fixture is a valid response body, and it must still
 			   not decode as JSON -- which is the mismatch case the module has to survive */
 			switch_snprintf(path, sizeof(path), "%s%s", FST_XC_FIXTURE_DIR, "directory_user_simple.xml");
-			xml = xml_curl_json_decode_response(path, "application/json", XML_CURL_MAX_BYTES, "https://example.com/prov", "directory", NULL);
+			xml = xml_curl_json_decode_response(path, "application/json", XML_CURL_MAX_BYTES, "https://example.com/prov", "directory");
 			fst_xcheck(xml == NULL, "an XML body announced as JSON must fall back rather than decode");
 			switch_xml_free(xml);
 		}
@@ -4811,11 +5089,12 @@ FST_CORE_BEGIN("conf")
 		 * GROUP 8 -- the fallback event
 		 * -------------------------------------------------------------------
 		 * The WARNING tells an operator that provisioning fidelity degraded; the
-		 * event tells their alerting.  These three cases assert the machine-facing
+		 * event tells their alerting.  These four cases assert the machine-facing
 		 * half: that it fires exactly once per fallback with the right reason on
 		 * each edge, that it identifies the binding and the gateway without
-		 * carrying a credential, and that a binding which never asked for JSON
-		 * fires nothing at all.
+		 * carrying a credential, that a binding which never asked for JSON fires
+		 * nothing at all, and that an event which could not be built completely is
+		 * abandoned rather than delivered with a header missing.
 		 *
 		 * Every assertion after the consumer is bound is deliberately non-fatal, so
 		 * no failure can abandon a case body with the consumer still bound to the
@@ -5012,6 +5291,86 @@ FST_CORE_BEGIN("conf")
 		}
 		FST_TEST_END()
 
+		/*
+		 * The construction guard, which is what makes the three headers a contract
+		 * rather than an expectation.  switch_event_add_header_string() returns a
+		 * status and refuses a value it cannot store, so an unchecked add would let
+		 * a two-of-three event reach a consumer that has no way to tell a refused
+		 * header from one the module chose not to send.
+		 *
+		 * The emitter is called directly because no gateway can produce that edge:
+		 * the reason token is an internal literal and the other two operands pass
+		 * through bounding helpers that always yield a string, so nothing a remote
+		 * peer answers with can reach the header API with a value it will refuse.
+		 * Driving it from here is the only way the guard is observable at all.
+		 *
+		 * Two controls sit either side of the negative assertion.  A complete call
+		 * must fire exactly one whole event, so "no event" cannot be satisfied by a
+		 * consumer that was never listening; and a call whose binding and gateway are
+		 * both absent -- rendered, not refused -- must still fire, so the guard is a
+		 * refusal of what cannot be built rather than a refusal of anything unusual.
+		 */
+		FST_TEST_BEGIN(fallback_event_abandoned_when_incomplete)
+		{
+			static const char gateway_url[] = "https://provisioner:hunter2@127.0.0.1:1"
+				"/tenants/s3cr3t-tenant-token/directory?apikey=deadbeefapikey";
+			fst_xc_evt_record_t captured;
+
+			fst_requires(fst_xc_evt_capture_start());
+
+			/*
+			 * 1. Control: everything the emitter needs is present, so one event
+			 *    arrives carrying all three headers -- the same rendering the
+			 *    end-to-end cases above assert, reached through the emitter alone.
+			 */
+			fst_xcheck(fst_xc_evt_barrier(), "the event queue must drain before the counters are armed");
+			fst_xc_evt_arm();
+			xml_curl_json_fire_fallback_event("provisioning_binding", XML_CURL_JSON_FALLBACK_REASON_MALFORMED, gateway_url);
+			fst_xcheck(fst_xc_evt_barrier(), "the event queue must drain before the counters are read");
+			fst_xc_evt_disarm();
+
+			fst_check_int_equals(fst_xc_evt_captured(), 1);
+			captured = fst_xc_evt_record(0);
+			fst_check_string_equals(captured.binding, "provisioning_binding");
+			fst_check_string_equals(captured.reason, "malformed-json");
+			fst_check_string_equals(captured.gateway, "https://[redacted]@127.0.0.1:1/[redacted]");
+
+			/*
+			 * 2. The guard itself: the reason is the one header value with no
+			 *    rendering helper behind it, so a NULL one is refused by the header
+			 *    API -- and the answer is silence, not an event carrying Binding and
+			 *    Gateway with the reason missing.
+			 */
+			fst_xcheck(fst_xc_evt_barrier(), "the event queue must drain before the counters are armed");
+			fst_xc_evt_arm();
+			xml_curl_json_fire_fallback_event("provisioning_binding", NULL, gateway_url);
+			fst_xcheck(fst_xc_evt_barrier(), "the event queue must drain before the counters are read");
+			fst_xc_evt_disarm();
+
+			fst_check_int_equals(fst_xc_evt_captured(), 0);
+
+			/*
+			 * 3. And the guard is precise.  An unnamed binding and an absent gateway
+			 *    URL are both rendered to their deterministic markers rather than
+			 *    refused, so that event is complete and must still be delivered.  A
+			 *    blanket "abandon anything with an empty operand" would fail here.
+			 */
+			fst_xcheck(fst_xc_evt_barrier(), "the event queue must drain before the counters are armed");
+			fst_xc_evt_arm();
+			xml_curl_json_fire_fallback_event(NULL, XML_CURL_JSON_FALLBACK_REASON_CONTENT_TYPE, NULL);
+			fst_xcheck(fst_xc_evt_barrier(), "the event queue must drain before the counters are read");
+			fst_xc_evt_disarm();
+
+			fst_check_int_equals(fst_xc_evt_captured(), 1);
+			captured = fst_xc_evt_record(0);
+			fst_check_string_equals(captured.binding, "(unnamed)");
+			fst_check_string_equals(captured.reason, "content-type-mismatch");
+			fst_check_string_equals(captured.gateway, "(none)");
+
+			fst_xcheck(fst_xc_evt_capture_stop(), "the fallback event consumer must unbind and release cleanly");
+		}
+		FST_TEST_END()
+
 		FST_TEST_BEGIN(fixture_parity_configuration_load_width_ceiling)
 		{
 			char *from_json = NULL;
@@ -5019,9 +5378,36 @@ FST_CORE_BEGIN("conf")
 			char xml_error[256] = "";
 
 			{
+				cJSON *loads = NULL;
+
 				fst_parse_json_file(fixture, FST_XC_FIXTURE_DIR "configuration_load_width_ceiling.json");
 				fst_check(cJSON_IsObject(fixture));
 				fst_check_int_equals(cJSON_GetArraySize(fixture), 1);
+
+				/*
+				 * The width this pair stands on, asserted on the parsed document
+				 * before it is released.  Parity alone cannot see it: two twins
+				 * that had both shrunk to a handful of children would still
+				 * serialise identically, and the pair would have stopped being a
+				 * boundary case without failing.  The array is required to be
+				 * exactly as wide as the ceiling the module enforces, and its two
+				 * endpoints are named so a truncated or re-based run is caught as
+				 * well as a short one.
+				 */
+				loads = cJSON_GetObjectItem(cJSON_GetObjectItem(cJSON_GetObjectItem(cJSON_GetObjectItem(fixture, "configuration"),
+																				   "configuration"),
+															   "modules"),
+											"load");
+				fst_requires(loads != NULL);
+				fst_check(cJSON_IsArray(loads));
+				fst_check_int_equals(cJSON_GetArraySize(loads), XML_CURL_JSON_MAX_ARRAY_ELEMENTS);
+				fst_check_string_equals(cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_GetArrayItem(loads, 0), "@module")),
+										"mod_load_000");
+				fst_check_string_equals(cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_GetArrayItem(loads,
+																								   XML_CURL_JSON_MAX_ARRAY_ELEMENTS - 1),
+																				"@module")),
+										"mod_load_255");
+
 				cJSON_Delete(fixture);
 			}
 
@@ -5030,6 +5416,16 @@ FST_CORE_BEGIN("conf")
 			fst_check_string_equals(xml_error, "");
 			/* the declared width ceiling boundary: 256 repeated children under one parent */
 			fst_check_string_equals(from_json, from_xml);
+			/*
+			 * And the width survives the translation, which is the half of the
+			 * claim the document above cannot make: every one of the 256 array
+			 * elements has to become its own element under the one parent, in
+			 * order, with none coalesced and none dropped.
+			 */
+			fst_check_int_equals(fst_xc_count_occurrences(from_json, "<load module="), XML_CURL_JSON_MAX_ARRAY_ELEMENTS);
+			fst_check_int_equals(fst_xc_count_occurrences(from_xml, "<load module="), XML_CURL_JSON_MAX_ARRAY_ELEMENTS);
+			fst_check_string_has(from_json, "<load module=\"mod_load_000\"></load>");
+			fst_check_string_has(from_json, "<load module=\"mod_load_255\"></load>");
 
 			switch_safe_free(from_json);
 			switch_safe_free(from_xml);
@@ -5040,12 +5436,47 @@ FST_CORE_BEGIN("conf")
 		{
 			char *from_json = NULL;
 			char *from_xml = NULL;
+			char *raw = NULL;
 			char xml_error[256] = "";
 
+			/*
+			 * "Attribute-only" is a claim about the whole document, so it is made
+			 * about the whole document: the bytes on disk carry no text member at
+			 * all.  A "$" member is spelled exactly that way in JSON, and no value
+			 * anywhere in this fixture contains that sequence, so its absence is
+			 * an exact reading rather than an approximation.
+			 */
+			raw = xml_curl_json_read_file(FST_XC_FIXTURE_DIR "configuration_attribute_only.json", XML_CURL_MAX_BYTES);
+			fst_requires(raw != NULL);
+			fst_check_string_does_not_have(raw, "\"$\"");
+			switch_safe_free(raw);
+
 			{
+				cJSON *layout = NULL;
+
 				fst_parse_json_file(fixture, FST_XC_FIXTURE_DIR "configuration_attribute_only.json");
 				fst_check(cJSON_IsObject(fixture));
 				fst_check_int_equals(cJSON_GetArraySize(fixture), 1);
+
+				/*
+				 * And the construct itself, on the element the pair was written
+				 * around: every member an "@" carrying a string, so the element has
+				 * neither text nor a child.  Parity cannot see this - two twins that
+				 * had both grown a text member would still compare equal - so the
+				 * structure is read directly, before the document is released.
+				 */
+				layout = cJSON_GetArrayItem(cJSON_GetObjectItem(cJSON_GetObjectItem(cJSON_GetObjectItem(cJSON_GetObjectItem(cJSON_GetObjectItem(fixture,
+																																			   "configuration"),
+																													   "configuration"),
+																			   "layout-settings"),
+													   "layouts"),
+											   "layout"),
+											0);
+				fst_requires(layout != NULL);
+				fst_xcheck(fst_xc_json_attribute_only(cJSON_GetObjectItem(layout, "image")),
+						   "the image element must carry nothing but @-prefixed string members");
+				fst_check_int_equals(cJSON_GetArraySize(cJSON_GetObjectItem(layout, "image")), 4);
+
 				cJSON_Delete(fixture);
 			}
 
@@ -5054,6 +5485,15 @@ FST_CORE_BEGIN("conf")
 			fst_check_string_equals(xml_error, "");
 			/* attribute-only elements: every member an @, no $ and no children, in non-alphabetical order */
 			fst_check_string_equals(from_json, from_xml);
+			/*
+			 * What the translation has to preserve: each "@" member becomes an
+			 * attribute in the order it was written - not alphabetised - and an
+			 * element with no text member serialises with empty content rather than
+			 * borrowing text from anywhere.
+			 */
+			fst_check_string_has(from_json, "<image x=\"0\" y=\"0\" scale=\"360\" floor=\"true\"></image>");
+			fst_check_string_has(from_json, "<layout name=\"2x1\" auto-3d-position=\"true\">");
+			fst_check_int_equals(fst_xc_count_occurrences(from_json, "<image "), 5);
 
 			switch_safe_free(from_json);
 			switch_safe_free(from_xml);
@@ -5064,6 +5504,7 @@ FST_CORE_BEGIN("conf")
 		{
 			char *from_json = NULL;
 			char *from_xml = NULL;
+			char *raw = NULL;
 			char xml_error[256] = "";
 
 			{
@@ -5073,11 +5514,39 @@ FST_CORE_BEGIN("conf")
 				cJSON_Delete(fixture);
 			}
 
+			/*
+			 * The JSON twin has to be the side that carries ESCAPES rather than
+			 * decoded characters, or the decoded-value assertions below would prove
+			 * nothing about the escape path.  The production reader hands back
+			 * exactly the bytes on disk, so a plain escape, a three-byte one and the
+			 * surrogate pair are all checked for there first.
+			 */
+			raw = xml_curl_json_read_file(FST_XC_FIXTURE_DIR "configuration_unicode_escapes.json", XML_CURL_MAX_BYTES);
+			fst_requires(raw != NULL);
+			fst_check_string_has(raw, "\\u00ea");
+			fst_check_string_has(raw, "\\u2122");
+			fst_check_string_has(raw, "\\u89c6\\u9891\\u4f1a\\u8bae");
+			fst_check_string_has(raw, "\\ud83d\\ude42");
+			switch_safe_free(raw);
+
 			fst_requires(fst_xc_render_pair("configuration_unicode_escapes", "configuration", &from_json, &from_xml,
 											xml_error, sizeof(xml_error)) == SWITCH_STATUS_SUCCESS);
 			fst_check_string_equals(xml_error, "");
 			/* \uXXXX escapes, one of them a surrogate pair, surviving as the decoded character */
 			fst_check_string_equals(from_json, from_xml);
+			/*
+			 * Equality alone would also hold if both sides had passed an escape
+			 * through verbatim, so the decoded values are asserted directly.  Each
+			 * non-ASCII code point comes back as the numeric character reference
+			 * switch_xml_toxml() emits for it, the surrogate pair comes back as ONE
+			 * reference for U+1F642 rather than as its two halves, an escaped
+			 * ampersand comes back as the entity and not as a raw "&", and no
+			 * literal escape survives anywhere in the output.
+			 */
+			fst_check_string_has(from_json, "Confer&#xEA;ncia FreeSWITCH&#x2122; &#x1F642;");
+			fst_check_string_has(from_json, "&#x89C6;&#x9891;&#x4F1A;&#x8BAE;");
+			fst_check_string_has(from_json, "Atenci&#xF3;n &amp; Ventas");
+			fst_check_string_does_not_have(from_json, "\\u");
 
 			switch_safe_free(from_json);
 			switch_safe_free(from_xml);
@@ -5137,6 +5606,21 @@ FST_CORE_BEGIN("conf")
 		FST_TEST_BEGIN(fixture_parity_directory_nesting_boundary)
 		{
 			/*
+			 * Interpretation I-3: the requested "CJSON_NESTING_LIMIT minus
+			 * one" does not describe this tree, so the depth this pair stands
+			 * on cannot be reconstructed from the request alone.
+			 * CJSON_NESTING_LIMIT bounds cJSON's own parser recursion rather
+			 * than this decoder, and it is not even a single value here:
+			 * configure.ac defines it as 64 for the autotools build, while
+			 * switch_cJSON.h falls back to 1000 for any build that leaves it
+			 * undefined.  Neither number ever decides anything, because the
+			 * module refuses first at its own XML_CURL_JSON_MAX_DEPTH -- 32 --
+			 * which it enforces itself on every platform precisely so that the
+			 * parser's configuration cannot move the boundary.  32 is therefore
+			 * the enforceable ceiling, and this fixture pair uses that boundary
+			 * minus one: depth 31.  The assertions below pin that choice from
+			 * both sides.
+			 *
 			 * The depth in this pair is only meaningful against the accounting
 			 * that produces it, so both are stated here.
 			 *
@@ -5294,14 +5778,54 @@ FST_CORE_BEGIN("conf")
 
 		FST_TEST_BEGIN(fixture_parity_dialplan_nested_arrays)
 		{
+			/* the shape this pair is written around: three extensions, each with
+			   three conditions, each with three actions */
+			static const int wide = 3;
 			char *from_json = NULL;
 			char *from_xml = NULL;
 			char xml_error[256] = "";
 
 			{
+				cJSON *extensions = NULL;
+				cJSON *extension = NULL;
+				cJSON *conditions = NULL;
+				cJSON *condition = NULL;
+				int outer = 0;
+				int inner = 0;
+
 				fst_parse_json_file(fixture, FST_XC_FIXTURE_DIR "dialplan_nested_arrays.json");
 				fst_check(cJSON_IsObject(fixture));
 				fst_check_int_equals(cJSON_GetArraySize(fixture), 1);
+
+				/*
+				 * Arrays at all three levels, asserted on the parsed document.
+				 * Parity cannot distinguish an array of one from a lone object -
+				 * both translate to a single child - so a fixture that had lost its
+				 * nesting would compare equal to a twin that had lost it too.  Every
+				 * level is walked rather than sampled, because the construct is
+				 * arrays INSIDE arrays and one conforming branch says nothing about
+				 * the others.
+				 */
+				extensions = cJSON_GetObjectItem(cJSON_GetObjectItem(cJSON_GetObjectItem(fixture, "dialplan"), "context"),
+												 "extension");
+				fst_requires(extensions != NULL);
+				fst_check(cJSON_IsArray(extensions));
+				fst_check_int_equals(cJSON_GetArraySize(extensions), wide);
+
+				for (outer = 0; outer < cJSON_GetArraySize(extensions); outer++) {
+					extension = cJSON_GetArrayItem(extensions, outer);
+					conditions = cJSON_GetObjectItem(extension, "condition");
+					fst_xcheck(cJSON_IsArray(conditions), "every extension must carry an ARRAY of conditions");
+					fst_check_int_equals(cJSON_GetArraySize(conditions), wide);
+
+					for (inner = 0; inner < cJSON_GetArraySize(conditions); inner++) {
+						condition = cJSON_GetArrayItem(conditions, inner);
+						fst_xcheck(cJSON_IsArray(cJSON_GetObjectItem(condition, "action")),
+								   "every condition must carry an ARRAY of actions");
+						fst_check_int_equals(cJSON_GetArraySize(cJSON_GetObjectItem(condition, "action")), wide);
+					}
+				}
+
 				cJSON_Delete(fixture);
 			}
 
@@ -5312,6 +5836,15 @@ FST_CORE_BEGIN("conf")
 			   of extensions, each holding an array of conditions, each holding an array of
 			   actions */
 			fst_check_string_equals(from_json, from_xml);
+			/*
+			 * And the product of those widths in the output: 3 extensions, 3 x 3
+			 * conditions and 3 x 3 x 3 actions, which is what proves each array was
+			 * expanded in its own parent rather than flattened into one run.
+			 */
+			fst_check_int_equals(fst_xc_count_occurrences(from_json, "<extension "), wide);
+			fst_check_int_equals(fst_xc_count_occurrences(from_json, "<condition "), wide * wide);
+			fst_check_int_equals(fst_xc_count_occurrences(from_json, "<action "), wide * wide * wide);
+			fst_check_int_equals(fst_xc_count_occurrences(from_xml, "<action "), wide * wide * wide);
 
 			switch_safe_free(from_json);
 			switch_safe_free(from_xml);
@@ -5444,10 +5977,17 @@ FST_CORE_BEGIN("conf")
 			char entry[512] = "";
 			char path[1024] = "";
 			const char *found = NULL;
+			int parity_seen[switch_arraylen(fst_xc_val_required_parity_json)];
 			int parity_files = 0;
 			int invalid_files = 0;
 			int quoting_failures = 0;
+			int missing_parity = 0;
+			int missing_samples = 0;
+			int slot = -1;
+			int i = 0;
 			int code = -1;
+
+			memset(parity_seen, 0, sizeof(parity_seen));
 
 			/* Everything before this case is accounted for, including the
 			   teardown of the case that asserted the cumulative latch. */
@@ -5478,12 +6018,46 @@ FST_CORE_BEGIN("conf")
 			fst_xcheck(code == 0, "python3 is not available on this host, so the contract validator cannot be exercised");
 
 			/*
+			 * The quoting every command below is built with, asserted directly
+			 * rather than trusted.  This is the one property that cannot be
+			 * observed from an exit code - a mis-quoted word and an unterminated
+			 * quote can both come back as the same status - so the produced word
+			 * is compared with the POSIX form byte for byte: an apostrophe closes
+			 * the quoted run, is emitted escaped, and a new run opens.
+			 */
+			SWITCH_STANDARD_STREAM(stream);
+			fst_xcheck(fst_xc_val_append_word(&stream, "a'b") == 1, "a word carrying an apostrophe must still be quotable");
+			fst_xcheck(stream.data && !strcmp((const char *) stream.data, " 'a'\\''b'"),
+					   "a word carrying an apostrophe must be quoted as the POSIX '\\'' form");
+			switch_safe_free(stream.data);
+
+			SWITCH_STANDARD_STREAM(stream);
+			fst_xcheck(fst_xc_val_append_word(&stream, "") == 0, "an empty word must be refused rather than emitted as an empty argument");
+			switch_safe_free(stream.data);
+
+			/*
 			 * And the validator itself has to be runnable and self-describing.
 			 * --help exits 0, which also proves the interpreter accepts the
 			 * script - a syntax error would surface here rather than as a
 			 * confusing conformance verdict below.
+			 *
+			 * Every command from here on is BUILT rather than written as a
+			 * literal, because the interpreter and the tool path are words the
+			 * shell has to receive whole just as much as the arguments are.
 			 */
-			code = fst_xc_val_run(FST_XC_VAL_PYTHON " '" FST_XC_VAL_TOOL "' --help >/dev/null 2>&1");
+			SWITCH_STANDARD_STREAM(stream);
+
+			if (fst_xc_val_begin_command(&stream)) {
+				stream.write_function(&stream, "%s", " --help >/dev/null 2>&1");
+				code = fst_xc_val_run((const char *) stream.data);
+			} else {
+				quoting_failures++;
+				code = -1;
+			}
+
+			switch_safe_free(stream.data);
+
+			fst_xcheck(quoting_failures == 0, "the validator command could not be built as quoted shell words");
 			fst_xcheck(code == 0, "the contract validator must document its own usage with --help and exit 0");
 
 			/*
@@ -5491,9 +6065,69 @@ FST_CORE_BEGIN("conf")
 			 * error, NOT as a conformance failure - otherwise a mistyped path
 			 * in a deployment gate would read as a refused payload.
 			 */
-			code = fst_xc_val_run(FST_XC_VAL_PYTHON " '" FST_XC_VAL_TOOL "' '"
-								  FST_XC_FIXTURE_DIR "no_such_response.json' >/dev/null 2>&1");
+			SWITCH_STANDARD_STREAM(stream);
+
+			if (fst_xc_val_begin_command(&stream)
+				&& fst_xc_val_append_word(&stream, FST_XC_FIXTURE_DIR "no_such_response.json")) {
+				stream.write_function(&stream, "%s", " >/dev/null 2>&1");
+				code = fst_xc_val_run((const char *) stream.data);
+			} else {
+				quoting_failures++;
+				code = -1;
+			}
+
+			switch_safe_free(stream.data);
+
+			fst_xcheck(quoting_failures == 0, "the validator command could not be built as quoted shell words");
 			fst_xcheck(code == 2, "a missing input must exit 2, so it is never mistaken for a conformance verdict");
+
+			/*
+			 * The response ceiling the module enforces before it parses anything
+			 * (XML_CURL_MAX_BYTES, per-binding response-max-bytes) is part of the
+			 * contract the validator certifies, so its override is exercised
+			 * against a real fixture: a ceiling of one byte cannot be met by any
+			 * document, so a conformant fixture must be REFUSED under it.  This
+			 * needs no oversized fixture of its own, which is the point - the
+			 * boundary is asserted without committing a megabyte of padding.
+			 */
+			SWITCH_STANDARD_STREAM(stream);
+
+			if (fst_xc_val_begin_command(&stream)
+				&& fst_xc_val_append_word(&stream, "--max-response-bytes")
+				&& fst_xc_val_append_word(&stream, "1")
+				&& fst_xc_val_append_word(&stream, FST_XC_FIXTURE_DIR "configuration_acl.json")) {
+				stream.write_function(&stream, "%s", " >/dev/null 2>&1");
+				code = fst_xc_val_run((const char *) stream.data);
+			} else {
+				quoting_failures++;
+				code = -1;
+			}
+
+			switch_safe_free(stream.data);
+
+			fst_xcheck(quoting_failures == 0, "the validator command could not be built as quoted shell words");
+			fst_xcheck(code == 1, "a document larger than the response ceiling must be refused with exit 1, as mod_xml_curl refuses it before parsing");
+
+			/*
+			 * And the same fixture has to PASS at the default ceiling, or the
+			 * assertion above would be satisfied by a validator that refuses
+			 * everything.
+			 */
+			SWITCH_STANDARD_STREAM(stream);
+
+			if (fst_xc_val_begin_command(&stream)
+				&& fst_xc_val_append_word(&stream, FST_XC_FIXTURE_DIR "configuration_acl.json")) {
+				stream.write_function(&stream, "%s", " >/dev/null 2>&1");
+				code = fst_xc_val_run((const char *) stream.data);
+			} else {
+				quoting_failures++;
+				code = -1;
+			}
+
+			switch_safe_free(stream.data);
+
+			fst_xcheck(quoting_failures == 0, "the validator command could not be built as quoted shell words");
+			fst_xcheck(code == 0, "the same fixture must conform at the default response ceiling");
 
 			/*
 			 * One pool for both halves' directory enumerations.  Nothing has
@@ -5508,13 +6142,19 @@ FST_CORE_BEGIN("conf")
 			 * ---------------------------------------------------------------
 			 * HALF ONE: every conformant parity fixture, in a single run
 			 * ---------------------------------------------------------------
-			 * The corpus is enumerated rather than listed, because the parity
-			 * pairs are additive: this asserts the verdict on whatever is
-			 * present and, separately, that at least the frozen nine are.
+			 * The corpus is enumerated AND named.  Enumerating it is what runs
+			 * the validator over whatever is actually present, so an added pair
+			 * is covered the moment it lands; naming it is what makes the
+			 * eighteen shipped pairs a requirement rather than a coincidence,
+			 * so a deleted pair is reported by name instead of being absorbed
+			 * by a count that some other file happened to satisfy.
 			 */
 			if (switch_dir_open(&dir, FST_XC_FIXTURE_DIR, pool) == SWITCH_STATUS_SUCCESS) {
 				SWITCH_STANDARD_STREAM(stream);
-				stream.write_function(&stream, "%s '%s'", FST_XC_VAL_PYTHON, FST_XC_VAL_TOOL);
+
+				if (!fst_xc_val_begin_command(&stream)) {
+					quoting_failures++;
+				}
 
 				while ((found = switch_dir_next_file(dir, entry, sizeof(entry)))) {
 					if (!fst_xc_val_is_parity_json(found)) {
@@ -5522,9 +6162,17 @@ FST_CORE_BEGIN("conf")
 					}
 
 					parity_files++;
+
+					slot = fst_xc_val_index_of(fst_xc_val_required_parity_json,
+											   switch_arraylen(fst_xc_val_required_parity_json), found);
+
+					if (slot >= 0) {
+						parity_seen[slot] = 1;
+					}
+
 					switch_snprintf(path, sizeof(path), "%s%s", FST_XC_FIXTURE_DIR, found);
 
-					if (!fst_xc_val_append_arg(&stream, path)) {
+					if (!fst_xc_val_append_word(&stream, path)) {
 						quoting_failures++;
 					}
 				}
@@ -5539,9 +6187,22 @@ FST_CORE_BEGIN("conf")
 				code = fst_xc_val_run((const char *) stream.data);
 				switch_safe_free(stream.data);
 
+				/* Which of the required pairs were not in the run, named one by
+				   one: "the corpus is short by two" is not an actionable
+				   diagnostic and this is. */
+				for (i = 0; i < (int) switch_arraylen(fst_xc_val_required_parity_json); i++) {
+					if (!parity_seen[i]) {
+						missing_parity++;
+						switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+										  "test_mod_xml_curl: required conformant fixture [%s] is missing from %s\n",
+										  fst_xc_val_required_parity_json[i], FST_XC_FIXTURE_DIR);
+					}
+				}
+
 				fst_xcheck(quoting_failures == 0, "a fixture path could not be passed to the validator as a single shell word");
+				fst_xcheck(missing_parity == 0, "every named conformant parity fixture must be present and included in the validator run");
 				fst_xcheck(parity_files >= FST_XC_VAL_MIN_PARITY_JSON,
-						   "the conformant corpus is smaller than the frozen nine parity fixtures");
+						   "the conformant corpus is smaller than the eighteen parity fixtures this suite ships");
 				fst_xcheck(code == 0, "the validator must exit 0 across every conformant parity JSON fixture present");
 			} else {
 				fst_fail("the fixtures directory could not be enumerated for the conformant sweep");
@@ -5549,10 +6210,63 @@ FST_CORE_BEGIN("conf")
 
 			/*
 			 * ---------------------------------------------------------------
-			 * HALF TWO: each committed counter-example, one run apiece
+			 * HALF TWO: each counter-example the contract names, one run apiece
 			 * ---------------------------------------------------------------
 			 * One run per sample is the point: a single run over all five would
 			 * exit 1 even if only one of them were still being detected.
+			 *
+			 * The five are driven from the named list rather than from whatever
+			 * the directory happens to hold, so each of the five rules is
+			 * required to still be detected individually.  Its absence is
+			 * reported as an absence - checked before the run, so a deleted
+			 * sample reads as "missing" rather than as the validator's exit 2
+			 * for an unopenable input.
+			 */
+			for (i = 0; i < (int) switch_arraylen(fst_xc_val_required_invalid_json); i++) {
+				switch_snprintf(path, sizeof(path), "%s%s", FST_XC_FIXTURE_DIR, fst_xc_val_required_invalid_json[i]);
+
+				if (switch_file_exists(path, NULL) != SWITCH_STATUS_SUCCESS) {
+					missing_samples++;
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+									  "test_mod_xml_curl: required non-conformant sample [%s] is missing from %s\n",
+									  fst_xc_val_required_invalid_json[i], FST_XC_FIXTURE_DIR);
+					continue;
+				}
+
+				invalid_files++;
+
+				/*
+				 * Both streams are discarded here, unlike the sweep above: these
+				 * files are MEANT to be refused, and a passing run must not
+				 * spray the test log with the named violations of deliberate
+				 * counter-examples.  An unexpected verdict is logged explicitly
+				 * instead, naming the file and the code.
+				 */
+				code = fst_xc_val_run_one(path, 1);
+
+				if (code == FST_XC_VAL_UNQUOTABLE) {
+					quoting_failures++;
+					continue;
+				}
+
+				if (code != 1) {
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+									  "test_mod_xml_curl: validator returned %d for non-conformant sample [%s]\n", code,
+									  fst_xc_val_required_invalid_json[i]);
+				}
+
+				fst_xcheck(code == 1, "each non-conformant sample the contract names must be refused with exit 1, on its own");
+			}
+
+			fst_xcheck(missing_samples == 0, "every non-conformant sample the contract names must be present in the fixtures directory");
+			fst_xcheck(invalid_files == (int) switch_arraylen(fst_xc_val_required_invalid_json),
+					   "all five named non-conformant samples must have been exercised");
+
+			/*
+			 * Anything else committed under the same prefix is exercised too, so
+			 * that a sixth counter-example added later is covered without this
+			 * case having to change - the named five above are a floor, not a
+			 * ceiling.
 			 */
 			if (switch_dir_open(&dir, FST_XC_FIXTURE_DIR, pool) == SWITCH_STATUS_SUCCESS) {
 				while ((found = switch_dir_next_file(dir, entry, sizeof(entry)))) {
@@ -5560,28 +6274,21 @@ FST_CORE_BEGIN("conf")
 						continue;
 					}
 
-					invalid_files++;
-					switch_snprintf(path, sizeof(path), "%s%s", FST_XC_FIXTURE_DIR, found);
-
-					SWITCH_STANDARD_STREAM(stream);
-					stream.write_function(&stream, "%s '%s'", FST_XC_VAL_PYTHON, FST_XC_VAL_TOOL);
-
-					if (!fst_xc_val_append_arg(&stream, path)) {
-						quoting_failures++;
-						switch_safe_free(stream.data);
+					if (fst_xc_val_index_of(fst_xc_val_required_invalid_json,
+											switch_arraylen(fst_xc_val_required_invalid_json), found) >= 0) {
+						/* already run, by name, above */
 						continue;
 					}
 
-					/*
-					 * Both streams are discarded here, unlike the sweep above:
-					 * these five files are MEANT to be refused, and a passing
-					 * run must not spray the test log with the named violations
-					 * of deliberate counter-examples.  An unexpected verdict is
-					 * logged explicitly instead, naming the file and the code.
-					 */
-					stream.write_function(&stream, "%s", " >/dev/null 2>&1");
-					code = fst_xc_val_run((const char *) stream.data);
-					switch_safe_free(stream.data);
+					invalid_files++;
+					switch_snprintf(path, sizeof(path), "%s%s", FST_XC_FIXTURE_DIR, found);
+
+					code = fst_xc_val_run_one(path, 1);
+
+					if (code == FST_XC_VAL_UNQUOTABLE) {
+						quoting_failures++;
+						continue;
+					}
 
 					if (code != 1) {
 						switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
@@ -5595,16 +6302,6 @@ FST_CORE_BEGIN("conf")
 				dir = NULL;
 
 				fst_xcheck(quoting_failures == 0, "a sample path could not be passed to the validator as a single shell word");
-
-				/*
-				 * The five the contract enumerates: multiple top-level keys, a
-				 * top-level key that is not a bound section name, a non-string
-				 * leaf value, an emitted <document>/<section> envelope, and an
-				 * attribute directly under the root key.  Asserted as a floor
-				 * for the same reason as the parity count - a sample can be
-				 * added, and this case must not have to change when one is.
-				 */
-				fst_xcheck(invalid_files >= 5, "all five committed non-conformant samples must be present and exercised");
 			} else {
 				fst_fail("the fixtures directory could not be enumerated for the non-conformant samples");
 			}

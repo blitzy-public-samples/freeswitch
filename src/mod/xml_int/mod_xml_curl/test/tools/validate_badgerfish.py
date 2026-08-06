@@ -66,8 +66,34 @@ EXIT STATUS
 -----------
     0   every input conforms
     1   at least one input violates the contract
-    2   usage or I/O error (no file, unreadable file, bad option) -- distinct on
-        purpose, so a mistyped path can never be mistaken for a verdict
+    2   usage or I/O error -- distinct on purpose, so a mistyped path can never be
+        mistaken for a verdict. This covers a bad option, a path that names
+        nothing, a file that cannot be read, and three refusals this tool makes
+        deliberately because its input is untrusted: a symbolic link (pass what it
+        resolves to if that is really the intent), anything that is not a regular
+        file (a FIFO, a socket, a device -- none has a bounded body), and a
+        directory whose entries cannot be listed.
+
+SAFETY WITH UNTRUSTED INPUT
+---------------------------
+This tool is pointed at output captured from a gateway, so it treats that output
+as hostile rather than merely malformed. Three properties follow, and each is a
+deliberate refusal rather than a best effort:
+
+  * A body larger than mod_xml_curl's own 1 MiB response ceiling is refused from
+    fstat() before anything is allocated, and again as a bounded read in case the
+    file grew in between.
+  * The decoder's depth, value-count and string-length ceilings are applied to the
+    RAW TEXT in a single pass, BEFORE json.loads() is called, so a document that
+    breaches them is never materialised as an object graph. This mirrors what the
+    module itself does and for the same reason.
+  * Every input is opened exactly once, with O_NOFOLLOW, and judged by fstat() on
+    that same descriptor. Nothing is checked and then reopened, and a directory's
+    entries are opened relative to the descriptor the directory was listed
+    through, so there is no window in which a name could be swapped.
+
+Paths are escaped before they are printed, because a filename may legally contain
+a newline or an ANSI escape and these lines are what a CI report is built from.
 
 OUTPUT
 ------
@@ -76,8 +102,13 @@ Violations go to STDERR, one line per violation, in this exact form:
     <path>: <VIOLATION_NAME>: <human explanation>
 
 VIOLATION_NAME is a stable identifier suitable for grep and for a CI report; the
-explanation names the offending JSON path. Every violation in a file is
-reported, not just the first, so a gateway author can fix a payload in one pass.
+explanation names the offending JSON path. Every violation in a file is reported,
+not just the first, so a gateway author can fix a payload in one pass -- with one
+deliberate exception: a document that is STRUCTURALLY broken (an unterminated
+string, a mismatched bracket, a scalar where the profile allows none, nesting past
+the ceiling) is reported and then abandoned, because past such a point the pass no
+longer knows where it is in the document and every further finding would describe a
+shape it has lost track of.
 STDOUT carries only the per-file "OK" lines that --verbose adds and the final
 summary that --quiet removes, so redirecting stdout to /dev/null still leaves
 every violation visible.
@@ -100,6 +131,7 @@ import errno
 import json
 import os
 import re
+import stat
 import sys
 
 # ---------------------------------------------------------------------------
@@ -136,6 +168,20 @@ MAX_STRING_BYTES = 8192
 MAX_NAME_BYTES = 128
 MAX_TRANSFORMED_NAME_BYTES = MAX_NODES * (MAX_NAME_BYTES + 1)
 
+# The response body ceiling, mirroring XML_CURL_MAX_BYTES (mod_xml_curl.c L76).
+# mod_xml_curl streams a response to a temporary file through a write callback
+# that stops at this many bytes, so a payload larger than this is one the module
+# would never decode at all -- and it is also the bound that makes this validator
+# safe to point at untrusted output. It is applied from fstat() BEFORE anything is
+# allocated, and again as a bounded read, because a file can grow between the two.
+MAX_RESPONSE_BYTES = 1024 * 1024
+
+# How much of a path this tool will echo back. A path arrives from the command
+# line or from a directory listing, so it is untrusted text that ends up in a CI
+# log; render_path() escapes it and this bounds the result, because an escaped
+# rendering of a pathological name can be several times longer than the name.
+MAX_RENDERED_PATH_CHARS = 512
+
 # The provisioning sections mod_xml_curl binds by default, and therefore the
 # only names the single top-level key of a response may carry. The module
 # compares that key against the section the FreeSWITCH core asked the binding
@@ -166,6 +212,60 @@ EXIT_VIOLATION = 1
 EXIT_USAGE = 2
 
 
+def render_path(path):
+    """Render an untrusted path as one line of printable, bounded ASCII.
+
+    Every path this tool echoes comes from the command line or from a directory
+    listing, and a filename may legally contain a carriage return, a newline, an
+    ESC or any other control byte. Emitted verbatim into a CI log those bytes
+    forge structure: a name carrying "\\n" splits one diagnostic into two, and one
+    carrying an ANSI escape rewrites what an operator sees. Since the diagnostic
+    format is "<path>: <NAME>: <explanation>", a forged line is indistinguishable
+    from a real verdict about a different file.
+
+    So the path is escaped rather than printed: backslash first (or the escaping
+    would be ambiguous), then everything outside printable ASCII as a numeric
+    escape. Non-ASCII is escaped too -- a legitimate UTF-8 filename becomes less
+    pretty, which is the right trade for output that cannot be restructured by
+    its own content. The result is bounded, because an escaped rendering can be
+    up to six times the length of what it renders.
+    """
+    if isinstance(path, bytes):
+        text = path.decode("utf-8", "replace")
+    else:
+        text = path
+
+    out = []
+    width = 0
+    truncated = False
+
+    for char in text:
+        code = ord(char)
+
+        if char == "\\":
+            piece = "\\\\"
+        elif 0x20 <= code < 0x7F:
+            piece = char
+        elif code <= 0xFF:
+            piece = "\\x%02x" % (code,)
+        elif code <= 0xFFFF:
+            piece = "\\u%04x" % (code,)
+        else:
+            piece = "\\U%08x" % (code,)
+
+        if width + len(piece) > MAX_RENDERED_PATH_CHARS:
+            truncated = True
+            break
+
+        out.append(piece)
+        width += len(piece)
+
+    if truncated:
+        out.append("...")
+
+    return "".join(out)
+
+
 class Violation(object):
     """One named contract breach, bound to the file and JSON path that caused it.
 
@@ -185,7 +285,9 @@ class Violation(object):
         return (self.path, self.name, self.detail)
 
     def format_line(self):
-        return "%s: %s: %s" % (self.path, self.name, self.detail)
+        # The path is rendered, not interpolated: it is untrusted text and this is
+        # the line a CI report is built from.
+        return "%s: %s: %s" % (render_path(self.path), self.name, self.detail)
 
 
 class DuplicateMemberError(ValueError):
@@ -805,17 +907,380 @@ class DocumentValidator(object):
                               "decoded form" % (span, MAX_STRING_BYTES))
 
 
-def read_document_text(path):
-    """Read one file and return its text, or raise ValueError with a violation name.
+def validate_unicode_escape(text, index):
+    """Validate one \\uXXXX escape at text[index] == 'u'. Returns chars consumed, or 0.
 
-    Mirrors xml_curl_json_read_file() (mod_xml_curl.c L714) for the two things
-    it establishes about the bytes before any parsing happens: the body carries
-    no NUL, and it is well-formed UTF-8. One leading byte order mark is
-    tolerated, exactly as the module's lexical gate tolerates it
-    (mod_xml_curl.c L563-L566).
+    Mirrors xml_curl_json_validate_unicode_escape() (mod_xml_curl.c L520-L559):
+    a high surrogate has to be followed by a \\uXXXX low surrogate, a lone low
+    surrogate is refused, and the resulting code point has to be a legal XML
+    character -- which rules out \\u0000, \\u0008, \\u000c, the rest of C0, and
+    U+FFFE/U+FFFF. Returns the number of characters this escape occupies counting
+    the leading 'u' (5 for a plain escape, 11 for a surrogate pair), so 0 is
+    unambiguously a rejection.
     """
-    with open(path, "rb") as handle:
-        raw = handle.read()
+    if index + 5 > len(text):
+        return 0
+
+    digits = text[index + 1:index + 5]
+
+    for digit in digits:
+        if digit not in "0123456789abcdefABCDEF":
+            return 0
+
+    code = int(digits, 16)
+
+    if 0xD800 <= code <= 0xDBFF:
+        # A high surrogate is only legal as the first half of a pair.
+        if index + 11 > len(text) or text[index + 5] != "\\" or text[index + 6] != "u":
+            return 0
+
+        low_digits = text[index + 7:index + 11]
+
+        for digit in low_digits:
+            if digit not in "0123456789abcdefABCDEF":
+                return 0
+
+        low = int(low_digits, 16)
+
+        if low < 0xDC00 or low > 0xDFFF:
+            return 0
+
+        return 11
+
+    if not is_xml_char(code):
+        return 0
+
+    return 5
+
+
+class LexicalGate(object):
+    """The pre-parse gate: one pass over the raw text, bounding it before json.loads().
+
+    WHY THIS EXISTS AT ALL, AND WHY IT RUNS FIRST
+    ---------------------------------------------
+    This tool is pointed at output captured from a provisioning gateway, which is
+    exactly the untrusted input mod_xml_curl itself refuses to hand to a parser
+    unexamined. json.loads() materialises the complete object graph before any
+    ceiling expressed over the decoded tree can look at it, so a document that
+    breaches every ceiling in the table has already been allocated in full by the
+    time it is measured. Python's own json documentation warns about precisely
+    this. A 1 MiB payload of nested arrays, or of one enormous string, is cheap to
+    send and expensive to decode.
+
+    So the ceilings that CAN be enforced on the raw text are enforced on the raw
+    text, in a single pass with a bounded integer stack, before the parser runs.
+    This is not a Python-specific safety measure bolted on: it is the same gate the
+    module applies, xml_curl_json_validate_text() (mod_xml_curl.c L575-L690), for
+    the same reason and in the same order. The semantic walk that follows now only
+    ever sees a document that is already known to be small, shallow and shaped
+    like the profile.
+
+    WHAT IT BOUNDS
+    --------------
+      * nesting -- every '{' and every '[' pushes a level, ceiling MAX_DEPTH
+      * value count -- every '{', every '[' and every string literal, INCLUDING a
+        member key, counts one; ceiling MAX_VALUES
+      * string length -- measured on the literal as WRITTEN, so an \\uXXXX-heavy
+        literal is charged what it costs on the wire; ceiling MAX_STRING_BYTES
+
+    WHAT IT REFUSES OUTRIGHT
+    ------------------------
+    Anything outside the profile: a number, a boolean, a null, NaN, Infinity, an
+    unterminated string, a mismatched bracket, a raw control byte inside a string,
+    \\b and \\f (which name characters XML forbids), and any other escape.
+
+    Every finding is reported once and the pass continues, so a gateway author sees
+    the whole set rather than the first -- except after a structural error, where
+    the rest of the scan would be describing a document this pass has already lost
+    track of.
+    """
+
+    def __init__(self):
+        self.violations = []
+        self._reported = set()
+        self.structural = False
+
+    def add_once(self, name, detail):
+        if name in self._reported:
+            return
+
+        self._reported.add(name)
+        self.violations.append((name, detail))
+
+    def scan(self, text):
+        """Walk `text` once. Returns the list of (name, detail) findings."""
+        depth = 0
+        stack = []
+        values = 0
+        index = 0
+        length = len(text)
+
+        if not text:
+            self.add_once("INVALID_JSON", "the body is empty; a response has to be a single "
+                                          "well-formed JSON object")
+            return self.violations
+
+        while index < length:
+            char = text[index]
+
+            if char == "{" or char == "[":
+                if depth >= MAX_DEPTH:
+                    self.add_once("MAX_DEPTH_EXCEEDED",
+                                  "structural nesting passes %d levels at character %d; every "
+                                  "JSON object AND every JSON array consumes one level, so the "
+                                  "object/array alternation a repeated-children array needs "
+                                  "costs two levels per element level"
+                                  % (MAX_DEPTH, index))
+                    self.structural = True
+                    return self.violations
+
+                values += 1
+
+                if values > MAX_VALUES:
+                    self.add_once("MAX_VALUES_EXCEEDED",
+                                  "the document passes %d values at character %d, counting every "
+                                  "object, every array and every string including member names"
+                                  % (MAX_VALUES, index))
+                    self.structural = True
+                    return self.violations
+
+                stack.append(char)
+                depth += 1
+                index += 1
+                continue
+
+            if char == "}" or char == "]":
+                expected = "{" if char == "}" else "["
+
+                if not stack or stack[-1] != expected:
+                    self.add_once("INVALID_JSON",
+                                  "the body closes a %s at character %d that was never opened"
+                                  % (char, index))
+                    self.structural = True
+                    return self.violations
+
+                stack.pop()
+                depth -= 1
+                index += 1
+                continue
+
+            if char in ":, \t\r\n":
+                index += 1
+                continue
+
+            if char == '"':
+                index += 1
+                start = index
+                values += 1
+
+                if values > MAX_VALUES:
+                    self.add_once("MAX_VALUES_EXCEEDED",
+                                  "the document passes %d values at character %d, counting every "
+                                  "object, every array and every string including member names"
+                                  % (MAX_VALUES, index))
+                    self.structural = True
+                    return self.violations
+
+                while index < length and text[index] != '"':
+                    if text[index] == "\\":
+                        if index + 1 >= length:
+                            self.add_once("INVALID_JSON",
+                                          "the body ends inside an escape sequence at character %d"
+                                          % (index,))
+                            self.structural = True
+                            return self.violations
+
+                        following = text[index + 1]
+
+                        if following in '"\\/nrt':
+                            index += 2
+                            continue
+
+                        if following == "u":
+                            consumed = validate_unicode_escape(text, index + 1)
+
+                            if not consumed:
+                                self.add_once("INVALID_TEXT_VALUE",
+                                              "the escape at character %d does not name a "
+                                              "character that may appear in XML character data; "
+                                              "a lone surrogate, \\\\u0000, \\\\u0008, \\\\u000c, "
+                                              "another C0 control or U+FFFE/U+FFFF is refused "
+                                              "before the parser sees it" % (index,))
+                                self.structural = True
+                                return self.violations
+
+                            index += 1 + consumed
+                            continue
+
+                        self.add_once("INVALID_TEXT_VALUE",
+                                      "the escape \\\\%s at character %d is not usable: \\\\b and "
+                                      "\\\\f name characters XML forbids, and anything else is not "
+                                      "a JSON escape at all" % (following, index))
+                        self.structural = True
+                        return self.violations
+
+                    if ord(text[index]) < 0x20:
+                        self.add_once("INVALID_JSON",
+                                      "a raw control byte U+%04X appears inside the string "
+                                      "literal at character %d; JSON requires it to be escaped"
+                                      % (ord(text[index]), index))
+                        self.structural = True
+                        return self.violations
+
+                    index += 1
+
+                if index >= length:
+                    self.add_once("INVALID_JSON",
+                                  "the string literal opened at character %d is never terminated"
+                                  % (start - 1,))
+                    self.structural = True
+                    return self.violations
+
+                span = len(text[start:index].encode("utf-8", "surrogatepass"))
+
+                if span > MAX_STRING_BYTES:
+                    self.add_once("MAX_VALUE_BYTES_EXCEEDED",
+                                  "a JSON string literal spans %d encoded bytes; the ceiling is "
+                                  "%d, measured on the literal as written rather than on its "
+                                  "decoded form" % (span, MAX_STRING_BYTES))
+
+                index += 1
+                continue
+
+            # Anything else is outside the profile. A digit, a sign, a period, or the
+            # first letter of true/false/null/NaN/Infinity: all of them are scalars the
+            # translation has no representation for, and all of them are refused before
+            # the parser's number scanner can be reached.
+            token = text[index:index + 12].split(",")[0].split("}")[0].split("]")[0].strip()
+
+            self.add_once("NON_STRING_LEAF",
+                          "the token %r at character %d is neither an object, an array nor a "
+                          "string; every leaf value must be a JSON string, because the builders "
+                          "the translation uses take a const char * and a JSON number has no "
+                          "guaranteed lexical round trip" % (token or char, index))
+            self.structural = True
+            return self.violations
+
+        if depth != 0:
+            self.add_once("INVALID_JSON",
+                          "the body ends with %d container(s) still open" % (depth,))
+            self.structural = True
+            return self.violations
+
+        if values == 0:
+            self.add_once("INVALID_JSON",
+                          "the body carries no JSON value at all")
+            self.structural = True
+
+        return self.violations
+
+
+class InputRef(object):
+    """One thing to validate, named the way it will be OPENED rather than re-resolved.
+
+    THE POINT OF THIS CLASS
+    -----------------------
+    An earlier shape of this tool decided what a path was with os.path.isdir() and
+    os.path.isfile(), and then opened it again later. Those two steps are separated
+    in time and all three of those predicates follow symbolic links, so an attacker
+    who controls a capture directory can let the check see a plain .json file and
+    the open see something else entirely -- a symlink out of the directory, a FIFO
+    that blocks forever, a character device with no end. That is CWE-367, and the
+    fix is not a better check: it is to stop checking and reopening.
+
+    So a directory argument is OPENED once, as a directory, and every entry inside
+    it is opened relative to THAT descriptor with dir_fd. A single entry name has no
+    intermediate components, so there is nothing left to swap: the name resolves
+    inside the directory this tool enumerated and nowhere else. A file argument is
+    opened once, by the path the caller gave.
+
+    `dir_fd` is None for a directly named path, and otherwise the descriptor the
+    entry belongs to; `name` is what is passed to os.open(); `display` is the path a
+    human recognises and is only ever used for output.
+    """
+
+    __slots__ = ("dir_fd", "name", "display")
+
+    def __init__(self, dir_fd, name, display):
+        self.dir_fd = dir_fd
+        self.name = name
+        self.display = display
+
+
+def read_document_text(ref, max_response_bytes=MAX_RESPONSE_BYTES):
+    """Acquire and read one input, returning its text.
+
+    Raises ValueError((NAME, detail)) for a body that is unusable as a document,
+    and EnvironmentError for something that could not be read at all -- the caller
+    turns the first into a conformance verdict and the second into the I/O exit
+    status, because a mistyped path must never look like a refused payload.
+
+    THREE THINGS HAPPEN HERE IN THIS ORDER, AND THE ORDER IS THE SAFETY
+    ------------------------------------------------------------------
+    1. ONE open. O_NOFOLLOW so a symbolic link at the final component is refused
+       rather than followed; O_CLOEXEC so the descriptor cannot leak; O_NONBLOCK so
+       that a FIFO left in a capture directory returns immediately instead of
+       blocking this process until somebody writes to it.
+    2. fstat on THAT descriptor -- not a stat on the path, which would be a second
+       resolution -- and then two refusals before a single byte is allocated: it has
+       to be a regular file, and it has to be no larger than the response ceiling
+       mod_xml_curl itself enforces. A character device or a directory would
+       otherwise be read until memory ran out.
+    3. A BOUNDED read from that same descriptor, of at most the ceiling plus one
+       byte. The extra byte is not slack: st_size is a snapshot, and a file that
+       grows between the fstat and the read would otherwise slip past the ceiling.
+       Receiving that byte is itself the refusal.
+
+    The two things the module establishes about the bytes are then established here
+    too, mirroring xml_curl_json_read_file() (mod_xml_curl.c L714): no NUL anywhere,
+    and well-formed UTF-8. One leading byte order mark is tolerated, exactly as the
+    module's lexical gate tolerates it (mod_xml_curl.c L563-L566).
+    """
+    flags = os.O_RDONLY | os.O_CLOEXEC
+
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+
+    try:
+        if ref.dir_fd is None:
+            handle = os.open(ref.name, flags)
+        else:
+            handle = os.open(ref.name, flags, dir_fd=ref.dir_fd)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise EnvironmentError(errno.ELOOP,
+                                   "refusing to read a symbolic link; pass the file it resolves to "
+                                   "if that is really what should be validated")
+        raise EnvironmentError(error.errno, os.strerror(error.errno) if error.errno else str(error))
+
+    try:
+        info = os.fstat(handle)
+
+        if not stat.S_ISREG(info.st_mode):
+            raise EnvironmentError(errno.EINVAL,
+                                   "not a regular file; a directory, a FIFO, a socket or a device "
+                                   "has no bounded body to validate")
+
+        if info.st_size > max_response_bytes:
+            raise ValueError(("MAX_RESPONSE_BYTES_EXCEEDED",
+                              "the body is %d bytes; mod_xml_curl stops streaming a response at "
+                              "%d bytes (XML_CURL_MAX_BYTES, or response-max-bytes for the "
+                              "binding), so a payload this large is one the module would never "
+                              "decode" % (info.st_size, max_response_bytes)))
+
+        raw = read_bounded(handle, max_response_bytes + 1)
+    finally:
+        os.close(handle)
+
+    if len(raw) > max_response_bytes:
+        raise ValueError(("MAX_RESPONSE_BYTES_EXCEEDED",
+                          "the body exceeds %d bytes; mod_xml_curl stops streaming a response at "
+                          "that many (XML_CURL_MAX_BYTES, or response-max-bytes for the binding), "
+                          "so a payload this large is one the module would never decode"
+                          % (max_response_bytes,)))
 
     if b"\x00" in raw:
         raise ValueError(("EMBEDDED_NUL",
@@ -834,17 +1299,89 @@ def read_document_text(path):
                           % (error.reason, error.start)))
 
 
-def validate_file(path, sections):
-    """Validate one file. Returns a list of Violation, empty when it conforms.
+def read_bounded(handle, limit):
+    """Read at most `limit` bytes from an open descriptor.
 
-    Raises EnvironmentError for an unreadable file, which the caller turns into
-    the usage/I/O exit status rather than a conformance verdict.
+    os.read() may return fewer bytes than asked for without meaning end of file, so
+    a single call cannot establish either the content or the size. The loop stops on
+    a genuine end of file or when the limit is reached -- never on a short count,
+    and never without a limit. EINTR is retried because an interrupted read is not
+    a data error; EAGAIN ends the read because O_NONBLOCK is set and a regular file
+    that answers EAGAIN has nothing more to give this call.
     """
+    chunks = []
+    total = 0
+
+    while total < limit:
+        try:
+            chunk = os.read(handle, min(65536, limit - total))
+        except OSError as error:
+            if error.errno == errno.EINTR:
+                continue
+            if error.errno in (errno.EAGAIN, getattr(errno, "EWOULDBLOCK", errno.EAGAIN)):
+                break
+            raise EnvironmentError(error.errno, os.strerror(error.errno) if error.errno else str(error))
+
+        if not chunk:
+            break
+
+        chunks.append(chunk)
+        total += len(chunk)
+
+    return b"".join(chunks)
+
+
+def validate_file(ref, sections, max_response_bytes=MAX_RESPONSE_BYTES):
+    """Validate one input. Returns a list of Violation, empty when it conforms.
+
+    Raises EnvironmentError for something that could not be read at all, which the
+    caller turns into the usage/I/O exit status rather than a conformance verdict.
+
+    THE ORDER OF THE THREE STAGES IS LOAD BEARING
+    ---------------------------------------------
+      1. Acquire and read, bounded by the module's own response ceiling.
+      2. The LEXICAL GATE, over the raw text, before json.loads(). Nothing that
+         allocates in proportion to the document's shape runs before this, so a
+         hostile payload is refused while it is still just a bounded string.
+      3. Only then the parse and the semantic walk, which are safe precisely because
+         the gate has already established the document is shallow, small and made of
+         nothing but objects, arrays and strings.
+
+    Stage 2 short-circuits stages 3 when it finds a STRUCTURAL problem, because past
+    one the pass no longer knows where it is in the document and every further finding
+    would be describing a shape it has lost track of. A ceiling breach that is not
+    structural -- an over-long string literal -- is reported and the walk still runs,
+    so a gateway author gets the whole picture where a whole picture exists.
+    """
+    path = ref.display
+
     try:
-        text = read_document_text(path)
+        text = read_document_text(ref, max_response_bytes)
     except ValueError as error:
         name, detail = error.args[0]
         return [Violation(path, name, detail)]
+
+    gate = LexicalGate()
+
+    try:
+        found = gate.scan(text)
+    except MemoryError:
+        # The final fail-closed safeguard. The ceilings above make this
+        # unreachable for any input this tool will accept -- the body is already
+        # bounded at MAX_RESPONSE_BYTES and this pass allocates a stack bounded at
+        # MAX_DEPTH -- but running out of memory must produce a verdict rather than
+        # a traceback, because a traceback on stderr next to an exit code of 1 is
+        # indistinguishable from a refused payload.
+        return [Violation(path, "RESOURCE_EXHAUSTED",
+                          "the body exhausted memory before it could be measured; it is refused")]
+
+    if found:
+        violations = [Violation(path, name, detail) for name, detail in found]
+
+        if gate.structural:
+            return violations
+    else:
+        violations = []
 
     try:
         document = json.loads(text, object_pairs_hook=object_pairs_hook,
@@ -852,30 +1389,37 @@ def validate_file(path, sections):
     except DuplicateMemberError as error:
         # Reported on its own because the parse cannot continue past it, and
         # because the fix -- use an array -- is specific.
-        return [Violation(path, "DUPLICATE_MEMBER",
-                          "an object repeats the member name %r; cJSON preserves both, so "
-                          "the document a producer validated and the tree mod_xml_curl "
-                          "builds could disagree. Express repetition with an array instead"
-                          % (error.key,))]
+        violations.append(Violation(path, "DUPLICATE_MEMBER",
+                                    "an object repeats the member name %r; cJSON preserves both, so "
+                                    "the document a producer validated and the tree mod_xml_curl "
+                                    "builds could disagree. Express repetition with an array instead"
+                                    % (error.key,)))
+        return violations
     except NonStringConstantError as error:
-        return [Violation(path, "NON_STRING_LEAF",
-                          "the payload carries the token %s, which is neither JSON nor a "
-                          "string; every leaf value must be a JSON string" % (error.token,))]
+        violations.append(Violation(path, "NON_STRING_LEAF",
+                                    "the payload carries the token %s, which is neither JSON nor a "
+                                    "string; every leaf value must be a JSON string" % (error.token,)))
+        return violations
     except ValueError as error:
         # Not well-formed JSON at all, or well-formed with trailing bytes.
         # mod_xml_curl requires the parse to land exactly on the terminator, so
         # a document of "{...}GARBAGE" is refused rather than truncated.
-        return [Violation(path, "INVALID_JSON",
-                          "the body is not a single well-formed JSON value: %s"
-                          % (error,))]
+        violations.append(Violation(path, "INVALID_JSON",
+                                    "the body is not a single well-formed JSON value: %s"
+                                    % (error,)))
+        return violations
     except RecursionError:
-        # Only a document nested hundreds of levels deep can exhaust the
-        # interpreter's stack, and such a document breaches MAX_DEPTH many
-        # times over. Reporting the ceiling it actually breaches is both the
-        # true verdict and the one a gateway author can act on.
-        return [Violation(path, "MAX_DEPTH_EXCEEDED",
-                          "the document is nested far past the ceiling of %d levels -- deep "
-                          "enough that it cannot be walked at all" % (MAX_DEPTH,))]
+        # Unreachable now that the gate bounds nesting at MAX_DEPTH before the
+        # parser runs, and kept because "unreachable" is a claim about today's
+        # ceilings: a raised MAX_DEPTH must not turn into a traceback.
+        violations.append(Violation(path, "MAX_DEPTH_EXCEEDED",
+                                    "the document is nested far past the ceiling of %d levels -- deep "
+                                    "enough that it cannot be walked at all" % (MAX_DEPTH,)))
+        return violations
+    except MemoryError:
+        violations.append(Violation(path, "RESOURCE_EXHAUSTED",
+                                    "the body exhausted memory while being parsed; it is refused"))
+        return violations
 
     validator = DocumentValidator(path, sections)
 
@@ -885,63 +1429,122 @@ def validate_file(path, sections):
         validator.add("MAX_DEPTH_EXCEEDED",
                       "the document is nested far past the ceiling of %d levels -- deep "
                       "enough that it cannot be walked in full" % (MAX_DEPTH,))
+    except MemoryError:
+        validator.add("RESOURCE_EXHAUSTED",
+                      "the body exhausted memory while being walked; it is refused")
 
     validator.check_encoded_string_spans(text)
 
-    return validator.violations
+    return violations + validator.violations
 
 
-def collect_inputs(arguments):
-    """Expand the command line into a sorted, de-duplicated list of files.
+def open_directory(argument):
+    """Open `argument` as a directory, or return None when it is not one.
 
-    A directory contributes its *.json entries, non-recursively and sorted, so
-    that two runs over the same tree report in the same order. A file is taken
-    as given whatever its extension, because a captured gateway response is
-    often named for the request that produced it.
+    O_DIRECTORY makes the kernel decide, in the same syscall that opens it, whether
+    this is a directory -- which replaces an os.path.isdir() that would have to be
+    followed by a separate open. ENOTDIR means "not a directory" and is the caller's
+    signal to treat it as a file; everything else is a genuine error and is raised.
+
+    O_NOFOLLOW means a symbolic link is refused here as well, which is deliberate and
+    symmetric with files: this tool declines to decide on behalf of its caller that a
+    link should be followed into somewhere else. ELOOP is reported as exactly that.
     """
-    files = []
+    flags = os.O_RDONLY | os.O_CLOEXEC
+
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    try:
+        return os.open(argument, flags)
+    except OSError as error:
+        if error.errno == errno.ENOTDIR:
+            return None
+
+        if error.errno == errno.ELOOP:
+            raise EnvironmentError("refusing to follow the symbolic link %s; pass the directory or "
+                                   "file it resolves to if that is what should be validated"
+                                   % (render_path(argument),))
+
+        raise EnvironmentError("cannot open %s: %s"
+                               % (render_path(argument),
+                                  os.strerror(error.errno) if error.errno else error))
+
+
+def collect_inputs(arguments, open_dirs):
+    """Expand the command line into a sorted, de-duplicated list of InputRef.
+
+    A directory contributes its *.json entries, non-recursively and sorted, so that
+    two runs over the same tree report in the same order. A file is taken as given
+    whatever its extension, because a captured gateway response is often named for
+    the request that produced it.
+
+    NOTHING IS RESOLVED TWICE
+    -------------------------
+    A directory is opened ONCE and its descriptor is kept in `open_dirs` for the
+    caller to close; every entry it contributes is recorded against that descriptor
+    and later opened relative to it. There is therefore no window in which a
+    directory could be replaced between being listed and being read, and no entry
+    name is ever resolved through a path a second time. scandir() is given the
+    descriptor rather than the path for the same reason.
+
+    An entry that is itself a symbolic link is not filtered out here, and that is not
+    an oversight: filtering would mean asking about it now and opening it later, which
+    is the split this shape exists to remove. It is refused at open time instead, by
+    O_NOFOLLOW, where the refusal is atomic with the decision.
+    """
+    refs = []
     seen = set()
 
     for argument in arguments:
-        if os.path.isdir(argument):
+        dir_fd = open_directory(argument)
+
+        if dir_fd is not None:
+            open_dirs.append(dir_fd)
+
             try:
-                entries = sorted(os.listdir(argument))
+                entries = sorted(entry.name for entry in os.scandir(dir_fd))
             except OSError as error:
-                raise EnvironmentError("cannot list directory %s: %s" % (argument, error))
+                raise EnvironmentError("cannot list directory %s: %s"
+                                       % (render_path(argument),
+                                          os.strerror(error.errno) if error.errno else error))
 
             found = False
 
-            for entry in entries:
-                if not entry.endswith(".json"):
+            for name in entries:
+                if not name.endswith(".json"):
                     continue
 
-                candidate = os.path.join(argument, entry)
-
-                if not os.path.isfile(candidate):
-                    continue
+                display = os.path.join(argument, name)
 
                 found = True
 
-                if candidate not in seen:
-                    seen.add(candidate)
-                    files.append(candidate)
+                if display in seen:
+                    continue
+
+                seen.add(display)
+                refs.append(InputRef(dir_fd, name, display))
 
             if not found:
-                raise EnvironmentError("no *.json file found in directory %s" % (argument,))
+                raise EnvironmentError("no *.json file found in directory %s"
+                                       % (render_path(argument),))
 
             continue
 
-        if not os.path.exists(argument):
-            raise EnvironmentError("no such file or directory: %s" % (argument,))
+        # Not a directory. It is opened, fstat'ed and refused or read in one place,
+        # read_document_text(), so nothing is decided about it here -- not even
+        # whether it exists. A path that names nothing surfaces there as an I/O
+        # error, which is the exit status a mistyped path has to produce.
+        if argument in seen:
+            continue
 
-        if not os.path.isfile(argument):
-            raise EnvironmentError("not a regular file: %s" % (argument,))
+        seen.add(argument)
+        refs.append(InputRef(None, argument, argument))
 
-        if argument not in seen:
-            seen.add(argument)
-            files.append(argument)
-
-    return files
+    return refs
 
 
 def parse_sections(value):
@@ -963,6 +1566,26 @@ def parse_sections(value):
                 "synthesises" % (section,))
 
     return tuple(sections)
+
+
+def parse_response_ceiling(value):
+    """Turn a --max-response-bytes value into a positive integer.
+
+    A ceiling of zero or less is not a smaller ceiling, it is a validator that refuses
+    everything, so it is a usage error rather than a very strict run. The module's own
+    parameter behaves the same way: do_config() rejects a negative response-max-bytes
+    with an error rather than adopting it.
+    """
+    try:
+        parsed = int(value, 10)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError("%r is not an integer number of bytes" % (value,))
+
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("the response ceiling must be a positive number of "
+                                         "bytes, not %r" % (value,))
+
+    return parsed
 
 
 def build_parser():
@@ -993,11 +1616,20 @@ the contract, in one screen:
 exit status:
   0  every input conforms
   1  at least one input violates the contract
-  2  usage or I/O error, so a mistyped path is never read as a verdict
+  2  usage or I/O error, so a mistyped path is never read as a verdict.  A symbolic
+     link, a FIFO, a socket, a device and an unlistable directory are refused here
+     too: this tool reads untrusted output and declines to follow or block on
+     anything that is not a plain file it opened itself
+
+limits, all mirroring mod_xml_curl:
+  a body over 1 MiB is refused before it is read; nesting past 32 levels, more than
+  50000 values and a string literal over 8192 encoded bytes are refused before the
+  JSON is parsed at all
 
 output:
   one line per violation on stderr, as "<path>: <VIOLATION_NAME>: <explanation>";
-  every violation in a file is reported, not just the first
+  every violation in a file is reported, not just the first, except that a
+  structurally broken document is reported and then abandoned
 
 examples:
   validate_badgerfish.py response.json
@@ -1017,6 +1649,13 @@ one per rule.
                         help="comma-separated provisioning section names the single "
                              "top-level key may carry (default: %s)"
                              % (",".join(DEFAULT_SECTIONS),))
+    parser.add_argument("--max-response-bytes", metavar="N", type=parse_response_ceiling,
+                        default=MAX_RESPONSE_BYTES,
+                        help="the response-body ceiling to judge against, in bytes "
+                             "(default: %d, mod_xml_curl's own XML_CURL_MAX_BYTES). Mirrors the "
+                             "per-binding response-max-bytes parameter, so a gateway whose "
+                             "binding raises the cap can be judged against the cap it will "
+                             "actually meet" % (MAX_RESPONSE_BYTES,))
     parser.add_argument("--verbose", action="store_true",
                         help="also print one OK line per conformant file on stdout")
     parser.add_argument("--quiet", action="store_true",
@@ -1027,47 +1666,66 @@ one per rule.
 
 
 def main(argv):
-    """Run the validator. Returns the process exit status."""
+    """Run the validator. Returns the process exit status.
+
+    Every path this function prints goes through render_path(), including the ones
+    inside a Violation, because a filename is untrusted text and these lines are what
+    a CI report is assembled from.
+
+    The directory descriptors collect_inputs() opened are closed here rather than
+    there: they have to outlive the collection, since every entry is opened relative
+    to the descriptor its directory was enumerated through, and that is what leaves no
+    window for a directory to be swapped mid-run.
+    """
     parser = build_parser()
     options = parser.parse_args(argv)
+    open_dirs = []
 
     try:
-        files = collect_inputs(options.inputs)
-    except EnvironmentError as error:
-        sys.stderr.write("validate_badgerfish.py: %s\n" % (error,))
-        return EXIT_USAGE
-
-    violations = 0
-    conformant = 0
-
-    for path in files:
         try:
-            found = validate_file(path, options.sections)
+            files = collect_inputs(options.inputs, open_dirs)
         except EnvironmentError as error:
-            sys.stderr.write("validate_badgerfish.py: cannot read %s: %s\n"
-                             % (path, os.strerror(error.errno) if error.errno else error))
+            sys.stderr.write("validate_badgerfish.py: %s\n" % (error,))
             return EXIT_USAGE
 
-        if found:
-            violations += len(found)
+        violations = 0
+        conformant = 0
 
-            for violation in found:
-                sys.stderr.write("%s\n" % (violation.format_line(),))
-        else:
-            conformant += 1
+        for ref in files:
+            try:
+                found = validate_file(ref, options.sections, options.max_response_bytes)
+            except EnvironmentError as error:
+                sys.stderr.write("validate_badgerfish.py: cannot read %s: %s\n"
+                                 % (render_path(ref.display),
+                                    error.strerror if error.strerror else error))
+                return EXIT_USAGE
 
-            if options.verbose:
-                sys.stdout.write("%s: OK\n" % (path,))
+            if found:
+                violations += len(found)
 
-    if not options.quiet:
-        sys.stdout.write("validate_badgerfish.py: %d of %d file(s) conform to the "
-                         "BadgerFish contract, %d violation(s) reported\n"
-                         % (conformant, len(files), violations))
+                for violation in found:
+                    sys.stderr.write("%s\n" % (violation.format_line(),))
+            else:
+                conformant += 1
 
-    sys.stderr.flush()
-    sys.stdout.flush()
+                if options.verbose:
+                    sys.stdout.write("%s: OK\n" % (render_path(ref.display),))
 
-    return EXIT_VIOLATION if violations else EXIT_CONFORMANT
+        if not options.quiet:
+            sys.stdout.write("validate_badgerfish.py: %d of %d file(s) conform to the "
+                             "BadgerFish contract, %d violation(s) reported\n"
+                             % (conformant, len(files), violations))
+
+        sys.stderr.flush()
+        sys.stdout.flush()
+
+        return EXIT_VIOLATION if violations else EXIT_CONFORMANT
+    finally:
+        for handle in open_dirs:
+            try:
+                os.close(handle)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

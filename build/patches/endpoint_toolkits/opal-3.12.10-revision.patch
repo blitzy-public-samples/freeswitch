@@ -1,0 +1,31 @@
+OPAL 3.12.10: give the generated revision header a revision
+
+make/toplevel.mak generates revision.h from revision.h.in by extracting a number
+out of the file's Subversion $Revision$ keyword.  These sources are consumed from
+a git mirror, where that keyword is never expanded, so the extraction yields
+nothing and the generated header reads `#define SVN_REVISION` with no value -
+which makes OpalGetVersion() in src/opal/manager.cxx a syntax error.
+
+Seeding the keyword with 0 makes the generated header read
+`#define SVN_REVISION 0`, which is what the retained source tree that produced
+this project's installed OPAL carried.  0 rather than an invented number: the
+value only reaches OpalGetVersion()'s "(svn:%u)" suffix, and a git mirror has no
+Subversion revision to report honestly.  This is the same repair the pinned
+PTLib needs, for the same reason, in its own copy of the same mechanism.
+
+Applies to: a9091f39fcb16f66da2b1134646f341a741a1d15 (branch v3_12)
+Upstream:   https://git.code.sf.net/p/opalvoip/opal
+
+diff --git a/revision.h.in b/revision.h.in
+index f6e13d0..2b06df8 100644
+--- a/revision.h.in
++++ b/revision.h.in
+@@ -22,7 +22,7 @@
+  *
+  * Contributor(s): ______________________________________.
+  *
+- * $Revision$
++ * $Revision: 0 $
+  * $Author$
+  * $Date$
+  */
