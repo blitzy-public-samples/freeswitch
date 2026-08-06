@@ -196,6 +196,53 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_opal_shutdown);
 SWITCH_END_EXTERN_C
 
 /*
+ * LeakSanitizer suppressions for the OPAL toolkit's own start-up allocations.
+ *
+ * libasan declares __lsan_default_suppressions() as a weak symbol and calls it
+ * once, before main(), to obtain suppressions that travel WITH the binary rather
+ * than with an environment variable.  That property is the whole reason this is a
+ * function rather than a file plus LSAN_OPTIONS: this suite is run three different
+ * ways - automake's driver during `make check', a direct libtool-wrapper
+ * invocation, and tests/unit/test.sh - and only two of those three can be given an
+ * environment.  A suppression that applies in one lane and not the others is worse
+ * than none, because it makes the verdict depend on how the suite was started.
+ *
+ * WHAT is suppressed, and why it is not this tree's leak to fix.  PTLib and OPAL
+ * install their device and NAT-method plugin factories from _dl_init static
+ * initialisers, i.e. while the dynamic loader is still bringing the shared objects
+ * up and before any FreeSWITCH code has run.  Those factory singletons are never
+ * torn down, so LSan reports them at every exit, and the whole set is reachable
+ * through exactly one frame:
+ *
+ *   PDevicePluginAdapter<PNatMethod>::CreateFactory         libpt  (96 B / 4)
+ *   PDevicePluginAdapter<PSoundChannel>::CreateFactory      libpt  (48 B / 2)
+ *   PDevicePluginAdapter<PVideoInputDevice>::CreateFactory  libpt  (72 B / 3)
+ *   PDevicePluginAdapter<PVideoOutputDevice>::CreateFactory libpt  (24 B / 1)
+ *
+ * The total (240 bytes in 10 allocations) is invariant to which test cases run,
+ * which is the measurement that establishes it as pre-main() and toolkit-owned.
+ * Not one frame names a FreeSWITCH artefact.
+ *
+ * WHY the template is this narrow.  It matches one class template's factory
+ * constructor, not a library, not a file and not a namespace, so any leak this
+ * suite or mod_opal itself introduces is still reported and still fails the run.
+ * Suppressing by module (`leak:libpt.so') would have silenced genuine leaks in
+ * every PTLib and OPAL call the module makes, which is precisely the coverage this
+ * suite exists to provide.
+ *
+ * The visibility attribute is load-bearing, not decoration: the tree compiles with
+ * -fvisibility=hidden (SWITCH_AM_CXXFLAGS), under which this definition would be
+ * absent from the executable's .dynsym, libasan would keep its own empty weak
+ * default, and the suppression would silently do nothing while looking correct in
+ * the source.  Verify with ASAN_OPTIONS=print_suppressions=1, which lists the
+ * template and the bytes it accounted for.
+ */
+extern "C" __attribute__((visibility("default"))) const char *__lsan_default_suppressions(void)
+{
+	return "leak:PDevicePluginAdapter\n";
+}
+
+/*
  * The endpoint interface name registered by FSManager::Initialise().  The
  * module's own ModuleName constant has internal linkage, so the expected value
  * is spelled out here.  It is "opal", never "mod_opal".
@@ -1300,6 +1347,26 @@ static void test_opal_skip_run(const char *reason)
 }
 
 /*
+ * How long to keep trying for the IAX2 default port before giving up and skipping, and how
+ * often to look.
+ *
+ * The wait exists because the only realistic reason this suite cannot take the port is that
+ * another copy of this same suite is running concurrently - two clones of the tree on one
+ * host, or a `make check' overlapping a direct run - and that holder releases the port within
+ * the fraction of a second its own manager cases take.  Waiting converts that from a skip into
+ * a pass; without it, concurrency alone produces exit 77, which this tree does not accept from
+ * any test.  The bound is what keeps a genuinely permanent holder - something outside this
+ * tree owning UDP 4569 for good - from turning into a hang: after it expires the run still
+ * skips, with the same status and the same explanation as before.
+ */
+#define TEST_OPAL_CONTAINMENT_WAIT_MS 15000
+#define TEST_OPAL_CONTAINMENT_POLL_MS 250
+
+/* Defined below, and used by the wait loop as its QUIET probe: unlike an acquire attempt it
+ * logs nothing, so polling with it does not fill the log with one refusal per attempt. */
+static switch_bool_t test_opal_udp_port_is_bindable(const char *ip, switch_port_t port);
+
+/*
  * Containment or skip - what every case that constructs an FSManager calls before it does so.
  *
  * Returns only when this process holds the IAX2 default port.  It is deliberately not an
@@ -1307,15 +1374,47 @@ static void test_opal_skip_run(const char *reason)
  * means the port is owned elsewhere, which is a property of the host rather than of the module
  * under test.  Consulted per case, not once for the suite, so no re-ordering can leave a
  * manager built without it.
+ *
+ * A first refusal is not final, though, so it is retried under a bound before the run is
+ * abandoned.  Nothing about the containment invariant is relaxed by waiting: every attempt is
+ * the same full acquire, success still means THIS process holds the socket, and the
+ * check-then-use gap stays closed because the loop never reports success on the strength of
+ * the probe alone - the probe only decides when it is worth attempting an acquire at all.
  */
 static void test_opal_require_containment_or_skip(void)
 {
+	int waited_ms;
+
 	if (test_opal_iax2_containment_in_effect()) {
 		return;
 	}
 
-	test_opal_skip_run("the IAX2 default UDP port could not be taken on loopback, so the containment an "
-					   "FSManager's unconditional IAX2 listener requires cannot be established");
+	/* The first acquire has already failed and already said why, naming the port and the
+	 * holder condition, so the wait itself is announced once and then stays silent. */
+	switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
+					  "IAX2 containment guard will retry %s:%d for up to %d ms before skipping the run, in case the "
+					  "current holder is another copy of this suite that is about to release it\n",
+					  TEST_OPAL_GUARD_ADDRESS, (int) IAX2EndPoint::DefaultUdpPort, TEST_OPAL_CONTAINMENT_WAIT_MS);
+
+	for (waited_ms = 0; waited_ms < TEST_OPAL_CONTAINMENT_WAIT_MS; waited_ms += TEST_OPAL_CONTAINMENT_POLL_MS) {
+		switch_yield(TEST_OPAL_CONTAINMENT_POLL_MS * 1000);
+
+		/* Still owned by someone else - say nothing and look again. */
+		if (!test_opal_udp_port_is_bindable(TEST_OPAL_GUARD_ADDRESS, (switch_port_t) IAX2EndPoint::DefaultUdpPort)) {
+			continue;
+		}
+
+		if (test_opal_iax2_containment_in_effect()) {
+			switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE,
+							  "IAX2 containment guard took %s:%d after waiting %d ms for the previous holder to release it\n",
+							  TEST_OPAL_GUARD_ADDRESS, (int) IAX2EndPoint::DefaultUdpPort,
+							  waited_ms + TEST_OPAL_CONTAINMENT_POLL_MS);
+			return;
+		}
+	}
+
+	test_opal_skip_run("the IAX2 default UDP port could not be taken on loopback within the retry window, so the "
+					   "containment an FSManager's unconditional IAX2 listener requires cannot be established");
 }
 
 /*
@@ -2426,7 +2525,7 @@ static void test_opal_suite_state_cleanup(void)
  *   - POSITIVELY, in the module-load case: a successful mod_opal_load() must leave the
  *     reservation held under exactly this name, with this module's own name as its value.
  *     A module that reserved some other name would leave this one unset.
- *   - NEGATIVELY, in case 10: a reservation planted under exactly this name must make
+ *   - NEGATIVELY, in case 11: a reservation planted under exactly this name must make
  *     mod_opal_load() refuse.  A module reading some other name would not see it and the
  *     load would succeed.
  *
@@ -2500,10 +2599,14 @@ SWITCH_END_EXTERN_C
  *      observes a fully initialised module and its result is asserted rather than
  *      discarded, and so that its two extra duties come last: proving the case before it
  *      orphaned no configuration provider, and running the suite's unconditional sweep;
- *   9. coload_guard_refuses_when_sibling_is_loaded - the OOS-9 refusal reached through the
+ *   9. coload_reservation_outlives_the_unloaded_module - immediately after the shutdown it
+ *      observes: the OOS-9 claim must survive it, because the PTLib runtime stays mapped.
+ *      This is the property whose absence let `load; unload; load the sibling' reach the
+ *      crash;
+ *  10. coload_guard_refuses_when_sibling_is_loaded - the OOS-9 refusal reached through the
  *      module hash, which needs a shut-down module and adds no state for case 8's sweep
  *      to release.
- *  10. coload_reservation_refuses_a_reserved_ptlib_runtime - last; the OOS-9 refusal
+ *  11. coload_reservation_refuses_a_reserved_ptlib_runtime - last; the OOS-9 refusal
  *      reached through the ATOMIC reservation instead, which is the branch a concurrent
  *      load takes and which the module hash cannot express.
  */
@@ -2636,7 +2739,7 @@ FST_CORE_BEGIN("conf_opal")
 			 * provenance handshake proves it came from the parent of this run.  Helper mode
 			 * _exit()s from inside this first case, so a top-level run that entered it on an
 			 * inherited or stale marker alone would run one case, exit with that case's
-			 * status, and be recorded as a clean pass with the nine later cases never run.
+			 * status, and be recorded as a clean pass with the ten later cases never run.
 			 *
 			 * A marker without valid provenance is therefore a hard refusal rather than a
 			 * fallback to an ordinary run: the marker's presence also disarms the spawn
@@ -3304,7 +3407,7 @@ FST_CORE_BEGIN("conf_opal")
 				 * with `modname' as the value (mod_opal.cpp:169), so the variable this
 				 * suite spells out independently must now read back as "mod_opal".  If
 				 * the module's spelling ever moves, this reads NULL and says so - which
-				 * is the check case 10 cannot make, because an unset reservation is
+				 * is the check case 11 cannot make, because an unset reservation is
 				 * indistinguishable from a correctly released one there. */
 				reservation_holder = switch_core_get_variable_dup(TEST_OPAL_PTLIB_RESERVATION);
 				fst_xcheck(reservation_holder != NULL && !strcmp(reservation_holder, TEST_OPAL_MODULE_NAME),
@@ -3478,14 +3581,85 @@ FST_CORE_BEGIN("conf_opal")
 		FST_TEST_END()
 
 		/*
-		 * CASE 9 - the OOS-9 co-load refusal, declared last.
+		 * CASE 9 - the OOS-9 reservation OUTLIVES the module it protected.  Declared
+		 * immediately after the shutdown case, because that shutdown is what it observes.
 		 *
-		 * Last for two reasons.  It needs a module that is NOT loaded, which is exactly
-		 * what case 8 leaves behind, and it must not perturb the eight cases before it:
-		 * the sibling stand-in it registers would make the load case refuse if it ever
-		 * outlived this case.  Being last also means the stand-in cannot strand
-		 * anything, since the only assertion after its removal is the removal itself,
-		 * and no check here is fatal.
+		 * This is the case whose absence let the QA6 defect through.  While the claim was
+		 * released by mod_opal_shutdown(), the sequence `load mod_opal; unload mod_opal;
+		 * load mod_h323' left BOTH guard arms clear - the module had left
+		 * loadable_modules.module_hash and the reservation was free - while
+		 * libpt.so.2.12-beta10 was still mapped, because this build defines
+		 * HAVE_FAKE_DLCLOSE and src/switch_dso.c:91-98 then skips dlclose().  The
+		 * sibling's load walked straight into the PProcess::Construct() SIGSEGV the guard
+		 * exists to prevent.  Residency, not registration, is the invariant, so the claim
+		 * now outlives the module and only its own holder may take it again.
+		 *
+		 * Asserted, in the state case 8 leaves behind - shut down, no process, no pool:
+		 * the claim is still held and still names THIS module; a sibling can take it
+		 * neither as a free claim nor as a re-claim, which is exactly the compare-and-swap
+		 * pair mod_h323_load() would execute against it; and this module's own re-claim
+		 * still succeeds, which is why `load mod_opal; unload mod_opal; load mod_opal'
+		 * remains a supported operator flow.
+		 *
+		 * The refusal those predicates produce inside the REAL sibling is not reachable
+		 * from this binary, for the same reason the stand-in below exists - loading the
+		 * real mod_h323 is the crash under discussion - so the end-to-end proof lives in
+		 * the runtime evidence archived with the determination.  Nothing here is left
+		 * changed: the claim is observed and handed back to itself, never consumed.
+		 */
+		FST_TEST_BEGIN(coload_reservation_outlives_the_unloaded_module)
+		{
+			char *holder = NULL;
+
+			/* The claim the load case took is still there, and it is ours.  A NULL
+			 * holder at this point IS the defect: it means a shutdown released the
+			 * claim while the PTLib runtime it stood for remained mapped. */
+			holder = switch_core_get_variable_dup(TEST_OPAL_PTLIB_RESERVATION);
+			fst_xcheck(holder != NULL,
+					   "the PTLib reservation must survive mod_opal_shutdown(), because the runtime stays mapped (OOS-9)");
+			fst_check(holder != NULL && !strcmp(holder, TEST_OPAL_MODULE_NAME));
+			switch_safe_free(holder);
+
+			/* Neither arm of the sibling's claim can succeed against it: not the
+			 * free-claim arm, whose val2 "" matches only an unset or empty variable,
+			 * and not the re-claim arm, whose val2 matches only the sibling's own
+			 * name.  Both failing is precisely what makes mod_h323_load() refuse. */
+			fst_check(switch_core_set_var_conditional(TEST_OPAL_PTLIB_RESERVATION,
+													 TEST_OPAL_SIBLING_MODULE, "") != SWITCH_TRUE);
+			fst_check(switch_core_set_var_conditional(TEST_OPAL_PTLIB_RESERVATION,
+													 TEST_OPAL_SIBLING_MODULE,
+													 TEST_OPAL_SIBLING_MODULE) != SWITCH_TRUE);
+
+			/* Neither refused attempt may have moved the claim. */
+			holder = switch_core_get_variable_dup(TEST_OPAL_PTLIB_RESERVATION);
+			fst_check(holder != NULL && !strcmp(holder, TEST_OPAL_MODULE_NAME));
+			switch_safe_free(holder);
+
+			/* THIS module may still re-claim what it already holds.  That is the arm
+			 * that keeps reloading mod_opal alone working after an unload. */
+			fst_check(switch_core_set_var_conditional(TEST_OPAL_PTLIB_RESERVATION,
+													 TEST_OPAL_MODULE_NAME,
+													 TEST_OPAL_MODULE_NAME) == SWITCH_TRUE);
+
+			holder = switch_core_get_variable_dup(TEST_OPAL_PTLIB_RESERVATION);
+			fst_check(holder != NULL && !strcmp(holder, TEST_OPAL_MODULE_NAME));
+			switch_safe_free(holder);
+
+			/* None of this constructed anything: the claim is guard state, not a
+			 * constructor, and case 8's teardown must still hold. */
+			fst_check(!PProcess::IsInitialised());
+		}
+		FST_TEST_END()
+
+		/*
+		 * CASE 10 - the OOS-9 co-load refusal reached through the MODULE HASH.
+		 *
+		 * Declared here for two reasons.  It needs a module that is NOT loaded, which is
+		 * exactly what case 8 leaves behind, and it must not perturb the nine cases
+		 * before it: the sibling stand-in it registers would make the load case refuse if
+		 * it ever outlived this case.  Its cleanup tail removes the stand-in and confirms
+		 * the removal, so nothing it registers reaches the case after it, and no check
+		 * here is fatal.
 		 *
 		 * What is asserted is the guard's contract as the refine directive states it:
 		 * the predicate reports the sibling's absence and presence correctly, a load
@@ -3541,9 +3715,9 @@ FST_CORE_BEGIN("conf_opal")
 		FST_TEST_END()
 
 		/*
-		 * CASE 10 - the OOS-9 refusal reached through the ATOMIC RESERVATION, declared last.
+		 * CASE 11 - the OOS-9 refusal reached through the ATOMIC RESERVATION, declared last.
 		 *
-		 * Case 9 asserts the guard that reads the module hash, and that guard is a snapshot:
+		 * Case 10 asserts the guard that reads the module hash, and that guard is a snapshot:
 		 * switch_loadable_module_exists() takes loadable_modules.mutex for its own lookup and
 		 * releases it, while the core holds no single lock across a sibling observation, a
 		 * module's load routine and the publication of its result
@@ -3553,16 +3727,22 @@ FST_CORE_BEGIN("conf_opal")
 		 * runtime.global_var_rwlock in write mode.
 		 *
 		 * That branch cannot be reached by registering a sibling, because a registered sibling
-		 * is refused by case 9's guard first and the reservation is never consulted.  So it is
-		 * reached the way a losing concurrent claimant reaches it: the reservation is taken
-		 * under the SIBLING's name while the sibling is NOT in the module hash - exactly the
-		 * state the window produces - and mod_opal_load() is then asked to load into it.
+		 * is refused by case 10's guard first and the reservation is never consulted.  So it
+		 * is reached the way a losing concurrent claimant reaches it: the reservation is
+		 * handed to the SIBLING's name while the sibling is NOT in the module hash - exactly
+		 * the state the window produces - and mod_opal_load() is then asked to load into it.
 		 *
-		 * Asserted: the sibling really is absent from the hash, so case 9's guard cannot be
+		 * The hand-over is a compare-and-swap out of THIS module's name rather than a bare
+		 * set, because case 9 established that the claim is still held by this module: the
+		 * reservation now outlives the shutdown case 8 performed, so there is a holder to
+		 * displace and the transfer must fail loudly if there is not.
+		 *
+		 * Asserted: the sibling really is absent from the hash, so case 10's guard cannot be
 		 * what refuses; the load returns SWITCH_STATUS_FALSE; no module interface is created;
 		 * and no FSProcess is constructed, which is the property that matters because
-		 * constructing a second one is what crashes the process.  The reservation this case
-		 * planted is then released and its absence confirmed, so nothing is stranded.
+		 * constructing a second one is what crashes the process.  The claim is then handed
+		 * back to the module that really did construct a PProcess here, so the suite exits
+		 * with the reservation describing the truth about this process.
 		 */
 		FST_TEST_BEGIN(coload_reservation_refuses_a_reserved_ptlib_runtime)
 		{
@@ -3570,22 +3750,24 @@ FST_CORE_BEGIN("conf_opal")
 			switch_status_t status = SWITCH_STATUS_FALSE;
 			char *holder = NULL;
 
-			/* The reservation must start out unheld: case 8 shut the module down, and that
-			 * shutdown releases it.  If it were still held, this case would be asserting a
-			 * leak rather than the guard. */
+			/* The reservation starts out held by THIS module: case 8 shut the module down
+			 * and the claim deliberately survived it, as case 9 asserts.  If it were
+			 * unheld, this case would be measuring the defect rather than the guard. */
 			holder = switch_core_get_variable_dup(TEST_OPAL_PTLIB_RESERVATION);
-			fst_xcheck(holder == NULL, "the PTLib reservation must be unheld once mod_opal has shut down");
+			fst_xcheck(holder != NULL && !strcmp(holder, TEST_OPAL_MODULE_NAME),
+					   "the PTLib reservation must still be held by mod_opal when this case begins");
 			switch_safe_free(holder);
 
 			/* The distinguishing control: the sibling is NOT registered, so the module-hash
-			 * guard asserted in case 9 cannot be the thing that refuses below. */
+			 * guard asserted in case 10 cannot be the thing that refuses below. */
 			fst_check(switch_loadable_module_exists(TEST_OPAL_SIBLING_MODULE) == SWITCH_STATUS_FALSE);
 
-			/* Take the reservation under the sibling's name, the way the sibling's own load
-			 * would have taken it a moment before publishing itself. */
+			/* Hand the reservation over to the sibling's name, the way the sibling's own
+			 * load would have taken it a moment before publishing itself. */
 			fst_xcheck(switch_core_set_var_conditional(TEST_OPAL_PTLIB_RESERVATION,
-													  TEST_OPAL_SIBLING_MODULE, "") == SWITCH_TRUE,
-					   "the sibling stand-in must be able to claim the PTLib reservation");
+													  TEST_OPAL_SIBLING_MODULE,
+													  TEST_OPAL_MODULE_NAME) == SWITCH_TRUE,
+					   "the sibling stand-in must be able to take the PTLib reservation over");
 
 			status = mod_opal_load(&module_interface, fst_pool);
 
@@ -3599,14 +3781,16 @@ FST_CORE_BEGIN("conf_opal")
 			fst_check(holder != NULL && !strcmp(holder, TEST_OPAL_SIBLING_MODULE));
 			switch_safe_free(holder);
 
-			/* Cleanup tail: release what this case planted, and confirm the release, so the
-			 * refusal is provably a function of the reservation rather than of anything
+			/* Cleanup tail: hand the claim back to the module that really did construct a
+			 * PProcess in this process, and confirm the hand-back, so the refusal is
+			 * provably a function of who held the reservation rather than of anything
 			 * permanent this case did. */
-			fst_check(switch_core_set_var_conditional(TEST_OPAL_PTLIB_RESERVATION, NULL,
+			fst_check(switch_core_set_var_conditional(TEST_OPAL_PTLIB_RESERVATION,
+													 TEST_OPAL_MODULE_NAME,
 													 TEST_OPAL_SIBLING_MODULE) == SWITCH_TRUE);
 
 			holder = switch_core_get_variable_dup(TEST_OPAL_PTLIB_RESERVATION);
-			fst_check(holder == NULL);
+			fst_check(holder != NULL && !strcmp(holder, TEST_OPAL_MODULE_NAME));
 			switch_safe_free(holder);
 		}
 		FST_TEST_END()

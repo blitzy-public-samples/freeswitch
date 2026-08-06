@@ -925,6 +925,32 @@ require_module_disabled_for_tests()
 	return 0
 }
 
+# Say out loud whether tests/unit/switch_rtp_pcap will be part of this run.
+#
+# It is the one collected test whose presence is decided by the host rather than by
+# modules.conf: tests/unit/Makefile.am wraps it in `if HAVE_PCAP', and configure.ac
+# sets that conditional from whether pcap-config is on PATH.  Without libpcap's
+# development package the test is not built, is not collected, and `print_tests'
+# simply returns one fewer entry - with no warning anywhere, because nothing in the
+# build treats an absent optional dependency as an error.
+#
+# That silence is the problem this addresses.  A collected-test count is only a
+# meaningful acceptance figure if the reason it moved is visible, so the probe is
+# reported rather than left to be inferred from a diff of two test lists.  It is
+# deliberately NOT a gate: libpcap is optional, an absent optional dependency must
+# degrade rather than fail, and that is the same posture the H.323 and OPAL toolkit
+# guards above take.  Nothing here installs anything or edits any file.
+report_pcap_capability()
+{
+	if command -v pcap-config > /dev/null 2>&1; then
+		echo "Capability: pcap-config found; HAVE_PCAP will be true and tests/unit/switch_rtp_pcap will be built and collected"
+	else
+		echo "Capability: pcap-config NOT found; HAVE_PCAP will be false, so tests/unit/switch_rtp_pcap is not built and the collected-test count is one lower. Install libpcap's development package to collect it."
+	fi
+
+	return 0
+}
+
 # Function to handle freeswitch configuration
 configure_freeswitch()
 {
@@ -964,6 +990,8 @@ configure_freeswitch()
 			else
 				require_module_disabled_for_tests 'endpoints/mod_h323' || exit 1
 			fi
+
+			report_pcap_capability
 
 			export ASAN_OPTIONS=log_path=stdout:disable_coredump=0:unmap_shadow_on_exit=1:fast_unwind_on_malloc=0
 
@@ -1407,8 +1435,7 @@ guard_self_test_opal_negative()
 	return 0
 }
 
-# Arm 3: both guards' POSITIVE branch on this host, with no environment manipulation at
-# all.
+# Arm 3: run both guards against the REAL host, with no simulated environment at all.
 #
 # The negative arms prove that a refusal is respected; this one proves the guards still
 # say yes when the toolkit really is installed, and that the enablement they then perform

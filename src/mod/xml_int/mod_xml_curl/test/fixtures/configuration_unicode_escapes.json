@@ -10,7 +10,7 @@
             "param": [
               {
                 "@name": "domain",
-                "@value": "$${domain}"
+                "@value": "conference.example.net"
               },
               {
                 "@name": "caller-id-name",
@@ -22,7 +22,7 @@
               },
               {
                 "@name": "moh-sound",
-                "@value": "$${hold_music}"
+                "@value": "local_stream://moh"
               }
             ]
           },
@@ -31,7 +31,7 @@
             "param": [
               {
                 "@name": "domain",
-                "@value": "$${domain}"
+                "@value": "conference.example.net"
               },
               {
                 "@name": "caller-id-name",
@@ -43,7 +43,7 @@
               },
               {
                 "@name": "moh-sound",
-                "@value": "$${hold_music}"
+                "@value": "local_stream://moh"
               }
             ]
           },
@@ -52,7 +52,7 @@
             "param": [
               {
                 "@name": "domain",
-                "@value": "$${domain}"
+                "@value": "conference.example.net"
               },
               {
                 "@name": "caller-id-name",
@@ -64,7 +64,7 @@
               },
               {
                 "@name": "moh-sound",
-                "@value": "$${hold_music}"
+                "@value": "local_stream://moh"
               }
             ]
           }

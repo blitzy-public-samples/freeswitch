@@ -11,14 +11,14 @@
 # endpoints/mod_h323 and endpoints/mod_opal are the only two FreeSWITCH modules
 # whose build inputs cannot be obtained from a distribution package: Debian
 # ships no libopal-dev, and libopenh323-dev / libh323plus-dev / libpt-dev
-# resolve to no installable candidate either, even though
-# debian/control-modules:355 and :364 declare all four.  Every host that
-# carries these toolkits therefore carries a HAND INSTALLED toolkit, which is
-# not reproducible: a rebuilt CI image or a fresh production host comes up
-# without them, and the capability guards in ci.sh then quietly leave both
-# modules disabled.  This script closes that gap.  It installs the exact
-# versions this project was validated against, from pinned immutable refs, it
-# is safe to re-run, and it refuses to install onto a PTLib that cannot be
+# resolve to no installable candidate either, even though the Build-Depends
+# stanzas debian/control-modules carries for both endpoints declare all four.
+# Every host that carries these toolkits therefore carries a HAND INSTALLED
+# toolkit, which is not reproducible: a rebuilt CI image or a fresh production
+# host comes up without them, and the capability guards in ci.sh then quietly
+# leave both modules disabled.  This script closes that gap.  It installs the
+# exact versions this project was validated against, from pinned immutable refs,
+# it is safe to re-run, and it refuses to install onto a PTLib that cannot be
 # cleared of CVE-2013-1864.
 #
 # WHAT IS PINNED  (Appendix D of blitzy/documentation/Project Guide.md)
@@ -46,16 +46,16 @@
 # build/buildopal.sh is the MODEL for this script's flow - locate the tree from
 # $0, export PKG_CONFIG_PATH, ./configure --disable-plugins --prefix=..., make,
 # sudo make install - and it is left byte for byte as it is.  It cannot serve as
-# reproducible provisioning itself, for three reasons.  It checks out
-# https://svn.code.sf.net/p/opalvoip/code/{ptlib,opal} (build/buildopal.sh:45
-# and :53) and that SourceForge Subversion service no longer answers - the
-# `svn' client the script demands is beside the point.  Its version pins are
-# commented out (build/buildopal.sh:29-30), so it resolves to `trunk' and
-# installs whatever upstream happens to be that day.  And it knows nothing of
-# H323Plus, which mod_h323 needs in addition to PTLib (-lopenh323, and
-# /usr/include/openh323/h323.h).  The sources that actually produced this
-# project's toolkits were the SourceForge GIT mirrors plus two GitHub mirrors,
-# which is what the table below pins.
+# reproducible provisioning itself, for three reasons.  Both of its `svn co'
+# invocations check out https://svn.code.sf.net/p/opalvoip/code/{ptlib,opal},
+# and that SourceForge Subversion service no longer answers - the `svn' client
+# the script demands is beside the point.  Its VERSION and PATCH pins are
+# commented out, so it resolves to `trunk' and installs whatever upstream
+# happens to be that day.  And it knows nothing of H323Plus, which mod_h323
+# needs in addition to PTLib (-lopenh323, and /usr/include/openh323/h323.h).
+# The sources that actually produced this project's toolkits were the
+# SourceForge GIT mirrors plus two GitHub mirrors, which is what the table below
+# pins.
 #
 # PREFIXES, AND A DIVERGENCE THAT IS DELIBERATE
 #
@@ -72,8 +72,8 @@
 # would reinstall a toolkit that is present, correct and in use.  Idempotence is
 # therefore decided by CAPABILITY DETECTION - can mod_h323's own compile and
 # link inputs be satisfied, does pkg-config answer for an OPAL new enough for
-# the #error in src/mod/endpoints/mod_opal/mod_opal.h:41 - which makes this
-# script exit 0 on that host, and on any other layout that genuinely works.
+# mod_opal.h's OPAL_CHECK_VERSION guard and the #error beneath it - which makes
+# this script exit 0 on that host, and on any other layout that genuinely works.
 #
 # Two DIFFERENT questions are asked about a prefix, and keeping them apart is what
 # makes the defaults work.  "Is this host provisioned" is asked against the search
@@ -120,17 +120,20 @@
 #   4  provisioning failed (fetch, configure, build or install)
 #   5  self-test failed
 #
-# This script never prompts.  It is safe to run non-interactively, it removes
-# every scratch directory it creates through a trap, and it touches nothing
-# outside the two prefixes and the source directory it reports.
+# This script never prompts.  It is safe to run non-interactively, and it removes
+# every scratch directory it creates through a trap.  Apart from those temporary
+# probe directories and the loader-cache refresh that follows an installation,
+# every persistent write it makes is confined to the selected prefixes and the
+# retained-source root it reports.
 #------------------------------------------------------------------------------
 
 # No `set -e'.  The probe helpers below deliberately run commands that are
 # EXPECTED to fail (that is what a probe is), and an errexit shell turns the
 # expected failure of a guard into an unexplained exit before the guard can
-# report its verdict.  Every command that can fail is checked explicitly
-# instead.  `set -u' stays on: an unset variable in a path that is about to be
-# handed to rm or install is the one class of bug this script must not have.
+# report its verdict.  Every failure that affects a probe, a fetch, a build, an
+# install or a verification is checked explicitly instead.  `set -u' stays on: an
+# unset variable in a path that is about to be handed to rm or install is the one
+# class of bug this script must not have.
 set -u
 
 readonly PROG='provision_endpoint_toolkits'
@@ -1146,7 +1149,6 @@ observe_pkg_config_state()
 	return 0
 }
 
-# Which prefix a component installs into.
 prefix_for()
 {
 	case "${COMPONENT_STACK[$1]}" in
@@ -1538,8 +1540,8 @@ select_tools()
 
 		# Said now rather than discovered halfway through a build: the report has
 		# to show the install command the way it would really run, and a provision
-		# run that will fail at the install step should say so before it spends
-		# twenty minutes compiling.
+		# run that will fail at the install step should say so before it spends an
+		# expensive compile getting there.
 		if ! command -v sudo > /dev/null 2>&1 || ! sudo -n true > /dev/null 2>&1; then
 			if [ "$MODE" = 'provision' ]; then
 				warn 'not running as root and passwordless sudo is unavailable, so the install steps would fail'

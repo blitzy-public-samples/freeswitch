@@ -113,66 +113,69 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_opal_load)
     /* OOS-9 mutual exclusion - the single reason this production file is edited.
 
        mod_opal links PTLib 2.12-beta10 (libpt.so.2.12-beta10) while mod_h323 links
-       PTLib 2.10.9 (libpt.so.2.10.9), so co-loading them leaves two PTLib runtimes
-       contending for the one PProcess singleton a process can have, and whichever
-       module loads second SIGSEGVs inside PProcess::Construct() while building its
-       FSProcess - deterministically, in either load order.  Both crash frames are
-       in frozen third-party code, so refusing the second load is the safe
-       degradation: the sibling keeps serving calls, this module is merely
-       unavailable here, and the remedy is one endpoint per FreeSWITCH instance.
+       PTLib 2.10.9 (libpt.so.2.10.9), so bringing both into one process leaves two
+       PTLib runtimes contending for the one PProcess singleton a process can have,
+       and whichever module builds its FSProcess second SIGSEGVs inside
+       PProcess::Construct() - deterministically, in either order.  Both crash frames
+       are in frozen third-party code, so refusing the second load is the safe
+       degradation: the sibling keeps serving calls, this module is merely unavailable
+       here, and the remedy is one endpoint per FreeSWITCH instance.
 
-       The refusal belongs in module code because that is where the fault was
-       empirically found: under gdb the faulting stack carries a mod_*_load frame
-       and the second module logs its own entry line first, while a dlopen-only
-       probe never faults - see blitzy/documentation/oos9-coload-determination.md.
-       It must be the FIRST statement, because new FSProcess() below is what
-       creates the conflicting singleton.
+       The refusal lives in module code because that is where the fault was found: the
+       faulting stack carries a mod_*_load frame and the second module logs its own
+       entry line first, while a dlopen-only probe never faults - see
+       blitzy/documentation/oos9-coload-determination.md.  It must precede
+       new FSProcess() below, which is what creates the singleton.
 
-       TWO CHECKS, AND THE SECOND IS THE ONE THAT IS SAFE UNDER CONCURRENCY.
-       switch_loadable_module_exists() answers from loadable_modules.module_hash
-       under its own lock and then releases it, and the core does NOT hold one lock
-       across a sibling observation, this function, and the publication of the
-       result: switch_loadable_module_load_module_ex() checks the hash, releases,
-       calls the module's load routine, and publishes under a separate lock later.
-       Two concurrent load requests can therefore both observe the sibling absent
-       and both proceed to construct a PProcess, which is exactly the fatal case
-       this guard exists to prevent - and unloading has the same window in reverse,
-       because the sibling leaves the hash before its shutdown has torn PTLib down.
-
-       So the observation below is kept for the diagnostic it produces - it is the
-       sequential case, it is the common case, and it can name the sibling - and the
-       decision is then made ATOMICALLY, immediately after it. */
+       TWO CHECKS.  This one reads loadable_modules.module_hash, which is a snapshot:
+       the core holds no single lock across a sibling observation, this function and
+       the publication of its result, so two concurrent loads can both see the sibling
+       absent.  It is kept for the diagnostic it produces - it is the common case and
+       the only check that can name the sibling - and the binding decision is then
+       made ATOMICALLY, immediately after it. */
     if (switch_loadable_module_exists("mod_h323") == SWITCH_STATUS_SUCCESS) {
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
                           "Refusing to load mod_opal: mod_h323 is already loaded in this process, and their conflicting "
                           "PProcess singletons - one per PTLib runtime, libpt.so.2.12-beta10 for mod_opal against "
-                          "libpt.so.2.10.9 for mod_h323 - crash the process (OOS-9). Run the two endpoints in separate "
-                          "FreeSWITCH instances.\n");
+                          "libpt.so.2.10.9 for mod_h323 - crash the process (OOS-9). Unloading mod_h323 does not make "
+                          "this load safe, because its PTLib runtime stays mapped for the lifetime of the process: run "
+                          "the two endpoints in separate FreeSWITCH instances, and restart this one to change which "
+                          "endpoint it serves.\n");
         return SWITCH_STATUS_FALSE;
     }
 
     /* OOS-9 mutual exclusion, part 2 of 2: claim the PTLib runtime atomically.
 
-       switch_core_set_var_conditional() holds runtime.global_var_rwlock in WRITE
-       mode across its entire test-and-set (switch_core.c), so this is a genuine
-       compare-and-swap on a process-global name: with val2 as the empty string it
-       succeeds only if the variable did not exist, and it returns SWITCH_FALSE
-       having changed nothing if any other value is already there.  Exactly one of
+       switch_core_set_var_conditional() holds runtime.global_var_rwlock in WRITE mode
+       across its whole test-and-set (switch_core.c), so each call below is a genuine
+       compare-and-swap on a process-global name, and no core API is added - the
+       function is already exported for modules and already used by mod_commands and
+       mod_v8.  The first call claims the runtime when nobody holds it, val2 "" matching
+       only an unset or empty variable; the second re-claims a claim THIS module already
+       holds, val2 modname matching only our own name.  Refusing therefore needs both to
+       fail, which happens exactly when some other endpoint is the holder.  Only one of
        two concurrent claimants can win, whatever the loader is doing with its own
-       locks, and the loser refuses here - before new FSProcess() below, which is
-       the operation that would crash.
+       locks, and the loser refuses here - before new FSProcess(), which would crash.
 
-       No core API is added for this: the function is already exported for modules
-       (switch_core.h) and is already used by mod_commands and mod_v8.  The
-       reservation is released in mod_opal_shutdown() AFTER the FSProcess is deleted,
-       so it also spans the unload window described above. */
-    if (switch_core_set_var_conditional(OPAL_PTLIB_RESERVATION, modname, "") != SWITCH_TRUE) {
+       THE CLAIM IS STICKY, AND THAT IS THE POINT.  It is deliberately NOT released by
+       mod_opal_shutdown(): this build defines HAVE_FAKE_DLCLOSE, so switch_dso.c
+       skips dlclose() and an unloaded module keeps its PTLib runtime mapped for the
+       lifetime of the process.  `load mod_opal; unload mod_opal; load mod_h323' would
+       otherwise find an empty module hash and a released reservation and walk straight
+       into the crash this guard exists to prevent.  Residency, not registration, is
+       the invariant, so the claim outlives the module.  Re-loading THIS module stays
+       allowed, because it re-claims its own reservation and because destroying and
+       rebuilding one FSProcess on one PTLib runtime is safe. */
+    if (switch_core_set_var_conditional(OPAL_PTLIB_RESERVATION, modname, "") != SWITCH_TRUE &&
+        switch_core_set_var_conditional(OPAL_PTLIB_RESERVATION, modname, modname) != SWITCH_TRUE) {
         char *holder = switch_core_get_variable_dup(OPAL_PTLIB_RESERVATION);
 
         switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
                           "Refusing to load mod_opal: the PTLib runtime in this process is already reserved by [%s], and "
-                          "two PTLib runtimes contending for the one PProcess singleton crash the process (OOS-9). Run "
-                          "the two endpoints in separate FreeSWITCH instances.\n", holder ? holder : "another endpoint");
+                          "two PTLib runtimes contending for the one PProcess singleton crash the process (OOS-9). The "
+                          "reservation outlives an unload because the runtime stays mapped, so restart FreeSWITCH to "
+                          "change which endpoint this process serves, and run the two endpoints in separate "
+                          "instances.\n", holder ? holder : "another endpoint");
 
         switch_safe_free(holder);
 
@@ -188,10 +191,11 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_opal_load)
 
     *module_interface = switch_loadable_module_create_module_interface(pool, modname);
     if (!*module_interface) {
-        /* Every failure edge from here on releases the reservation, because a load
-           that did not complete must not leave the PTLib runtime reserved: the core
-           never calls this module's shutdown for a load that returned failure, so
-           nothing else would ever release it and a later retry would be refused. */
+        /* OOS-9: release the claim on the two failure edges that precede
+           new FSProcess().  No PProcess exists yet, so nothing is resident to protect,
+           and the core never calls this module's shutdown for a load that returned
+           failure - a claim left behind here would reserve nothing and refuse every
+           later retry.  Every edge AFTER the construction deliberately keeps it. */
         switch_core_set_var_conditional(OPAL_PTLIB_RESERVATION, NULL, modname);
         return SWITCH_STATUS_MEMERR;
     }
@@ -211,9 +215,6 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_opal_load)
 
     delete opal_process;
     opal_process = NULL;
-
-    switch_core_set_var_conditional(OPAL_PTLIB_RESERVATION, NULL, modname);
-
     return SWITCH_STATUS_FALSE;
 }
 
@@ -222,16 +223,6 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_opal_shutdown)
 {
     delete opal_process;
     opal_process = NULL;
-
-    /* OOS-9: release the reservation LAST, once this module's PTLib runtime is
-       actually gone.  Ordering matters: the core removes a module from its hash
-       before calling this function, so releasing any earlier would open the window
-       in which the sibling sees no mod_opal and no reservation while PProcess is
-       still standing.  val2 is this module's own name, so the release is a no-op
-       unless we are the holder - which makes a second shutdown, or a shutdown after
-       a refused load, harmless rather than a way to free somebody else's claim. */
-    switch_core_set_var_conditional(OPAL_PTLIB_RESERVATION, NULL, modname);
-
     return SWITCH_STATUS_SUCCESS;
 }
 
@@ -267,7 +258,13 @@ private:
   #define FULL_TEXT_INDEX 5
 #endif
       PStringArray fields(7);
-      static PRegularExpression logRE("^([0-9]+)\t *(.+)\t *([^(]+)\\(([0-9]+)\\)\t"CONTEXT_ID_REGEX"(.*)",
+      /* The spaces around CONTEXT_ID_REGEX are required, not cosmetic: C++11 lexes a
+       * string literal immediately followed by an identifier as a single
+       * user-defined-literal token, so "...\t"CONTEXT_ID_REGEX"(.*)" raised
+       * -Wliteral-suffix and compiled only through a GCC compatibility fallback.  The
+       * expansion is byte-identical either way - adjacent literals still concatenate,
+       * and an empty CONTEXT_ID_REGEX still contributes nothing. */
+      static PRegularExpression logRE("^([0-9]+)\t *(.+)\t *([^(]+)\\(([0-9]+)\\)\t" CONTEXT_ID_REGEX "(.*)",
                                       PRegularExpression::Extended);
       if (!logRE.Execute(s.c_str(), fields)) {
         fields[1] = "4";
@@ -388,8 +385,11 @@ bool FSManager::Initialise(switch_loadable_module_interface_t *iface)
         }
     }
 
-    AddRouteEntry("h323:.* = "FS_PREFIX":<da>");  // config option for direct routing
-    AddRouteEntry("iax2:.* = "FS_PREFIX":<da>");  // config option for direct routing
+    /* Spaces around FS_PREFIX for the same reason as at :270 - a literal directly
+     * followed by an identifier is a C++11 user-defined literal, which is what
+     * -Wliteral-suffix was reporting here.  The concatenated result is unchanged. */
+    AddRouteEntry("h323:.* = " FS_PREFIX ":<da>");  // config option for direct routing
+    AddRouteEntry("iax2:.* = " FS_PREFIX ":<da>");  // config option for direct routing
     AddRouteEntry(FS_PREFIX":.* = h323:<da>");  // config option for direct routing
 
     // Make sure all known codecs are instantiated,

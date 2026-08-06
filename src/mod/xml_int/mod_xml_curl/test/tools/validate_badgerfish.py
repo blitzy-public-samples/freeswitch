@@ -33,11 +33,13 @@ contract mod_xml_curl accepts, BEFORE the gateway is deployed.
 WHO THIS IS FOR
 ---------------
 The backend team that owns a provisioning gateway. mod_xml_curl's JSON decoder
-accepts a deliberately restricted profile, and anything outside it is silently
-degraded: the module logs a warning and parses the response as XML instead, so a
-non-conformant gateway does not fail loudly -- it just never gets used. Running
-this validator against real gateway output turns that silent degradation into a
-verdict you can gate a deployment on.
+accepts a deliberately restricted profile, and anything outside it is degraded
+rather than refused: the module logs a WARNING, fires the custom event
+xml_curl::json_fallback, and then parses the same response as XML instead. So a
+non-conformant gateway does not fail loudly -- it just never gets used, and the
+only trace is a log line and an event nobody may be watching. Running this
+validator against real gateway output turns that degradation into a verdict you
+can gate a deployment on.
 
 USAGE
 -----
@@ -59,8 +61,9 @@ directory up, in ../fixtures/: every *.json file whose name starts with
 that this validator accepts, and each has an .xml twin that mod_xml_curl's own
 test suite proves it translates into byte for byte. The five
 badgerfish_invalid_*.json files in the same directory are deliberate
-counter-examples, one per contract rule, and this validator rejects each of them
-with a named violation. Start from a fixture that resembles your own payload.
+counter-examples, one per required non-conformant category, and this validator
+rejects each of them with a named violation. Start from a fixture that resembles
+your own payload.
 
 EXIT STATUS
 -----------
@@ -135,8 +138,8 @@ import stat
 import sys
 
 # ---------------------------------------------------------------------------
-# CEILINGS -- one table, mirroring mod_xml_curl.c L185-L192 (plus the derived
-# ceiling at L203). These are the resource limits the decoder enforces so that
+# CEILINGS -- one table, mirroring the XML_CURL_JSON_MAX_* definitions in
+# mod_xml_curl.c. These are the resource limits the decoder enforces so that
 # a runaway or hostile response cannot exhaust memory. They are gathered here,
 # and nowhere else in this file, so that drift between the validator and the
 # module is visible as a diff in one place.
@@ -152,11 +155,11 @@ import sys
 #   XML_CURL_JSON_MAX_STRING_BYTES          8192  bytes in one name or one value
 #   XML_CURL_JSON_MAX_NAME_BYTES             128  bytes in one name
 #
-# The last entry is not a #define of its own in the module but the derived
-# ceiling at L203, XML_CURL_JSON_MAX_TRANSFORMED_NAME_BYTES, which bounds the
-# cumulative NAME bytes the translation writes into the tree. It is a ceiling of
-# its own rather than the payload length because an array writes one key once
-# per element.
+# The last entry below is not a #define read straight from the module but its
+# derived XML_CURL_JSON_MAX_TRANSFORMED_NAME_BYTES, which bounds the cumulative
+# NAME bytes the translation writes into the tree. It is a ceiling of its own
+# rather than the payload length because an array writes one key once per
+# element.
 # ---------------------------------------------------------------------------
 MAX_DEPTH = 32
 MAX_VALUES = 50000
@@ -195,7 +198,6 @@ DEFAULT_SECTIONS = ("configuration", "directory", "dialplan")
 # owns -- see ENVELOPE_ATTRIBUTES_EMITTED below.
 ENVELOPE_KEYS = ("document", "section")
 
-# BadgerFish markers.
 ATTRIBUTE_PREFIX = "@"
 TEXT_KEY = "$"
 
@@ -206,7 +208,6 @@ TEXT_KEY = "$"
 # string as it is ENCODED, which is what the module's lexical gate bounds.
 STRING_LITERAL_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
 
-# Exit statuses. Documented in the module docstring above and in --help.
 EXIT_CONFORMANT = 0
 EXIT_VIOLATION = 1
 EXIT_USAGE = 2
@@ -322,8 +323,7 @@ class NonStringConstantError(ValueError):
 def object_pairs_hook(pairs):
     """Build a dict while refusing a repeated key.
 
-    Mirrors the duplicate-member half of xml_curl_json_check_object()
-    (mod_xml_curl.c L830-L838).
+    Mirrors the duplicate-member scan in xml_curl_json_check_object().
     """
     seen = {}
 
@@ -336,17 +336,16 @@ def object_pairs_hook(pairs):
 
 
 def parse_constant(token):
-    """Refuse the three non-JSON constants Python's parser would otherwise accept."""
     raise NonStringConstantError(token)
 
 
 def is_xml_char(code_point):
     """True when a code point may appear in XML 1.0 character data.
 
-    Mirrors xml_curl_json_is_xml_char() (mod_xml_curl.c L306). Tab, newline and
-    carriage return are the only control characters XML permits; NUL, backspace,
-    form feed and the rest of C0 are forbidden, as are the surrogate range and
-    the two permanently invalid code points.
+    Mirrors xml_curl_json_is_xml_char(). Tab, newline and carriage return are
+    the only control characters XML permits; NUL, backspace, form feed and the
+    rest of C0 are forbidden, as are the surrogate range and the two permanently
+    invalid code points.
     """
     if code_point in (0x09, 0x0A, 0x0D):
         return True
@@ -366,11 +365,10 @@ def is_xml_char(code_point):
 def is_name_char(char, first):
     """One character of the element and attribute name alphabet.
 
-    Mirrors xml_curl_json_is_name_char() (mod_xml_curl.c L408). A deliberate
-    subset of the XML Name production, because a JSON member name reaches
-    switch_xml_add_child_d() verbatim and the serializer writes names without
-    escaping: a name such as x></x><evil would otherwise forge document
-    structure.
+    Mirrors xml_curl_json_is_name_char(). A deliberate subset of the XML Name
+    production, because a JSON member name reaches switch_xml_add_child_d()
+    verbatim and the serializer writes names without escaping: a name such as
+    x></x><evil would otherwise forge document structure.
     """
     if ("A" <= char <= "Z") or ("a" <= char <= "z") or char == "_":
         return True
@@ -384,10 +382,10 @@ def is_name_char(char, first):
 def is_valid_xml_name(name):
     """True when a string may be used as an element or attribute name.
 
-    Mirrors xml_curl_json_is_valid_xml_name() (mod_xml_curl.c L424). A single
-    colon is accepted as a namespace separator and both halves must then be
-    well-formed names in their own right, so ":x", "x:" and "a:b:c" are all
-    refused rather than passed through as malformed namespace syntax.
+    Mirrors xml_curl_json_is_valid_xml_name(). A single colon is accepted as a
+    namespace separator and both halves must then be well-formed names in their
+    own right, so ":x", "x:" and "a:b:c" are all refused rather than passed
+    through as malformed namespace syntax.
 
     The MAX_NAME_BYTES ceiling is deliberately NOT applied here: an over-long
     name is reported as its own ceiling violation so that a gateway author sees
@@ -404,7 +402,6 @@ def is_valid_xml_name(name):
             colons += 1
 
             if colons > 1 or first:
-                # a leading colon, or a second one
                 return False
 
             # the local part after the colon must start a name of its own
@@ -423,8 +420,8 @@ def is_valid_xml_name(name):
 def invalid_text_reason(text):
     """Explain why a decoded string may not be handed to the XML builders.
 
-    Mirrors xml_curl_json_is_valid_text() (mod_xml_curl.c L352) for everything
-    that survives JSON decoding. Returns None when the string is usable.
+    Mirrors xml_curl_json_is_valid_text() for everything that survives JSON
+    decoding. Returns None when the string is usable.
 
     The two-character sequence "<!" is refused outright because
     switch_xml_ampencode() special-cases a '<' whose next byte is '!': it emits
@@ -452,8 +449,8 @@ def measure_structure(value, depth=1):
     """Return (deepest structural nesting, total value count) for a decoded document.
 
     Mirrors the two document-wide counters of the lexical gate,
-    xml_curl_json_validate_text() (mod_xml_curl.c L546-L660), which walks the
-    RAW payload and therefore counts things the semantic walk below does not:
+    xml_curl_json_validate_text(), which walks the RAW payload and therefore
+    counts things the semantic walk below does not:
 
       * Nesting: the gate pushes a level for EVERY '{' and EVERY '[', so an
         array contributes a level of its own. The translator's own depth
@@ -533,9 +530,9 @@ class DocumentValidator(object):
         self.violations = []
         self._seen = set()
 
-        # Document-wide budget, mirroring struct xml_curl_json_budget
-        # (mod_xml_curl.c L217-L224). They are instance state rather than
-        # per-call locals because the module's ceilings are document-wide.
+        # Document-wide budget, mirroring struct xml_curl_json_budget in
+        # mod_xml_curl.c. They are instance state rather than per-call locals
+        # because the module's ceilings are document-wide.
         self.nodes = 0
         self.name_bytes = 0
 
@@ -584,7 +581,6 @@ class DocumentValidator(object):
                      % (values, MAX_VALUES))
 
     def charge_node(self, where):
-        """Count one element or attribute against MAX_NODES."""
         self.nodes += 1
 
         if self.nodes > MAX_NODES:
@@ -609,7 +605,7 @@ class DocumentValidator(object):
     # -- the contract -------------------------------------------------------
 
     def validate(self, document):
-        """Entry point. Mirrors xml_curl_json_to_xml() (mod_xml_curl.c L1001)."""
+        """Entry point. Mirrors xml_curl_json_to_xml()."""
         if not isinstance(document, dict):
             self.add("ROOT_NOT_OBJECT",
                      "the payload is a JSON %s; the contract requires a single JSON object "
@@ -661,7 +657,6 @@ class DocumentValidator(object):
             self.validate_section(key, document[key])
 
     def validate_section(self, key, value):
-        """Validate one top-level key and the element it names."""
         where = "$.%s" % (key,)
 
         if key not in self.sections:
@@ -686,7 +681,7 @@ class DocumentValidator(object):
         # deliberate "not found" and satisfies the lookup from static local
         # configuration, so the decode reports success, no fallback warning is
         # emitted, and the caller believes the gateway said nothing exists.
-        # Mirrors mod_xml_curl.c L1069-L1078.
+        # Mirrors the root-attribute refusal in xml_curl_json_to_xml().
         for member in value:
             if member.startswith(ATTRIBUTE_PREFIX):
                 self.add("ROOT_ATTRIBUTE",
@@ -700,10 +695,10 @@ class DocumentValidator(object):
     def validate_element(self, obj, where, depth):
         """Validate one BadgerFish element object.
 
-        Mirrors xml_curl_json_check_object() (mod_xml_curl.c L797) and
-        xml_curl_json_to_xml_node() (L860). depth is the element nesting level,
-        counted the way the translator counts it: an array does not add a level
-        of its own, the element objects inside it do.
+        Mirrors xml_curl_json_check_object() and xml_curl_json_to_xml_node().
+        depth is the element nesting level, counted the way the translator counts
+        it: an array does not add a level of its own, the element objects inside
+        it do.
         """
         if depth > MAX_DEPTH:
             self.add_once("MAX_DEPTH_EXCEEDED",
@@ -731,7 +726,8 @@ class DocumentValidator(object):
         # switch_xml serialisation emits an element's text only when the
         # element has no children, so a node carrying both could not round
         # trip; the BadgerFish convention cannot recover the separate text runs
-        # of mixed content either. Mirrors mod_xml_curl.c L827-L829.
+        # of mixed content either. Mirrors the children-or-text check in
+        # xml_curl_json_check_object().
         if has_text and has_children:
             self.add("MIXED_CONTENT",
                      "%s carries both %r text and child elements; an element has children "
@@ -760,7 +756,7 @@ class DocumentValidator(object):
                 # trip through the const char * builders that receive every
                 # name and value, so they are a translation error rather than
                 # an implicit coercion: 1 against 1.0, true against "true".
-                # Mirrors mod_xml_curl.c L989-L994.
+                # Mirrors the default arm of xml_curl_json_to_xml_node().
                 self.add("NON_STRING_LEAF",
                          "%s.%s is a JSON %s; every leaf value must be a JSON string, and a "
                          "child element must be an object or a non-empty array of objects"
@@ -772,7 +768,6 @@ class DocumentValidator(object):
                      % (where, children, MAX_CHILDREN_PER_PARENT))
 
     def validate_child(self, name, value, where, depth):
-        """Validate one child element and the name it is built under."""
         self.check_name(name, where, "element")
         self.charge_node(where)
         self.charge_name(name, where)
@@ -781,8 +776,7 @@ class DocumentValidator(object):
     def validate_array(self, name, elements, where, depth):
         """Validate a repeated-children array. Returns the child count it adds.
 
-        Mirrors the array arm of xml_curl_json_to_xml_node()
-        (mod_xml_curl.c L951-L978).
+        Mirrors the array arm of xml_curl_json_to_xml_node().
         """
         member_where = "%s.%s" % (where, name)
 
@@ -819,8 +813,7 @@ class DocumentValidator(object):
     def validate_attribute(self, member, value, where):
         """Validate one "@"-prefixed attribute member.
 
-        Mirrors the attribute arm of xml_curl_json_to_xml_node()
-        (mod_xml_curl.c L887-L913).
+        Mirrors the attribute arm of xml_curl_json_to_xml_node().
         """
         member_where = "%s.%s" % (where, member)
 
@@ -839,8 +832,7 @@ class DocumentValidator(object):
     def validate_text(self, value, where):
         """Validate the "$" text member.
 
-        Mirrors the text arm of xml_curl_json_to_xml_node()
-        (mod_xml_curl.c L914-L923).
+        Mirrors the text arm of xml_curl_json_to_xml_node().
         """
         member_where = "%s.%s" % (where, TEXT_KEY)
 
@@ -886,14 +878,14 @@ class DocumentValidator(object):
     def check_encoded_string_spans(self, text):
         """Bound every string literal as it is ENCODED, not as it decodes.
 
-        The module's lexical gate measures a string against
-        XML_CURL_JSON_MAX_STRING_BYTES on the raw payload
-        (mod_xml_curl.c L647-L649), before any escape has been decoded, so a
-        literal built out of \\uXXXX escapes can breach the ceiling while its
-        decoded form is comfortably inside it. The decoded tree cannot show
-        that, which is the one and only reason this pass over the raw text
-        exists. Names are additionally bounded at MAX_NAME_BYTES, so in
-        practice any literal that reaches this ceiling is a value.
+        The module's lexical gate, xml_curl_json_validate_text(), measures a
+        string against XML_CURL_JSON_MAX_STRING_BYTES on the raw payload before
+        any escape has been decoded, so a literal built out of \\uXXXX escapes
+        can breach the ceiling while its decoded form is comfortably inside it.
+        The decoded tree cannot show that, which is the one and only reason this
+        pass over the raw text exists. Names are additionally bounded at
+        MAX_NAME_BYTES, so in practice any literal that reaches this ceiling is
+        a value.
         """
         for match in STRING_LITERAL_RE.finditer(text):
             # Measure the content, excluding the two delimiting quotes, the way
@@ -1548,7 +1540,6 @@ def collect_inputs(arguments, open_dirs):
 
 
 def parse_sections(value):
-    """Turn a --sections value into an ordered tuple of section names."""
     sections = []
 
     for token in value.replace(",", " ").split():
@@ -1639,7 +1630,7 @@ examples:
 FreeSWITCH ships a conformance corpus beside this tool, in ../fixtures/: the
 configuration_*, directory_* and dialplan_* JSON files are conformant reference
 documents, and the badgerfish_invalid_* files are deliberate counter-examples,
-one per rule.
+one per required non-conformant category.
 """)
 
     parser.add_argument("inputs", metavar="PATH", nargs="+",

@@ -452,6 +452,57 @@ SWITCH_MODULE_SHUTDOWN_FUNCTION(mod_h323_shutdown);
 SWITCH_END_EXTERN_C
 
 /*
+ * LeakSanitizer suppressions for the H.323 toolkit's own start-up allocations.
+ *
+ * libasan declares __lsan_default_suppressions() as a weak symbol and calls it
+ * once, before main(), to obtain suppressions that travel WITH the binary
+ * rather than with an environment variable.  That property is the whole reason
+ * this is a function rather than a file plus LSAN_OPTIONS: this suite is run
+ * three different ways - automake's driver during `make check', a direct
+ * libtool-wrapper invocation, and tests/unit/test.sh - and only two of those
+ * three can be given an environment.  A suppression that applies in one lane
+ * and not the others is worse than none, because it makes the verdict depend
+ * on how the suite was started.
+ *
+ * WHAT is suppressed, and why it is not this tree's leak to fix.  PTLib and
+ * H323Plus install their device and feature plugin factories from _dl_init
+ * static initialisers, i.e. while the dynamic loader is still bringing the
+ * shared objects up and before any FreeSWITCH code has run.  Those factory
+ * singletons are never torn down, so LSan reports them at every exit, and the
+ * whole set is reachable through exactly one frame:
+ *
+ *   PDevicePluginAdapter<H460_Feature>::CreateFactory     libh323 (144 B / 6)
+ *   PDevicePluginAdapter<PNatMethod>::CreateFactory       libpt    (72 B / 3)
+ *   PDevicePluginAdapter<PVideoInputDevice>::CreateFactory libpt   (72 B / 3)
+ *   PDevicePluginAdapter<PSoundChannel>::CreateFactory    libpt    (48 B / 2)
+ *   PDevicePluginAdapter<H224_Handler>::CreateFactory     libh323  (24 B / 1)
+ *   PDevicePluginAdapter<PVideoOutputDevice>::CreateFactory libpt  (24 B / 1)
+ *
+ * The total (384 bytes in 16 allocations) is invariant to which test cases run
+ * - filtering the suite down to a single pre-existing case reproduces it byte
+ * for byte - which is the measurement that establishes it as pre-main() and
+ * toolkit-owned.  Not one frame names a FreeSWITCH artefact.
+ *
+ * WHY the template is this narrow.  It matches one class template's factory
+ * constructor, not a library, not a file and not a namespace, so any leak this
+ * suite or mod_h323 itself introduces is still reported and still fails the
+ * run.  Suppressing by module (`leak:libpt.so') would have silenced genuine
+ * leaks in every PTLib call the module makes, which is precisely the coverage
+ * this suite exists to provide.
+ *
+ * The visibility attribute is load-bearing, not decoration: the tree compiles
+ * with -fvisibility=hidden (SWITCH_AM_CXXFLAGS), under which this definition
+ * would be absent from the executable's .dynsym, libasan would keep its own
+ * empty weak default, and the suppression would silently do nothing while
+ * looking correct in the source.  Verify with ASAN_OPTIONS=print_suppressions=1,
+ * which lists the template and the bytes it accounted for.
+ */
+extern "C" __attribute__((visibility("default"))) const char *__lsan_default_suppressions(void)
+{
+	return "leak:PDevicePluginAdapter\n";
+}
+
+/*
  * Test-local subclass: the only sanctioned route to FSH323EndPoint's protected
  * members (mod_h323.h:273-287).  Nothing is de-staticised, no symbol is
  * re-exported and no `friend` declaration is added to the production header -
@@ -2209,7 +2260,7 @@ static void fst_h323_suite_state_cleanup(void)
  * available here only because this suite compiles the production translation unit into
  * itself (#include "../mod_h323.cpp" above).  An alias cannot drift; a second copy of
  * the literal could, and a reservation taken under a name the module does not use would
- * make case 9 below pass while proving nothing.  mod_opal.cpp declares the same name
+ * make case 10 below pass while proving nothing.  mod_opal.cpp declares the same name
  * independently, and its own suite - which links rather than includes - has to spell it
  * out; the two module-side definitions must stay identical to each other.
  */
@@ -2253,10 +2304,14 @@ SWITCH_END_EXTERN_C
  *   6. codec_prefs_negotiation_order -- the last case to run Initialise().
  *   7. module_shutdown_releases_resources -- reclaims what case 2 allocated, and the last
  *      case that touches module lifetime state.
- *   8. coload_guard_refuses_when_sibling_is_loaded -- the OOS-9 refusal reached through the
+ *   8. coload_reservation_outlives_the_unloaded_module -- immediately after the shutdown
+ *      it observes: the OOS-9 claim must survive it, because the PTLib runtime stays
+ *      mapped.  This is the property whose absence let `load; unload; load the sibling'
+ *      reach the crash.
+ *   9. coload_guard_refuses_when_sibling_is_loaded -- the OOS-9 refusal reached through the
  *      module hash, which needs a shut-down module and adds no state for case 7's sweep
  *      to release.
- *   9. coload_reservation_refuses_a_reserved_ptlib_runtime -- last; the OOS-9 refusal
+ *  10. coload_reservation_refuses_a_reserved_ptlib_runtime -- last; the OOS-9 refusal
  *      reached through the ATOMIC reservation instead, which is the branch a concurrent
  *      load takes and which the module hash cannot express.
  *
@@ -2312,7 +2367,7 @@ FST_CORE_BEGIN("conf_h323")
 		 * PROCESS during the case that just ran.  FSH323EndPoint::ReadConfig() allocates
 		 * one on entry and never destroys or uses it (mod_h323.cpp:469).
 		 *
-		 * Six of the nine cases call it, but only five of those calls happen in this
+		 * Six of the ten cases call it, but only five of those calls happen in this
 		 * process and reach this hook: cases 2 through 6 read configuration here, while
 		 * case 1 reads it twice inside the exec'd helper image, whose pools live and die
 		 * in an address space this hook cannot see and that _exit() discards wholesale.
@@ -2415,7 +2470,7 @@ FST_CORE_BEGIN("conf_h323")
 			 * provenance handshake proves it came from the parent of this run.  Helper
 			 * mode _exit()s from inside this first case, so a top-level run that entered
 			 * it on an inherited or stale marker alone would run one case, exit with that
-			 * case's status, and be recorded as a clean pass with the eight later cases
+			 * case's status, and be recorded as a clean pass with the nine later cases
 			 * never run.
 			 *
 			 * A marker without valid provenance is therefore a hard refusal rather than a
@@ -3374,14 +3429,85 @@ FST_CORE_BEGIN("conf_h323")
 		FST_TEST_END()
 
 		/*
-		 * CASE 8 - the OOS-9 co-load refusal, declared last.
+		 * CASE 8 - the OOS-9 reservation OUTLIVES the module it protected.  Declared
+		 * immediately after the shutdown case, because that shutdown is what it observes.
 		 *
-		 * Last for two reasons.  It needs a module that is NOT loaded, which is exactly
-		 * what case 7 leaves behind, and it must not perturb the seven cases before it:
+		 * This is the case whose absence let the QA6 defect through.  While the claim was
+		 * released by mod_h323_shutdown(), the sequence `load mod_h323; unload mod_h323;
+		 * load mod_opal' left BOTH guard arms clear - the module had left
+		 * loadable_modules.module_hash and the reservation was free - while
+		 * libpt.so.2.10.9 was still mapped, because this build defines HAVE_FAKE_DLCLOSE
+		 * and src/switch_dso.c:91-98 then skips dlclose().  The sibling's load walked
+		 * straight into the PProcess::Construct() SIGSEGV the guard exists to prevent.
+		 * Residency, not registration, is the invariant, so the claim now outlives the
+		 * module and only its own holder may take it again.
+		 *
+		 * Asserted, in the state case 7 leaves behind - shut down, no interface, no
+		 * PProcess: the claim is still held and still names THIS module; a sibling can
+		 * take it neither as a free claim nor as a re-claim, which is exactly the
+		 * compare-and-swap pair mod_opal_load() would execute against it; and this
+		 * module's own re-claim still succeeds, which is why `load mod_h323;
+		 * unload mod_h323; load mod_h323' remains a supported operator flow.
+		 *
+		 * The refusal those predicates produce inside the REAL sibling is not reachable
+		 * from this binary, for the same reason the stand-in below exists - loading the
+		 * real mod_opal is the crash under discussion - so the end-to-end proof lives in
+		 * the runtime evidence archived with the determination.  Nothing here is left
+		 * changed: the claim is observed and handed back to itself, never consumed.
+		 */
+		FST_TEST_BEGIN(coload_reservation_outlives_the_unloaded_module)
+		{
+			char *holder = NULL;
+
+			/* The claim case 2 took is still there, and it is ours.  A NULL holder at
+			 * this point IS the defect: it means a shutdown released the claim while
+			 * the PTLib runtime it stood for remained mapped. */
+			holder = switch_core_get_variable_dup(FST_H323_PTLIB_RESERVATION);
+			fst_xcheck(holder != NULL,
+					   "the PTLib reservation must survive mod_h323_shutdown(), because the runtime stays mapped (OOS-9)");
+			fst_check(holder != NULL && !strcmp(holder, modname));
+			switch_safe_free(holder);
+
+			/* Neither arm of the sibling's claim can succeed against it: not the
+			 * free-claim arm, whose val2 "" matches only an unset or empty variable,
+			 * and not the re-claim arm, whose val2 matches only the sibling's own
+			 * name.  Both failing is precisely what makes mod_opal_load() refuse. */
+			fst_check(switch_core_set_var_conditional(FST_H323_PTLIB_RESERVATION,
+													 FST_H323_SIBLING_MODULE, "") != SWITCH_TRUE);
+			fst_check(switch_core_set_var_conditional(FST_H323_PTLIB_RESERVATION,
+													 FST_H323_SIBLING_MODULE,
+													 FST_H323_SIBLING_MODULE) != SWITCH_TRUE);
+
+			/* Neither refused attempt may have moved the claim. */
+			holder = switch_core_get_variable_dup(FST_H323_PTLIB_RESERVATION);
+			fst_check(holder != NULL && !strcmp(holder, modname));
+			switch_safe_free(holder);
+
+			/* THIS module may still re-claim what it already holds.  That is the arm
+			 * that keeps reloading mod_h323 alone working after an unload. */
+			fst_check(switch_core_set_var_conditional(FST_H323_PTLIB_RESERVATION,
+													 modname, modname) == SWITCH_TRUE);
+
+			holder = switch_core_get_variable_dup(FST_H323_PTLIB_RESERVATION);
+			fst_check(holder != NULL && !strcmp(holder, modname));
+			switch_safe_free(holder);
+
+			/* None of this constructed anything: the claim is guard state, not a
+			 * constructor, and case 7's teardown must still hold. */
+			fst_check(!PProcess::IsInitialised());
+		}
+		FST_TEST_END()
+
+		/*
+		 * CASE 9 - the OOS-9 co-load refusal reached through the MODULE HASH.
+		 *
+		 * Declared here for two reasons.  It needs a module that is NOT loaded, which is
+		 * exactly what case 7 leaves behind, and it must not perturb the eight cases
+		 * before it:
 		 * the sibling stand-in it registers would make every one of their loads refuse
-		 * if it ever outlived this case.  Being last also means the stand-in cannot
-		 * strand anything, since the only assertion after its removal is the removal
-		 * itself, and no check here is fatal.
+		 * if it ever outlived this case.  Its cleanup tail removes the stand-in and
+		 * confirms the removal, so nothing it registers reaches the case after it, and
+		 * no check here is fatal.
 		 *
 		 * What is asserted is the guard's contract as the refine directive states it:
 		 * the predicate reports the sibling's absence and presence correctly, a load
@@ -3437,9 +3563,9 @@ FST_CORE_BEGIN("conf_h323")
 		FST_TEST_END()
 
 		/*
-		 * CASE 9 - the OOS-9 refusal reached through the ATOMIC RESERVATION, declared last.
+		 * CASE 10 - the OOS-9 refusal reached through the ATOMIC RESERVATION, declared last.
 		 *
-		 * Case 8 asserts the guard that reads the module hash, and that guard is a snapshot:
+		 * Case 9 asserts the guard that reads the module hash, and that guard is a snapshot:
 		 * switch_loadable_module_exists() takes loadable_modules.mutex for its own lookup and
 		 * releases it, while the core holds no single lock across a sibling observation, a
 		 * module's load routine and the publication of its result
@@ -3449,17 +3575,22 @@ FST_CORE_BEGIN("conf_h323")
 		 * runtime.global_var_rwlock in write mode.
 		 *
 		 * That branch cannot be reached by registering a sibling, because a registered sibling
-		 * is refused by case 8's guard first and the reservation is never consulted.  So it is
-		 * reached the way a losing concurrent claimant reaches it: the reservation is taken
-		 * under the SIBLING's name while the sibling is NOT in the module hash - exactly the
+		 * is refused by case 9's guard first and the reservation is never consulted.  So it is
+		 * reached the way a losing concurrent claimant reaches it: the reservation is handed
+		 * to the SIBLING's name while the sibling is NOT in the module hash - exactly the
 		 * state the window produces - and mod_h323_load() is then asked to load into it.
 		 *
-		 * Asserted: the sibling really is absent from the hash, so case 8's guard cannot be
+		 * The hand-over is a compare-and-swap out of THIS module's name rather than a bare
+		 * set, because case 8 established that the claim is still held by this module: the
+		 * reservation now outlives the shutdown case 7 performed, so there is a holder to
+		 * displace and the transfer must fail loudly if there is not.
+		 *
+		 * Asserted: the sibling really is absent from the hash, so case 9's guard cannot be
 		 * what refuses; the load returns SWITCH_STATUS_FALSE; no module interface is created;
 		 * and no FSProcess is constructed, which is the property that matters because
-		 * constructing a second one is what crashes the process.  The reservation this case
-		 * planted is then released and its absence confirmed, so nothing is stranded for a
-		 * later run of this binary.
+		 * constructing a second one is what crashes the process.  The claim is then handed
+		 * back to the module that really did construct a PProcess here, so the suite exits
+		 * with the reservation describing the truth about this process.
 		 */
 		FST_TEST_BEGIN(coload_reservation_refuses_a_reserved_ptlib_runtime)
 		{
@@ -3467,22 +3598,23 @@ FST_CORE_BEGIN("conf_h323")
 			switch_status_t status = SWITCH_STATUS_FALSE;
 			char *holder = NULL;
 
-			/* The reservation must start out unheld: case 7 shut the module down, and that
-			 * shutdown releases it.  If it were still held, this case would be asserting a
-			 * leak rather than the guard. */
+			/* The reservation starts out held by THIS module: case 7 shut the module down
+			 * and the claim deliberately survived it, as case 8 asserts.  If it were
+			 * unheld, this case would be measuring the defect rather than the guard. */
 			holder = switch_core_get_variable_dup(FST_H323_PTLIB_RESERVATION);
-			fst_xcheck(holder == NULL, "the PTLib reservation must be unheld once mod_h323 has shut down");
+			fst_xcheck(holder != NULL && !strcmp(holder, modname),
+					   "the PTLib reservation must still be held by mod_h323 when this case begins");
 			switch_safe_free(holder);
 
 			/* The distinguishing control: the sibling is NOT registered, so the module-hash
-			 * guard asserted in case 8 cannot be the thing that refuses below. */
+			 * guard asserted in case 9 cannot be the thing that refuses below. */
 			fst_check(switch_loadable_module_exists(FST_H323_SIBLING_MODULE) == SWITCH_STATUS_FALSE);
 
-			/* Take the reservation under the sibling's name, the way the sibling's own load
-			 * would have taken it a moment before publishing itself. */
+			/* Hand the reservation over to the sibling's name, the way the sibling's own
+			 * load would have taken it a moment before publishing itself. */
 			fst_xcheck(switch_core_set_var_conditional(FST_H323_PTLIB_RESERVATION,
-													  FST_H323_SIBLING_MODULE, "") == SWITCH_TRUE,
-					   "the sibling stand-in must be able to claim the PTLib reservation");
+													  FST_H323_SIBLING_MODULE, modname) == SWITCH_TRUE,
+					   "the sibling stand-in must be able to take the PTLib reservation over");
 
 			status = mod_h323_load(&module_interface, fst_pool);
 
@@ -3496,14 +3628,15 @@ FST_CORE_BEGIN("conf_h323")
 			fst_check(holder != NULL && !strcmp(holder, FST_H323_SIBLING_MODULE));
 			switch_safe_free(holder);
 
-			/* Cleanup tail: release what this case planted, and confirm the release, so the
-			 * refusal is provably a function of the reservation rather than of anything
+			/* Cleanup tail: hand the claim back to the module that really did construct a
+			 * PProcess in this process, and confirm the hand-back, so the refusal is
+			 * provably a function of who held the reservation rather than of anything
 			 * permanent this case did. */
-			fst_check(switch_core_set_var_conditional(FST_H323_PTLIB_RESERVATION, NULL,
+			fst_check(switch_core_set_var_conditional(FST_H323_PTLIB_RESERVATION, modname,
 													 FST_H323_SIBLING_MODULE) == SWITCH_TRUE);
 
 			holder = switch_core_get_variable_dup(FST_H323_PTLIB_RESERVATION);
-			fst_check(holder == NULL);
+			fst_check(holder != NULL && !strcmp(holder, modname));
 			switch_safe_free(holder);
 		}
 		FST_TEST_END()

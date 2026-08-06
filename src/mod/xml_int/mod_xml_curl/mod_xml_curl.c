@@ -211,10 +211,10 @@ static size_t file_callback(void *ptr, size_t size, size_t nmemb, void *data)
 #define XML_CURL_JSON_MAX_TRANSFORMED_NAME_BYTES (XML_CURL_JSON_MAX_NODES * (XML_CURL_JSON_MAX_NAME_BYTES + 1))
 
 /*
- * OBSERVABILITY: the machine-readable twin of the JSON fallback WARNING. A total fallback is a
- * silent degradation of provisioning fidelity - the lookup still resolves, so nothing fails, and an
- * operator only learns of it by reading logs. Firing a custom event beside the WARNING makes the
- * degradation something an ESL consumer can subscribe to and alert on without log scraping.
+ * OBSERVABILITY: the machine-readable twin of the JSON fallback WARNING. A JSON decode failure does
+ * not itself fail the lookup - it hands the same body to the shared XML parser, so where that parse
+ * succeeds nothing fails and the WARNING is the only trace (where it fails too, the pre-existing
+ * SWITCH_LOG_ERROR reports it). The event fired beside it is what an ESL consumer alerts on.
  *
  * The subclass name follows the module::event_name convention switch_event.h recommends, so it is
  * unambiguous on the wire: `events plain CUSTOM xml_curl::json_fallback`.

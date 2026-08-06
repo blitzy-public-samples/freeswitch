@@ -65,15 +65,35 @@ a representation this fetch did not ask for.
 **Any JSON failure edge degrades to the untouched XML parse, so a lookup never fails
 because of a decode problem.** The JSON decoder returns `NULL` on every failure edge, and
 the caller's next statement parses the same already-downloaded body as XML
-(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1790-1794`). The HTTP-200 success gate
-(`:1779`) and the non-200 error branch (`:1818-1822`) are unchanged, and the `NULL`-return
-semantics the core sees are unchanged. A gateway that answers XML while a binding asks for
+(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1790-1794`). The HTTP-200 success gate — the
+`if (httpRes == 200)` at `:1779` — and the non-200 error branch that logs `Received HTTP error`
+at `:1818-1822` are unchanged, and the `NULL`-return semantics the core sees are unchanged. A gateway that answers XML while a binding asks for
 JSON is therefore still served — degraded in fidelity, never in availability.
+
+**One thing the two paths do not share: `$${…}` interpolation.** The XML path returns through
+`switch_xml_parse_file()` (`src/switch_xml.c:1724`), which runs the configuration preprocessor
+over the body before parsing it (call at `src/switch_xml.c:1757`, `preprocess()` at
+`src/switch_xml.c:1460`). That preprocessor expands `$${variable}` from the switch's global
+variables (`expand_vars()` at `src/switch_xml.c:1305-1330`, called per line at
+`src/switch_xml.c:1496`) and acts on `X-PRE-PROCESS` directives (`src/switch_xml.c:1523`). The
+JSON path does none of it: the translator builds the tree directly through the XML builder API,
+so a `$${…}` token in a JSON response reaches the core **verbatim**. One document served both
+ways therefore differs — `value="10.236.2.230"` as XML against `value="$${domain}"` as
+BadgerFish JSON, on a switch whose `domain` is set.
+
+Two consequences worth planning for. **A gateway that moves a binding from XML to JSON must
+resolve those tokens itself and send final values**, because nothing warns about it: a document
+full of literal `$${…}` is well-formed and conformant, so it decodes successfully and the
+difference only shows up in the value the dialplan or directory finally sees. And an *unset*
+variable is no safer than a set one — the preprocessor writes nothing for a variable it cannot
+resolve (`src/switch_xml.c:1327`), so the XML path drops the token while the JSON path keeps it.
+If a value has to be computed switch-side rather than gateway-side, leave that binding on XML.
+The `file:` shortcut of section 4 is on the XML path and so it does interpolate.
 
 **The single dispatch point and the single signal site.** There is exactly one place where
 the format is chosen — `src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1786-1787` — and exactly one
 place where a degradation is signalled: the `if (!xml)` block at
-`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1411-1422`, which emits the `WARNING` and
+`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1410-1422`, which emits the `WARNING` and
 fires the event side by side. Alerting therefore never has to correlate across sites: one
 degradation produces one `WARNING` and one event, always together.
 
@@ -189,7 +209,22 @@ its remedy is a gateway header fix rather than a payload fix.
 
 Note the practical consequence for a mismatch: the ceilings in section 3 are never reached
 on that edge, because the classifier rejects before the body is read at all
-(`mod_xml_curl.c:1397` precedes `mod_xml_curl.c:1400`).
+(`mod_xml_curl.c:1398` precedes `mod_xml_curl.c:1401`).
+
+Two of these five reasons are worth naming precisely, because their wording invites a wrong
+reading:
+
+- `response body could not be read in full` is the **read** edge, produced by
+  `xml_curl_json_read_file()` (`mod_xml_curl.c:747-809`) returning `NULL`. Its triggers are a
+  temporary file that is empty, cannot be opened or stat'd, shrinks while it is being read, or
+  contains an embedded NUL byte (`:765`, `:801`). It is **not** what a body over
+  `response-max-bytes` produces — that never reaches this function at all, for the reason set
+  out in section 3, row 10.
+- `no response body was captured` and `the requested provisioning section is unknown` are
+  guards on the decoder's own arguments (`:1391-1396`) rather than on anything a gateway sends.
+  Neither is reachable over the HTTP path, because the fetch routine always synthesises a
+  temporary-file name (`:1634`) and `switch_xml_locate` always supplies a section. They exist so
+  the decoder is total, and they are exercised by the module's test suite rather than by traffic.
 
 ### 2.4 Watching the event, and alerting without log scraping
 
@@ -280,11 +315,34 @@ couples an alert rule to wording. Three rules cover the operational cases:
   ceilings in section 3. Remedy: run the gateway's output through the validator in section
   9.
 
-Because the event and the `WARNING` are emitted from the same block
-(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1411-1422`), the two counts pair 1:1 over any
+Because the event and the `WARNING` are emitted from the same block — the `if (!xml)` block at
+(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1410-1422`) — the two counts pair 1:1 over any
 interval. That makes the log useful as a cross-check on the alerting path rather than as its
 input: if the log shows fallback `WARNING`s that the event stream did not, the subscription
 is the thing to look at.
+
+**What the event cannot tell you.** The event is a *decode* signal, so it covers exactly the
+five failure edges of section 2.3 and nothing else. A fetch that never produced a body worth
+decoding emits **neither** the event **nor** a fallback `WARNING` — it is reported only by the
+module's pre-existing log lines, which `response-format` leaves exactly as they were:
+
+| Failure | What is logged, in order | Severity and line |
+|---|---|---|
+| The response body exceeded `response-max-bytes` (section 3, row 10) | `Oversized file detected [N bytes]` then `Error encountered! [<gateway-url>]` | `ERROR` at `mod_xml_curl.c:137`, `ERROR` at `:1776` |
+| The transfer failed — timeout, connection refused, TLS rejection | `CURL returned error:[<n>] <message>` then `Received HTTP error 0 trying to fetch <gateway-url>` | `WARNING` at `mod_xml_curl.c:1753`, `ERROR` at `:1819` |
+| The gateway answered a status other than 200 | `Received HTTP error <code> trying to fetch <gateway-url>` | `ERROR` at `mod_xml_curl.c:1819` |
+
+That is the log-only class. An alerting rule that watches the event alone will not see any of
+it, so pair the event rule with a log rule if you need to notice a gateway that stops answering
+as well as one that answers badly: `Received HTTP error` and `Oversized file detected` are the
+two strings that cover the whole table, and neither has changed in years.
+
+One caution when you do scrape for them: those three lines render the gateway URL
+**unredacted**, unlike every line `response-format` added. That is deliberate — they are
+pre-existing operator-facing diagnostics and changing them would change behaviour for bindings
+that never opted into JSON — but it means a `gateway-url` carrying userinfo or a query token
+will appear in the log whenever the transport fails. Keep credentials in
+`gateway-credentials` with `auth-scheme` instead, which no log line ever renders.
 
 For a one-off diagnosis rather than an alert, `fs_cli -x 'xml_curl debug_on'` leaves each
 fetched response body on disk and logs its path
@@ -299,15 +357,29 @@ unchanged, since it appears in that operator-visible log line.
 ## 3. The eleven resource ceilings
 
 The JSON decoder is a whitelist, not a best-effort parser, and it is bounded so that a
-runaway or hostile response cannot exhaust memory or CPU on the fetch thread. The ceilings
-are compile-time constants enforced by the module itself rather than parser configuration,
-so behaviour is identical on every platform and every build
+runaway or hostile response cannot exhaust memory or CPU on the fetch thread. The decoder's
+own ceilings — every row below except row 10, which is the operator-settable response cap —
+are compile-time constants enforced by the module itself rather than parser configuration, so
+behaviour is identical on every platform and every build
 (`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:173-177`).
 
-Every ceiling behaves the same way when exceeded: the document is **refused** — the decoder
-returns `NULL` — which is one of the `malformed-json` edges of section 2.3, so the response
-is parsed as XML instead and the lookup still resolves. There is no partial acceptance and
-no truncation.
+Ceilings 1 to 9 and 11 behave the same way when exceeded: the document is **refused** — the
+decoder returns `NULL` — which is one of the `malformed-json` edges of section 2.3, so the
+response is parsed as XML instead. There is no partial acceptance and no truncation.
+
+A refusal can never by itself fail the fetch, but whether the *lookup* then resolves depends
+on what the body actually holds. A gateway that answered XML is still served in full. A
+JSON-only document that this decoder refused will not parse as XML either, so a lookup that
+only that gateway could satisfy is a provisioning **miss** rather than a loss of fidelity —
+`xml_locate` reports `can't find anything` and the XML parser logs its own error about the
+JSON bytes it was handed. When some other source can satisfy the same lookup the core reaches
+it, because `switch_xml_locate` retries the static root after a binding misses
+(`src/switch_xml.c:1861-1868`). Section 1's phrasing is the precise one: degraded in fidelity,
+never in availability of the **fetch**.
+
+**Row 10 is the exception to everything above** and is worth reading on its own:
+`response-max-bytes` is enforced on the transport, before any decode is attempted, so
+breaching it is not a fallback at all.
 
 | # | Name | Value | What it bounds | On breach |
 |---|---|---|---|---|
@@ -320,8 +392,18 @@ no truncation.
 | 7 | `XML_CURL_JSON_MAX_STRING_BYTES` (`mod_xml_curl.c:199`) | 8192 | Bytes in one name or one value | Refused at `:399`, `:681` -> fallback |
 | 8 | `XML_CURL_JSON_MAX_NAME_BYTES` (`mod_xml_curl.c:200`) | 128 | Bytes in one element or attribute name | Refused at `:470` -> fallback |
 | 9 | `XML_CURL_JSON_MAX_TRANSFORMED_NAME_BYTES` (`mod_xml_curl.c:211`) | `MAX_NODES * (MAX_NAME_BYTES + 1)` = 2580000 | Cumulative element and attribute **name** bytes written into the tree. It is a ceiling of its own rather than the payload length because an array writes one key once per element, so the output legitimately exceeds the input | Refused at `:931`, `:970` -> fallback |
-| 10 | `XML_CURL_MAX_BYTES` / `response-max-bytes` (`mod_xml_curl.c:76`, default applied at `:1876`, parameter parsed at `:1967-1973`) | 1 MiB (`1024 * 1024`), per-binding override | The HTTP response **body**, streamed to the temporary file. `response-max-bytes` caps the body for JSON **exactly** as it does for XML: the JSON decoder re-checks the same binding ceiling when it reads the file back (`:1400`, helper at `:747`), so a JSON payload inherits the cap for free | Body over the cap -> the read fails -> `response body could not be read in full` -> fallback |
+| 10 | `XML_CURL_MAX_BYTES` / `response-max-bytes` (`mod_xml_curl.c:76`, default assigned to `curl_max_bytes` at `:1876`, parameter parsed at `:1967`, handed to the transfer at `:1639`) | 1 MiB (`1024 * 1024`), per-binding override | The HTTP response **body** — enforced on the **transport**, not in either decoder. `file_callback()` counts every chunk libcurl delivers and aborts the transfer as soon as the running total passes the cap (`:128-140`). It therefore caps a JSON body exactly as it caps an XML one, because it acts before either representation is looked at. The decoder does re-check the same binding ceiling when it reads the body back (call at `:1400`, helper `xml_curl_json_read_file` at `:747`, test at `:765`), but that is defence in depth: the transport cap and the read cap are the same `binding->curl_max_bytes`, so the transport always fires first | **Not a fallback — see the note below.** `file_callback()` sets the fetch's error flag (`:138`) and the result block tests that flag (`:1775`) **before** the format dispatch (`:1786`), so the JSON decoder is never entered. Two `ERROR` lines are logged — `Oversized file detected [N bytes]` (`:137`) and `Error encountered! [<gateway-url>]` (`:1776`) — **no fallback `WARNING` and no `xml_curl::json_fallback` event fire**, and the fetch yields no document |
 | 11 | The budget's `max_text_bytes` (`mod_xml_curl.c:255`, bound at `:1135`) | `strlen(json_text)` — the payload length | Cumulative decoded attribute-value and element-text bytes. Bounded by the payload rather than by a constant, because every decoded value appears exactly once in the payload and escape sequences only ever shrink | Refused at `:934`, `:943` -> fallback |
+
+**Row 10 is the one ceiling whose breach is invisible to section 2's signatures.** A body over
+`response-max-bytes` is a transport failure rather than a decode failure, so it produces the two
+`ERROR` lines above and nothing else: no `WARNING`, no event, and a lookup that succeeds only if
+another source can satisfy it. An alerting rule keyed on the `xml_curl::json_fallback` event
+alone (section 2.4) will not see it, so watch the log for `Oversized file detected` as well. That
+line is the pre-existing signal for a gateway that has outgrown its cap and it long predates
+`response-format`; the only thing JSON support changes about this edge is nothing at all. Note
+also that the reason phrase `response body could not be read in full` belongs to the read edge in
+section 2.3 — an empty, unreadable, shrinking or NUL-bearing body — and **not** to this row.
 
 Ceilings 1 through 8 and 11 are document-wide rather than per-node because a single
 caller-owned budget structure is threaded through the whole recursive translation
@@ -358,8 +440,9 @@ three are all cited in the wild, so each is pinned here to the line that produce
   same four numbers).
 
 Why the module refuses first, whichever of 64 or 1000 is in force: its lexical gate rejects at
-32 before cJSON's own recursion limit can ever apply
-(`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:604`), and 32 is below both.
+32 (`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:604`) and its translation budget rejects at 32
+again (`:905`), both before cJSON's own recursion limit can ever apply, so the boundary is
+identical on every platform and in every build however that macro is set (`:173-177`).
 
 If you are sizing a gateway's documents, **32** is the number to design against.
 
@@ -390,13 +473,14 @@ gateway that sets `Content-Type: application/json`.
 
 | Parameter | Effect | Lines |
 |---|---|---|
-| `enable-cacert-check` | When true, sets `CURLOPT_SSL_VERIFYPEER` back on, so libcurl verifies that the gateway's certificate chains to a trusted CA | parsed at `mod_xml_curl.c:1932`, applied at `:1704-1706` |
-| `enable-ssl-verifyhost` | When true, sets `CURLOPT_SSL_VERIFYHOST` to 2, so libcurl verifies that the certificate actually names the host being contacted | parsed at `mod_xml_curl.c:1944`, applied at `:1732-1734` |
-| `ssl-cacert-file` | Sets `CURLOPT_CAINFO` to a PEM bundle, so a private or internal CA can be trusted instead of the system trust store. Only meaningful together with `enable-cacert-check` | parsed at `mod_xml_curl.c:1942`, applied at `:1728-1730` |
+| `enable-cacert-check` | When true, sets `CURLOPT_SSL_VERIFYPEER` back on, so libcurl verifies that the gateway's certificate chains to a trusted CA | parsed at `mod_xml_curl.c:1932`, applied at `:1705` (the `CURLOPT_SSL_VERIFYPEER, TRUE` setopt) |
+| `enable-ssl-verifyhost` | When true, sets `CURLOPT_SSL_VERIFYHOST` to 2, so libcurl verifies that the certificate actually names the host being contacted | parsed at `mod_xml_curl.c:1944`, applied at `:1733` (the `CURLOPT_SSL_VERIFYHOST, 2` setopt) |
+| `ssl-cacert-file` | Sets `CURLOPT_CAINFO` to a PEM bundle, so a private or internal CA can be trusted instead of the system trust store. Only meaningful together with `enable-cacert-check` | parsed at `mod_xml_curl.c:1942`, applied at `:1729` (the `CURLOPT_CAINFO` setopt) |
 
-Both booleans are parsed with `switch_true()` and the arm only matches when the value is
-true (`mod_xml_curl.c:1932`, `:1944`), so writing `value="false"` is equivalent to omitting
-the parameter rather than being an explicit opt-out.
+Both booleans are parsed with `switch_true()` and the arm only matches when the value is true —
+the `enable-cacert-check` arm at `mod_xml_curl.c:1932` and the `enable-ssl-verifyhost` arm at
+`:1944` — so writing `value="false"` is equivalent to omitting the parameter rather than being
+an explicit opt-out.
 
 ### Why the shipped defaults are permissive, and unchanged by this work
 
@@ -410,11 +494,24 @@ present any certificate and serve the switch its provisioning documents.
 That posture is long-standing and is deliberately left byte-for-byte as it was. Tightening
 it would change the behaviour of every existing deployment whose gateway uses a certificate
 that would not verify, turning a working switch into one that cannot provision — a
-behaviour change well outside a documentation and observability change. In all four shipped
-profiles all three parameters remain **commented samples**, so no default moves:
-`conf/vanilla/autoload_configs/xml_curl.conf.xml:18` (`enable-cacert-check`), `:20`
-(`enable-ssl-verifyhost`) and `:36` (`ssl-cacert-file`), and correspondingly in
-`conf/testing/autoload_configs/xml_curl.conf.xml:18`, `:20` and `:36`.
+behaviour change well outside a documentation and observability change.
+
+**No shipped profile sets any of the three**, so no default moves — but they do not all carry
+the same samples, and it is worth knowing which file you are looking at:
+
+| Profile | What it carries |
+|---|---|
+| `conf/vanilla/autoload_configs/xml_curl.conf.xml` | all three as commented samples: `:18` (`enable-cacert-check`), `:20` (`enable-ssl-verifyhost`), `:36` (`ssl-cacert-file`) |
+| `conf/testing/autoload_configs/xml_curl.conf.xml` | the same three, at the same lines `:18`, `:20`, `:36` |
+| `conf/curl/autoload_configs/xml_curl.conf.xml` | **none of the three.** Only a commented `ignore-cacert-check` sample at `:16` |
+| `conf/insideout/autoload_configs/xml_curl.conf.xml` | **none of the three.** Only a commented `ignore-cacert-check` sample at `:16` |
+
+`ignore-cacert-check` is a legacy spelling that this module has never had a parameter arm for —
+the parsing chain recognises `enable-cacert-check` and no variant of it
+(`mod_xml_curl.c:1932`) — so uncommenting it in `conf/curl` or `conf/insideout` verifies
+nothing. If you start from one of those two profiles, add
+`<param name="enable-cacert-check" value="true"/>` by hand rather than reaching for the sample
+that is already there.
 
 ### Recommended hardened configuration for production
 
@@ -482,8 +579,8 @@ location the sample recommends
 
 It **refuses the jar, keeps performing the fetch, and logs**. The validation function
 (`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1464`) gates only the two cookie `setopt`
-calls (`:1742-1745`); everything else about the fetch is untouched, so a refusal costs
-cookie persistence for that binding and nothing else. The refusal is a single
+calls — `CURLOPT_COOKIEJAR` and `CURLOPT_COOKIEFILE` at `:1743-1744`; everything else about the
+fetch is untouched, so a refusal costs cookie persistence for that binding and nothing else. The refusal is a single
 `SWITCH_LOG_WARNING` (`src/mod/xml_int/mod_xml_curl/mod_xml_curl.c:1532-1535`):
 
 ```
@@ -503,6 +600,12 @@ The reasons it can carry are these, and they say nothing at all on success:
 | `other users can write it, so its contents cannot be trusted` | `mod_xml_curl.c:1518` |
 | `its status could not be read` | `mod_xml_curl.c:1523` |
 | `it does not exist and could not be created privately` | `mod_xml_curl.c:1525` |
+
+The last two are the only ones you are unlikely ever to see. Both require an `lstat` or an
+`open` in the jar's directory to be refused, and a FreeSWITCH running as `root` — still the
+common case for a switch that binds privileged ports — bypasses the directory permissions that
+would refuse them. Run the switch as its own unprivileged user (`freeswitch -u freeswitch -g
+freeswitch`) and they become reachable like the rest.
 
 An existing jar that is a regular file, owned by this process and writable by nobody else,
 is accepted untouched and its mode is never altered
@@ -724,6 +827,10 @@ outside it is refused and falls back
 - An element carries **either** `$` **or** children — never both.
 - The top-level key carries **no** `@` member of any name, because the module owns the
   envelope.
+- **Every value is used verbatim.** `$${…}` global-variable interpolation happens on the XML
+  decode path only (section 1), so send resolved values: a literal `$${domain}` in a JSON
+  response reaches the dialplan or directory as those eleven characters, not as the switch's
+  domain.
 - The ceilings in section 3 apply to every document.
 
 ### The conformance corpus
@@ -773,7 +880,12 @@ a pass. Violations print one line each on stderr, as
 than just the first. Run `--help` for the full contract summary and the option list.
 
 A gateway whose captured responses exit 0 here will not produce a `malformed-json` fallback
-for a shape reason. Two things the validator cannot check for you: that the gateway sets
+for a shape reason. Three things the validator cannot check for you: that the gateway sets
 `Content-Type: application/json` — that is the `content-type-mismatch` edge of section 2.3 —
-and that the response body stays inside the binding's `response-max-bytes` ceiling
-(section 3, row 10).
+that the response body stays inside the binding's `response-max-bytes` ceiling (section 3,
+row 10), and that no value is a `$${…}` token left for the switch to expand, which decodes
+without complaint and then means something different from what the same document meant as XML
+(section 1). The last of those is a contract the corpus keeps rather than states: no fixture
+contains such a token, and the suite fails if one is ever added
+(`FST_TEST_BEGIN(fixture_corpus_carries_no_preprocessor_tokens)` in
+`src/mod/xml_int/mod_xml_curl/test/test_mod_xml_curl.c`).

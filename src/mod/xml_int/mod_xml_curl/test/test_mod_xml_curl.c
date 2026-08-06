@@ -2153,6 +2153,40 @@ static int fst_xc_val_is_json(const char *name)
 }
 
 /*
+ * True when `name` is either half of a conformant parity PAIR -- the .json twin or
+ * the .xml twin.  The deliberately non-conformant badgerfish_invalid_* samples are
+ * excluded by the same prefix test that excludes them from the validator sweep, so a
+ * caller that wants the shipped contract corpus and nothing else can use this.
+ */
+static int fst_xc_val_is_corpus_fixture(const char *name)
+{
+	switch_size_t i;
+	switch_size_t len;
+
+	if (zstr(name)) {
+		return 0;
+	}
+
+	/* the .json half is exactly what the validator sweep accepts; the .xml twin is
+	   the other half of the same pair and is tested for here */
+	if (!fst_xc_val_is_json(name)) {
+		len = strlen(name);
+
+		if (!(len > 4 && !strcmp(name + len - 4, ".xml"))) {
+			return 0;
+		}
+	}
+
+	for (i = 0; i < switch_arraylen(fst_xc_val_section_prefixes); i++) {
+		if (fst_xc_val_has_prefix(name, fst_xc_val_section_prefixes[i])) {
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+/*
  * True when `name` is one of the conformant parity fixtures: a .json file whose
  * stem begins with one of the three bound section names.
  */
@@ -5940,6 +5974,78 @@ FST_CORE_BEGIN("conf")
 
 			switch_safe_free(from_json);
 			switch_safe_free(from_xml);
+		}
+		FST_TEST_END()
+
+		/*
+		 * -------------------------------------------------------------------
+		 * THE CORPUS CARRIES NO PREPROCESSOR TOKEN
+		 * -------------------------------------------------------------------
+		 * A `$${var}' token is expanded by the XML decode path and NOT by this
+		 * one: switch_xml_parse_file() runs the configuration preprocessor over
+		 * the body it parses, while the translator builds the tree straight
+		 * through the builder API and copies every value verbatim.  A fixture
+		 * pair carrying such a token therefore claims an identity it does not
+		 * have: the two sides agree here, where the XML twin is read with
+		 * switch_xml_parse_file_simple() and nothing is expanded, and disagree in
+		 * a live switch whose global is set -- or, just as bad, whose global is
+		 * UNSET, since the preprocessor then writes nothing at all where the
+		 * translator writes the literal token.
+		 *
+		 * The corpus is the reference a gateway author reads, so the rule is kept
+		 * rather than merely stated in the runbook: both halves of every shipped
+		 * pair are scanned, and the scan is required to have covered them all so
+		 * that an unreadable directory cannot pass for a clean corpus.  The
+		 * badgerfish_invalid_* counter-examples are excluded deliberately -- they
+		 * exist to be refused, and what they contain past the rule they violate
+		 * is not part of the contract.
+		 */
+		FST_TEST_BEGIN(fixture_corpus_carries_no_preprocessor_tokens)
+		{
+			switch_dir_t *dir = NULL;
+			char entry[512] = "";
+			char path[1024] = "";
+			const char *found = NULL;
+			char *bytes = NULL;
+			int scanned = 0;
+			int offenders = 0;
+
+			fst_requires(switch_dir_open(&dir, FST_XC_FIXTURE_DIR, fst_pool) == SWITCH_STATUS_SUCCESS);
+
+			while ((found = switch_dir_next_file(dir, entry, sizeof(entry)))) {
+				if (!fst_xc_val_is_corpus_fixture(found)) {
+					continue;
+				}
+
+				switch_snprintf(path, sizeof(path), "%s%s", FST_XC_FIXTURE_DIR, found);
+
+				/* the production reader, so an unreadable fixture fails here exactly as it
+				   would fail a fetch rather than being silently skipped */
+				if (!(bytes = xml_curl_json_read_file(path, XML_CURL_MAX_BYTES))) {
+					offenders++;
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+									  "test_mod_xml_curl: corpus fixture [%s] could not be read\n", found);
+					continue;
+				}
+
+				scanned++;
+
+				if (strstr(bytes, "$${")) {
+					offenders++;
+					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR,
+									  "test_mod_xml_curl: corpus fixture [%s] carries a $${...} preprocessor token, which only the XML "
+									  "decode path expands\n", found);
+				}
+
+				switch_safe_free(bytes);
+			}
+
+			switch_dir_close(dir);
+
+			fst_xcheck(offenders == 0,
+					   "no fixture of the conformant corpus may carry a $${...} token, because the JSON path copies it verbatim while the XML path expands it");
+			fst_xcheck(scanned == 2 * FST_XC_VAL_MIN_PARITY_JSON,
+					   "both halves of all eighteen shipped parity pairs must have been scanned");
 		}
 		FST_TEST_END()
 
