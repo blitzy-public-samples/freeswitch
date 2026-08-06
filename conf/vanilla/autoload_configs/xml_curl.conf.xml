@@ -74,7 +74,12 @@
 
            A response that is not application/json, or whose body falls outside that profile, is
            logged as a warning and parsed as XML instead. When omitted, responses are decoded as
-           XML. -->
+           XML.
+
+           The operator runbook at src/mod/xml_int/mod_xml_curl/README.response-format.md
+           documents this contract in full: both fallback reasons and their log and event
+           signatures, the eleven resource ceilings, the "file:" boundary, the TLS hardening
+           parameters, cookie jar placement, and the mod_h323 / mod_opal co-load prohibition. -->
       <!-- <param name="response-format" value="json"/> -->
     </binding>
   </bindings>
